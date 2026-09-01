@@ -196,6 +196,10 @@ name = "operation_schema_v2"
 path = "tests/operation_schema_v2.rs"
 
 [[test]]
+name = "operation_dag"
+path = "tests/operation_dag.rs"
+
+[[test]]
 name = "compat_pull_strategy_flags_surface"
 path = "tests/compat/pull_strategy_flags_surface.rs"
 
