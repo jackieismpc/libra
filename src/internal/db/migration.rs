@@ -1403,6 +1403,16 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026082401_agent_bridge_link_relations.sql"),
             include_str!("../../../sql/migrations/2026082401_agent_bridge_link_relations_down.sql"),
         ),
+        // OL-02: the operation log v2 schema is a direct, forward-only
+        // replacement for the development-only v1 tables.  There is no down
+        // migration because the v1 shape cannot represent v2 snapshots,
+        // journals, or operation heads without loss.
+        Migration {
+            version: 2026090101,
+            name: "operation_v2",
+            up: include_str!("../../../sql/migrations/2026090101_operation_v2.sql"),
+            down: None,
+        },
     ]
 }
 
@@ -1850,9 +1860,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 57);
+        assert_eq!(runner.len(), 58);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026082401));
+        assert_eq!(runner.max_registered_version(), Some(2026090101));
     }
 
     #[test]

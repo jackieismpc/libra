@@ -10,7 +10,7 @@ use sea_orm::{
 };
 use thiserror::Error;
 
-use crate::internal::model::{
+use crate::internal::legacy_operation_model::{
     operation, operation_parent, operation_view, operation_view_ref, operation_view_workspace,
 };
 

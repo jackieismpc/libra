@@ -380,3 +380,12 @@ The graded command set is pinned to the plan's P0/P1 surface; the
 `compat_subface_labels` guard fails if it drifts from that set or from
 `src/cli.rs::Commands`, or if any cell names a label outside the fixed
 enumeration.
+
+## Operation-log storage v2 (OL-02)
+
+The operation-log persistence schema is now v2. Existing repositories are
+forward-migrated from the development-only v1 operation/view tables to the
+append-only operation, operation-head, journal, workspace-manifest, and change
+projection tables. The migration is intentionally forward-only: v1 rows do not
+contain enough information to reconstruct v2 workspace snapshots. Repositories
+that need to retain legacy audit records must export them before upgrading.

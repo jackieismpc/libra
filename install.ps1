@@ -22,7 +22,7 @@ $ErrorActionPreference = "Stop"
 # One of the release version surfaces. `compat_version_surface_sync` pins it
 # to Cargo.toml: this value is substituted verbatim into the download URL, so
 # a stale value silently installs an old binary when -Version is not given.
-$DefaultVersion = "v0.22.5"
+$DefaultVersion = "v0.23.0"
 $ExeName = "libra.exe"
 $ReleaseAsset = "libra-windows-amd64.exe"
 

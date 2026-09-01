@@ -23,6 +23,12 @@ extension rather than a Git command. The current public surface supports:
 - Transaction wrapper: `src/internal/operation_wrapper.rs`.
 - Operation tables are part of the bootstrap schema and are also ensured by the
   explicit database upgrade path for older repositories.
+- OL-02 replaces the development-only v1 operation tables with the v2 tables
+  `operation`, `operation_parent`, `operation_head`, `operation_journal`,
+  `change_identity`, `change_revision`, `change_predecessor`, and
+  `ai_operation_link`. The migration is forward-only because the v1 shape
+  cannot represent v2 workspace snapshots or journal state. Export any legacy
+  audit data before upgrading if it must be retained.
 
 ## Current Behavior
 
