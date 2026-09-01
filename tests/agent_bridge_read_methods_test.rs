@@ -236,7 +236,7 @@ async fn checkpoint_show_missing_is_error_not_empty() {
 #[serial_test::serial(cwd)]
 async fn diff_get_without_a_repository_fails_closed_on_scope() {
     let outside = tempfile::tempdir().expect("tempdir");
-    let _cwd = libra::utils::test::ChangeDirGuard::new(outside.path().to_path_buf());
+    let _cwd = libra::utils::test::ChangeDirGuard::new(outside.path());
     let c = ctx().await;
     let err = read_dispatch(
         &c,
