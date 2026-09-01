@@ -204,6 +204,14 @@ name = "workspace_snapshot_roundtrip"
 path = "tests/workspace_snapshot_roundtrip.rs"
 
 [[test]]
+name = "index_snapshot_roundtrip"
+path = "tests/index_snapshot_roundtrip.rs"
+
+[[test]]
+name = "sequencer_snapshot_roundtrip"
+path = "tests/sequencer_snapshot_roundtrip.rs"
+
+[[test]]
 name = "compat_pull_strategy_flags_surface"
 path = "tests/compat/pull_strategy_flags_surface.rs"
 

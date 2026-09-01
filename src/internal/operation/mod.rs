@@ -9,7 +9,9 @@ pub mod working_copy;
 // OL-15 removes this compatibility service. Re-exporting it keeps existing
 // command integrations source-compatible while all new code uses v2 types.
 pub use facet::{
-    FacetCapture, FacetCaptureCtx, FacetError, FacetName, FacetRegistry, RestorePolicy,
+    FacetCapture, FacetCaptureCtx, FacetDiff, FacetError, FacetName, FacetRegistry,
+    FacetRestoreCtx, RAW_INDEX_FACET_NAME, RawIndexFacet, RestorePolicy, SEQUENCER_FACET_NAME,
+    SPARSE_FACET_NAME, SequencerFacet, SparseFacet, StateFacet,
 };
 pub use snapshot::{
     IndexEntrySnapshot, ScanError, ScanResult, ScannedFile, SnapshotError, SnapshotOutcome,

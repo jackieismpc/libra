@@ -4,11 +4,36 @@
 //! lets snapshot and restore code fail closed when a new mutable state owner
 //! has not yet supplied capture/validation/restore semantics.
 
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::BTreeMap,
+    fmt, fs,
+    future::Future,
+    path::{Path, PathBuf},
+};
 
-use git_internal::hash::ObjectHash;
+use git_internal::{
+    hash::ObjectHash,
+    internal::object::{blob::Blob, types::ObjectType},
+};
+use sea_orm::{DatabaseConnection, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use super::{store::OperationStoreV2, working_copy::PinnedRequestScope};
+use crate::{
+    internal::{
+        sequencer::{SequenceKind, SequenceState},
+        sparse::SparseViewStore,
+        worktree_scope::WorktreeScope,
+    },
+    utils::{atomic_write::write_atomic, client_storage::ClientStorage},
+};
+
+const FACET_SCHEMA_VERSION: u32 = 1;
+const MAX_RAW_INDEX_BYTES: u64 = 64 * 1024 * 1024;
+pub const RAW_INDEX_FACET_NAME: &str = "index";
+pub const SEQUENCER_FACET_NAME: &str = "sequencer";
+pub const SPARSE_FACET_NAME: &str = "sparse";
 
 /// Stable name of a state facet.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -234,6 +259,491 @@ pub trait StateFacet: Send + Sync {
     fn restore(&self, capture: &FacetCapture, ctx: &mut FacetRestoreCtx) -> Result<(), FacetError>;
     fn diff(&self, from: &FacetCapture, to: &FacetCapture) -> Result<FacetDiff, FacetError>;
     fn roots(&self, capture: &FacetCapture) -> Vec<ObjectHash>;
+}
+
+fn store_payload(storage: &ClientStorage, payload: &[u8]) -> Result<ObjectHash, FacetError> {
+    let blob = Blob::from_content_bytes(payload.to_vec());
+    storage
+        .put(&blob.id, payload, ObjectType::Blob)
+        .map_err(|error| FacetError::Capture(error.to_string()))?;
+    Ok(blob.id)
+}
+
+/// Bridge the synchronous StateFacet contract to repository-owned async
+/// stores without blocking a multi-thread runtime worker. A current-thread
+/// runtime cannot synchronously service a database future while its only
+/// worker is blocked by the StateFacet contract, so it fails explicitly.
+fn run_db<F, T>(future: F) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| handle.block_on(future))
+        }
+        Ok(_) => Err(
+            "database-backed facets require a multi-thread Tokio runtime for synchronous capture"
+                .to_string(),
+        ),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?
+            .block_on(future),
+    }
+}
+
+fn load_payload(
+    storage: &ClientStorage,
+    capture: &FacetCapture,
+) -> Result<Option<Vec<u8>>, FacetError> {
+    capture
+        .payload_oid
+        .map(|oid| {
+            storage
+                .get(&oid)
+                .map_err(|error| FacetError::Restore(error.to_string()))
+        })
+        .transpose()
+}
+
+fn validate_payload(
+    storage: &ClientStorage,
+    capture: &FacetCapture,
+    facet: &str,
+) -> Result<(), FacetError> {
+    let Some(oid) = capture.payload_oid else {
+        return Ok(());
+    };
+    storage
+        .get(&oid)
+        .map(|_| ())
+        .map_err(|error| FacetError::Validation(format!("{facet} payload is unavailable: {error}")))
+}
+
+fn file_diff(from: &FacetCapture, to: &FacetCapture) -> FacetDiff {
+    FacetDiff {
+        changes: serde_json::json!({
+            "from_payload_oid": from.payload_oid,
+            "to_payload_oid": to.payload_oid,
+        }),
+    }
+}
+
+fn capture_roots(capture: &FacetCapture) -> Vec<ObjectHash> {
+    capture.payload_oid.into_iter().collect()
+}
+
+fn restore_file(path: &Path, payload: Option<&[u8]>) -> Result<(), FacetError> {
+    match payload {
+        Some(bytes) => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|error| {
+                    FacetError::Restore(format!("could not create facet parent: {error}"))
+                })?;
+            }
+            write_atomic(path, bytes, true)
+                .map_err(|error| FacetError::Restore(error.to_string()))?;
+        }
+        None => match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_dir() => {
+                fs::remove_dir_all(path).map_err(|error| FacetError::Restore(error.to_string()))?;
+            }
+            Ok(_) => {
+                fs::remove_file(path).map_err(|error| FacetError::Restore(error.to_string()))?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(FacetError::Restore(error.to_string())),
+        },
+    }
+    Ok(())
+}
+
+fn read_optional_file(path: &Path, facet: &str) -> Result<Option<Vec<u8>>, FacetError> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(FacetError::Capture(format!(
+            "could not read {facet} state: {error}"
+        ))),
+    }
+}
+
+fn file_meta(payload: Option<&[u8]>) -> serde_json::Value {
+    serde_json::json!({
+        "present": payload.is_some(),
+        "byte_len": payload.map_or(0, <[u8]>::len),
+    })
+}
+
+/// Preserves the raw Git index bytes, including stat data and extension bits
+/// such as intent-to-add, skip-worktree, and assume-unchanged. OL-10 owns
+/// the general restore engine; this facet only owns its exact payload.
+pub struct RawIndexFacet {
+    path: PathBuf,
+    storage: ClientStorage,
+}
+
+impl RawIndexFacet {
+    pub fn new(scope: &PinnedRequestScope, storage: ClientStorage) -> Self {
+        Self::with_path(scope.gitdir.join("index"), storage)
+    }
+
+    pub fn with_path(path: PathBuf, storage: ClientStorage) -> Self {
+        Self { path, storage }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl StateFacet for RawIndexFacet {
+    fn name(&self) -> FacetName {
+        FacetName::from(RAW_INDEX_FACET_NAME)
+    }
+
+    fn schema_version(&self) -> u32 {
+        FACET_SCHEMA_VERSION
+    }
+
+    fn restore_policy(&self) -> RestorePolicy {
+        RestorePolicy::AutoRestore
+    }
+
+    fn capture(&self, _ctx: &FacetCaptureCtx) -> Result<FacetCapture, FacetError> {
+        let payload = read_optional_file(&self.path, RAW_INDEX_FACET_NAME)?;
+        if let Some(bytes) = payload.as_ref()
+            && bytes.len() as u64 > MAX_RAW_INDEX_BYTES
+        {
+            return Err(FacetError::Capture(format!(
+                "raw index exceeds {} byte capture budget",
+                MAX_RAW_INDEX_BYTES
+            )));
+        }
+        let payload_oid = payload
+            .as_deref()
+            .map(|bytes| store_payload(&self.storage, bytes))
+            .transpose()?;
+        Ok(FacetCapture {
+            facet: self.name(),
+            schema_version: FACET_SCHEMA_VERSION,
+            payload_oid,
+            meta: file_meta(payload.as_deref()),
+        })
+    }
+
+    fn validate(&self, capture: &FacetCapture) -> Result<(), FacetError> {
+        if capture.payload_oid.is_none() {
+            return Err(FacetError::Validation(
+                "raw index capture must contain a payload".to_string(),
+            ));
+        }
+        validate_payload(&self.storage, capture, RAW_INDEX_FACET_NAME)
+    }
+
+    fn restore(
+        &self,
+        capture: &FacetCapture,
+        _ctx: &mut FacetRestoreCtx,
+    ) -> Result<(), FacetError> {
+        let payload = load_payload(&self.storage, capture)?;
+        restore_file(&self.path, payload.as_deref())
+    }
+
+    fn diff(&self, from: &FacetCapture, to: &FacetCapture) -> Result<FacetDiff, FacetError> {
+        Ok(file_diff(from, to))
+    }
+
+    fn roots(&self, capture: &FacetCapture) -> Vec<ObjectHash> {
+        capture_roots(capture)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SequencerStateEnvelope {
+    kind: String,
+    head_name: String,
+    head_orig: String,
+    current_oid: String,
+    todo: Vec<String>,
+    payload: String,
+}
+
+impl From<SequenceState> for SequencerStateEnvelope {
+    fn from(state: SequenceState) -> Self {
+        Self {
+            kind: state.kind.as_str().to_string(),
+            head_name: state.head_name,
+            head_orig: state.head_orig,
+            current_oid: state.current_oid,
+            todo: state.todo,
+            payload: state.payload,
+        }
+    }
+}
+
+impl TryFrom<SequencerStateEnvelope> for SequenceState {
+    type Error = FacetError;
+
+    fn try_from(envelope: SequencerStateEnvelope) -> Result<Self, Self::Error> {
+        let kind = match envelope.kind.as_str() {
+            "merge" => SequenceKind::Merge,
+            "revert" => SequenceKind::Revert,
+            "cherry_pick" => SequenceKind::CherryPick,
+            "rebase" => SequenceKind::Rebase,
+            other => {
+                return Err(FacetError::Validation(format!(
+                    "unknown sequencer kind '{other}'"
+                )));
+            }
+        };
+        Ok(Self {
+            kind,
+            head_name: envelope.head_name,
+            head_orig: envelope.head_orig,
+            current_oid: envelope.current_oid,
+            todo: envelope.todo,
+            payload: envelope.payload,
+        })
+    }
+}
+
+/// Captures the unified `sequence_state` row through the sequencer module's
+/// scoped SQL helpers. The adapter never resolves the process cwd itself.
+pub struct SequencerFacet {
+    scope: WorktreeScope,
+    db: DatabaseConnection,
+    storage: ClientStorage,
+}
+
+impl SequencerFacet {
+    pub fn new(scope: &PinnedRequestScope, db: DatabaseConnection, storage: ClientStorage) -> Self {
+        Self {
+            scope: scope.scope.clone(),
+            db,
+            storage,
+        }
+    }
+
+    pub fn from_store(scope: &PinnedRequestScope, store: &OperationStoreV2) -> Self {
+        Self::new(scope, store.db().clone(), store.storage().clone())
+    }
+
+    /// Test/setup helper that writes the same scoped row consumed by capture.
+    pub fn write_state(&self, state: Option<SequenceState>) -> Result<(), FacetError> {
+        let db = self.db.clone();
+        let scope = self.scope.clone();
+        run_db(async move {
+            let txn = db.begin().await.map_err(|error| error.to_string())?;
+            match state {
+                Some(state) => {
+                    crate::internal::sequencer::save_for_scope_with_conn(&txn, &scope, &state)
+                        .await
+                        .map_err(|error| error.to_string())?
+                }
+                None => crate::internal::sequencer::clear_for_scope_all_with_conn(&txn, &scope)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            }
+            txn.commit().await.map_err(|error| error.to_string())
+        })
+        .map_err(FacetError::Restore)
+    }
+}
+
+impl StateFacet for SequencerFacet {
+    fn name(&self) -> FacetName {
+        FacetName::from(SEQUENCER_FACET_NAME)
+    }
+
+    fn schema_version(&self) -> u32 {
+        FACET_SCHEMA_VERSION
+    }
+
+    fn restore_policy(&self) -> RestorePolicy {
+        RestorePolicy::AutoRestore
+    }
+
+    fn capture(&self, _ctx: &FacetCaptureCtx) -> Result<FacetCapture, FacetError> {
+        let db = self.db.clone();
+        let scope = self.scope.clone();
+        let state = run_db(async move {
+            crate::internal::sequencer::load_for_scope_with_conn(&db, &scope).await
+        })
+        .map_err(FacetError::Capture)?;
+        let payload = state
+            .map(SequencerStateEnvelope::from)
+            .map(|envelope| serde_json::to_vec(&envelope))
+            .transpose()
+            .map_err(|error| FacetError::Capture(error.to_string()))?;
+        let payload_oid = payload
+            .as_deref()
+            .map(|bytes| store_payload(&self.storage, bytes))
+            .transpose()?;
+        Ok(FacetCapture {
+            facet: self.name(),
+            schema_version: FACET_SCHEMA_VERSION,
+            payload_oid,
+            meta: file_meta(payload.as_deref()),
+        })
+    }
+
+    fn validate(&self, capture: &FacetCapture) -> Result<(), FacetError> {
+        let Some(payload) = load_payload(&self.storage, capture)
+            .map_err(|error| FacetError::Validation(error.to_string()))?
+        else {
+            return Ok(());
+        };
+        serde_json::from_slice::<SequencerStateEnvelope>(&payload)
+            .map(|_| ())
+            .map_err(|error| FacetError::Validation(error.to_string()))
+    }
+
+    fn restore(
+        &self,
+        capture: &FacetCapture,
+        _ctx: &mut FacetRestoreCtx,
+    ) -> Result<(), FacetError> {
+        let state = load_payload(&self.storage, capture)?
+            .map(|payload| {
+                serde_json::from_slice::<SequencerStateEnvelope>(&payload)
+                    .map_err(|error| FacetError::Restore(error.to_string()))
+                    .and_then(SequenceState::try_from)
+            })
+            .transpose()?;
+        self.write_state(state)
+    }
+
+    fn diff(&self, from: &FacetCapture, to: &FacetCapture) -> Result<FacetDiff, FacetError> {
+        Ok(file_diff(from, to))
+    }
+
+    fn roots(&self, capture: &FacetCapture) -> Vec<ObjectHash> {
+        capture_roots(capture)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SparseStateEnvelope {
+    enabled: bool,
+    patterns: Vec<String>,
+}
+
+/// Captures the sparse-view toggle and ordered pattern list from their owned
+/// SQLite tables. Its policy is AutoRestore because these rows are mutable
+/// user state rather than a derived display cache.
+pub struct SparseFacet {
+    scope: WorktreeScope,
+    db: DatabaseConnection,
+    storage: ClientStorage,
+}
+
+impl SparseFacet {
+    pub fn new(scope: &PinnedRequestScope, db: DatabaseConnection, storage: ClientStorage) -> Self {
+        Self {
+            scope: scope.scope.clone(),
+            db,
+            storage,
+        }
+    }
+
+    pub fn from_store(scope: &PinnedRequestScope, store: &OperationStoreV2) -> Self {
+        Self::new(scope, store.db().clone(), store.storage().clone())
+    }
+
+    /// Test/setup helper that writes the same scoped tables consumed by capture.
+    pub fn write_state(&self, enabled: bool, patterns: Vec<String>) -> Result<(), FacetError> {
+        let db = self.db.clone();
+        let scope = self.scope.clone();
+        run_db(async move {
+            let txn = db.begin().await.map_err(|error| error.to_string())?;
+            SparseViewStore::restore_for_scope_with_conn(&txn, &scope, enabled, &patterns).await?;
+            txn.commit().await.map_err(|error| error.to_string())
+        })
+        .map_err(FacetError::Restore)
+    }
+}
+
+impl StateFacet for SparseFacet {
+    fn name(&self) -> FacetName {
+        FacetName::from(SPARSE_FACET_NAME)
+    }
+
+    fn schema_version(&self) -> u32 {
+        FACET_SCHEMA_VERSION
+    }
+
+    fn restore_policy(&self) -> RestorePolicy {
+        RestorePolicy::AutoRestore
+    }
+
+    fn capture(&self, _ctx: &FacetCaptureCtx) -> Result<FacetCapture, FacetError> {
+        let db = self.db.clone();
+        let scope = self.scope.clone();
+        let (enabled, patterns) =
+            run_db(async move { SparseViewStore::state_for_scope_with_conn(&db, &scope).await })
+                .map_err(FacetError::Capture)?;
+        let payload = serde_json::to_vec(&SparseStateEnvelope { enabled, patterns })
+            .map_err(|error| FacetError::Capture(error.to_string()))?;
+        let payload_oid = store_payload(&self.storage, &payload)?;
+        Ok(FacetCapture {
+            facet: self.name(),
+            schema_version: FACET_SCHEMA_VERSION,
+            payload_oid: Some(payload_oid),
+            meta: file_meta(Some(&payload)),
+        })
+    }
+
+    fn validate(&self, capture: &FacetCapture) -> Result<(), FacetError> {
+        let Some(payload) = load_payload(&self.storage, capture)
+            .map_err(|error| FacetError::Validation(error.to_string()))?
+        else {
+            return Err(FacetError::Validation(
+                "sparse capture must contain a payload".to_string(),
+            ));
+        };
+        serde_json::from_slice::<SparseStateEnvelope>(&payload)
+            .map(|_| ())
+            .map_err(|error| FacetError::Validation(error.to_string()))
+    }
+
+    fn restore(
+        &self,
+        capture: &FacetCapture,
+        _ctx: &mut FacetRestoreCtx,
+    ) -> Result<(), FacetError> {
+        let payload = load_payload(&self.storage, capture)?.ok_or_else(|| {
+            FacetError::Restore("sparse capture is missing its payload".to_string())
+        })?;
+        let state = serde_json::from_slice::<SparseStateEnvelope>(&payload)
+            .map_err(|error| FacetError::Restore(error.to_string()))?;
+        let db = self.db.clone();
+        let scope = self.scope.clone();
+        run_db(async move {
+            let txn = db.begin().await.map_err(|error| error.to_string())?;
+            SparseViewStore::restore_for_scope_with_conn(
+                &txn,
+                &scope,
+                state.enabled,
+                &state.patterns,
+            )
+            .await?;
+            txn.commit().await.map_err(|error| error.to_string())
+        })
+        .map_err(FacetError::Restore)
+    }
+
+    fn diff(&self, from: &FacetCapture, to: &FacetCapture) -> Result<FacetDiff, FacetError> {
+        Ok(file_diff(from, to))
+    }
+
+    fn roots(&self, capture: &FacetCapture) -> Vec<ObjectHash> {
+        capture_roots(capture)
+    }
 }
 
 fn validate_metadata(value: &serde_json::Value) -> Result<(), FacetError> {
