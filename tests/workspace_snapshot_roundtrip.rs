@@ -26,6 +26,10 @@ fn scope(root: &std::path::Path) -> RequestScope {
 }
 
 async fn fixture() -> (TempDir, RequestScope, OperationStoreV2) {
+    fixture_with_index(true).await
+}
+
+async fn fixture_with_index(with_index: bool) -> (TempDir, RequestScope, OperationStoreV2) {
     let dir = TempDir::new().expect("temporary repository");
     let root = dir.path().join("worktree");
     let gitdir = root.join(".libra");
@@ -41,22 +45,39 @@ async fn fixture() -> (TempDir, RequestScope, OperationStoreV2) {
     .await
     .expect("database initializes");
     let storage = libra::utils::client_storage::ClientStorage::init_local(object_path);
-    let content = b"tracked baseline\n";
     std::fs::create_dir_all(&root).expect("create worktree");
-    std::fs::write(root.join("tracked.txt"), content).expect("write tracked file");
-    let blob = Blob::from_content_bytes(content.to_vec());
-    storage
-        .put(&blob.id, content, ObjectType::Blob)
-        .expect("store baseline blob");
-    let mut index = Index::new();
-    index.add(
-        IndexEntry::new_from_file(PathBuf::from("tracked.txt").as_path(), blob.id, &root)
-            .expect("create index entry"),
-    );
-    index.save(gitdir.join("index")).expect("write index");
+    if with_index {
+        let content = b"tracked baseline\n";
+        std::fs::write(root.join("tracked.txt"), content).expect("write tracked file");
+        let blob = Blob::from_content_bytes(content.to_vec());
+        storage
+            .put(&blob.id, content, ObjectType::Blob)
+            .expect("store baseline blob");
+        let mut index = Index::new();
+        index.add(
+            IndexEntry::new_from_file(PathBuf::from("tracked.txt").as_path(), blob.id, &root)
+                .expect("create index entry"),
+        );
+        index.save(gitdir.join("index")).expect("write index");
+    }
     let request_scope = scope(&root);
     let store = OperationStoreV2::new_for_repo("repo-test", db, storage);
     (dir, request_scope, store)
+}
+
+#[tokio::test]
+async fn snapshot_empty_worktree_without_index_is_unchanged() {
+    let (_dir, request_scope, store) = fixture_with_index(false).await;
+    let mut snapshotter = WorkspaceSnapshotter::new(
+        request_scope,
+        store,
+        FacetRegistry::new(),
+        CapturePolicy::Tracked,
+    );
+    assert_eq!(
+        snapshotter.capture().await.expect("empty worktree scan"),
+        SnapshotOutcome::NoChange
+    );
 }
 
 #[tokio::test]

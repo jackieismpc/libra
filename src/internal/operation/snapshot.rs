@@ -278,8 +278,11 @@ impl WorkspaceSnapshotter {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(ScanError::Index(error.to_string())),
         };
-        let index =
-            Index::load(&index_path).map_err(|error| ScanError::Index(error.to_string()))?;
+        let index = if raw_index.is_empty() && !index_path.exists() {
+            Index::new()
+        } else {
+            Index::load(&index_path).map_err(|error| ScanError::Index(error.to_string()))?
+        };
         let root = path_to_bytes(&self.scope.worktree_root);
         let mut files = BTreeMap::new();
         let mut index_entries = Vec::new();
@@ -352,9 +355,16 @@ impl WorkspaceSnapshotter {
         while let Some(directory) = pending.pop() {
             if visited >= self.max_files {
                 partial = true;
+                changed = true;
+                partial_paths.insert(directory.to_string_lossy().to_string());
                 break;
             }
-            let mut entries = self.read_dir(&root, &directory)?;
+            let (mut entries, hit_cap) = self.read_dir(&root, &directory)?;
+            if hit_cap {
+                partial = true;
+                changed = true;
+                partial_paths.insert(directory.to_string_lossy().to_string());
+            }
             entries.sort_by(|left, right| left.name.cmp(&right.name));
             for dirent in entries {
                 visited = visited.saturating_add(1);
@@ -752,7 +762,7 @@ impl WorkspaceSnapshotter {
         ))
     }
 
-    fn read_dir(&self, root: &[u8], relative: &Path) -> Result<Vec<Dirent>, ScanError> {
+    fn read_dir(&self, root: &[u8], relative: &Path) -> Result<(Vec<Dirent>, bool), ScanError> {
         let path = self.scope.worktree_root.join(relative);
         let relative = relative_worktree_path(root, &path, true)
             .map_err(|error| ScanError::InvalidPath(error.to_string()))?;
@@ -777,20 +787,16 @@ impl WorkspaceSnapshotter {
                     return Err(ScanError::Io(io_from_wire(kind, raw_os).to_string()));
                 }
                 IoEvent::DoneReadDir { listing } => {
-                    if listing.hit_cap {
-                        return Err(ScanError::Io(format!(
-                            "directory entry budget exceeded under '{}'",
-                            relative.display()
-                        )));
-                    }
+                    let hit_cap = listing.hit_cap;
                     if let Some((kind, raw_os)) = listing.error_kinds.first().copied() {
                         return Err(ScanError::Io(io_from_wire(kind, raw_os).to_string()));
                     }
+                    return Ok((entries, hit_cap));
                 }
                 _ => {}
             }
         }
-        Ok(entries)
+        Ok((entries, false))
     }
 }
 
