@@ -36,8 +36,14 @@ async fn operation_store_round_trips_objects_journal_and_head_cas() {
     let storage = libra::utils::client_storage::ClientStorage::init_local(object_path);
     let store = OperationStoreV2::new_for_repo("repo-1", db, storage);
 
-    let view_oid = store.write_view_manifest(&view()).expect("manifest writes");
-    assert_eq!(store.load_view(&view_oid).expect("manifest loads"), view());
+    let view_oid = store
+        .write_view_manifest(&view())
+        .await
+        .expect("manifest writes");
+    assert_eq!(
+        store.load_view(&view_oid).await.expect("manifest loads"),
+        view()
+    );
 
     let operation = OperationV2 {
         op_id: "op-1".to_string(),
@@ -59,11 +65,10 @@ async fn operation_store_round_trips_objects_journal_and_head_cas() {
         .await
         .expect("operation writes");
 
-    let generation = store
+    store
         .cas_update_op_heads("repo-1", "main", &[], &["op-1".to_string()])
         .await
         .expect("initial head publish");
-    assert_eq!(generation, 1);
     assert_eq!(
         store
             .read_heads("repo-1", "main")

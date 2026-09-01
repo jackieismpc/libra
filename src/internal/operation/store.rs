@@ -356,7 +356,7 @@ impl OperationStoreV2 {
         &self.db
     }
 
-    pub fn write_view_manifest(&self, view: &RepoViewV2) -> Result<ObjectHash, StoreError> {
+    pub async fn write_view_manifest(&self, view: &RepoViewV2) -> Result<ObjectHash, StoreError> {
         let bytes = view.to_canonical_bytes()?;
         let oid = ObjectHash::from_type_and_data(ObjectType::Blob, &bytes);
         self.storage
@@ -365,7 +365,7 @@ impl OperationStoreV2 {
         Ok(oid)
     }
 
-    pub fn load_view(&self, oid: &ObjectHash) -> Result<RepoViewV2, StoreError> {
+    pub async fn load_view(&self, oid: &ObjectHash) -> Result<RepoViewV2, StoreError> {
         let bytes = self
             .storage
             .get(oid)
@@ -452,7 +452,7 @@ impl OperationStoreV2 {
         scope_key: &str,
         expected_heads: &[String],
         new_heads: &[String],
-    ) -> Result<u64, StoreError> {
+    ) -> Result<(), StoreError> {
         let expected = normalize_heads(expected_heads)?;
         let replacement = normalize_heads(new_heads)?;
         let txn = begin_write_transaction(&self.db).await?;
@@ -508,7 +508,7 @@ impl OperationStoreV2 {
             }
         }
         txn.commit().await?;
-        Ok(generation)
+        Ok(())
     }
 
     pub async fn read_heads(
