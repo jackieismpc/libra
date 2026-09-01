@@ -19,10 +19,11 @@ extension rather than a Git command. The current public surface supports:
 
 - CLI entry: `src/cli.rs::Commands::Op`.
 - Command implementation: `src/command/op.rs`.
-- Storage/service layer: `src/internal/operation.rs`.
+- Storage/service layer: `src/internal/operation/store.rs` (v2); the legacy
+  command adapter is retained only until the later OL-15 command-path cutover.
 - Transaction wrapper: `src/internal/operation_wrapper.rs`.
-- Operation tables are part of the bootstrap schema and are also ensured by the
-  explicit database upgrade path for older repositories.
+- Operation tables are installed by the versioned v2 migration when a database
+  is created or opened for upgrade.
 - OL-02 replaces the development-only v1 operation tables with the v2 tables
   `operation`, `operation_parent`, `operation_head`, `operation_journal`,
   `change_identity`, `change_revision`, `change_predecessor`, and

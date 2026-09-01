@@ -359,17 +359,33 @@ impl OperationStoreV2 {
     pub async fn write_view_manifest(&self, view: &RepoViewV2) -> Result<ObjectHash, StoreError> {
         let bytes = view.to_canonical_bytes()?;
         let oid = ObjectHash::from_type_and_data(ObjectType::Blob, &bytes);
-        self.storage
-            .put(&oid, &bytes, ObjectType::Blob)
-            .map_err(|error| StoreError::Object(error.to_string()))?;
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || {
+            storage
+                .put(&oid, &bytes, ObjectType::Blob)
+                .map_err(|error| StoreError::Object(error.to_string()))
+        })
+        .await
+        .map_err(|error| StoreError::Object(error.to_string()))??;
         Ok(oid)
     }
 
     pub async fn load_view(&self, oid: &ObjectHash) -> Result<RepoViewV2, StoreError> {
-        let bytes = self
-            .storage
-            .get(oid)
-            .map_err(|error| StoreError::Object(error.to_string()))?;
+        let storage = self.storage.clone();
+        let expected_oid = *oid;
+        let bytes = tokio::task::spawn_blocking(move || {
+            storage
+                .get(&expected_oid)
+                .map_err(|error| StoreError::Object(error.to_string()))
+        })
+        .await
+        .map_err(|error| StoreError::Object(error.to_string()))??;
+        let actual_oid = ObjectHash::from_type_and_data(ObjectType::Blob, &bytes);
+        if actual_oid != *oid {
+            return Err(StoreError::InvalidObjectHash(format!(
+                "manifest {oid} contains object {actual_oid}"
+            )));
+        }
         RepoViewV2::from_canonical_bytes(&bytes).map_err(StoreError::View)
     }
 
@@ -395,7 +411,7 @@ impl OperationStoreV2 {
                  command_name, description, args_digest, actor, worktree_id, scope_kind, \
                  pre_view_oid, post_view_oid, restores_op_id, reverts_op_id, \
                  predecessor_map_oid, causal_context_id, start_ts, end_ts) \
-                 VALUES (?, ?, 2, ?, ?, ?, ?, ?, ?, NULL, 'repository', ?, ?, ?, ?, ?, ?, ?, NULL)",
+                 VALUES (?, ?, 2, ?, ?, ?, ?, ?, ?, NULL, 'repository', ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     operation.op_id.clone().into(),
                     self.repo_id.clone().into(),
@@ -415,6 +431,14 @@ impl OperationStoreV2 {
                         .into(),
                     operation.metadata.causal_context_id.clone().into(),
                     start_ts.into(),
+                    match operation.status {
+                        OperationStatusV2::Running => None,
+                        OperationStatusV2::Success
+                        | OperationStatusV2::Failed
+                        | OperationStatusV2::Partial
+                        | OperationStatusV2::Aborted => Some(start_ts),
+                    }
+                    .into(),
                 ],
             ))
             .await;
@@ -534,8 +558,16 @@ impl OperationStoreV2 {
             .db
             .query_all_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "SELECT op_id, parent_op_id FROM operation_parent ORDER BY op_id, ordinal",
-                [],
+                "WITH RECURSIVE reachable(op_id) AS ( \
+                 SELECT op_id FROM operation_head WHERE repo_id = ? AND scope_key = ? \
+                 UNION \
+                 SELECT parent_op_id FROM operation_parent \
+                 JOIN reachable ON operation_parent.op_id = reachable.op_id \
+                 ) SELECT operation_parent.op_id, operation_parent.parent_op_id \
+                 FROM operation_parent JOIN reachable \
+                 ON operation_parent.op_id = reachable.op_id \
+                 ORDER BY operation_parent.op_id, operation_parent.ordinal",
+                [repo_id.into(), scope_key.into()],
             ))
             .await?;
         for row in parent_rows {
@@ -607,10 +639,13 @@ async fn query_head_rows<C: ConnectionTrait>(
         .await?;
     rows.into_iter()
         .map(|row| {
-            Ok((
-                row.try_get_by_index::<String>(0)?,
-                row.try_get_by_index::<i64>(1)? as u64,
-            ))
+            let generation = row.try_get_by_index::<i64>(1)?;
+            if generation < 0 {
+                return Err(StoreError::Validation(format!(
+                    "operation head generation cannot be negative: {generation}"
+                )));
+            }
+            Ok((row.try_get_by_index::<String>(0)?, generation as u64))
         })
         .collect()
 }

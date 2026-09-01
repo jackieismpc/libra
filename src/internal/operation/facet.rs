@@ -172,6 +172,12 @@ impl FacetRegistry {
             .get(name)
             .ok_or_else(|| FacetError::Unregistered(name.clone()))?;
         let capture = facet.capture(ctx)?;
+        if capture.facet != *name {
+            return Err(FacetError::NameMismatch {
+                facet: name.clone(),
+                returned: capture.facet,
+            });
+        }
         self.validate_capture(&capture)?;
         Ok(capture)
     }
@@ -247,6 +253,7 @@ mod tests {
 
     struct TestFacet {
         policy: RestorePolicy,
+        capture_name: FacetName,
     }
 
     impl StateFacet for TestFacet {
@@ -264,7 +271,7 @@ mod tests {
 
         fn capture(&self, _ctx: &FacetCaptureCtx) -> Result<FacetCapture, FacetError> {
             Ok(FacetCapture {
-                facet: self.name(),
+                facet: self.capture_name.clone(),
                 schema_version: 1,
                 payload_oid: None,
                 meta: serde_json::json!({"count": 1}),
@@ -309,6 +316,7 @@ mod tests {
         registry
             .register(Box::new(TestFacet {
                 policy: RestorePolicy::NeverRestore,
+                capture_name: FacetName::from("test"),
             }))
             .expect("register facet");
         let capture = registry
@@ -323,6 +331,7 @@ mod tests {
         registry
             .register(Box::new(TestFacet {
                 policy: RestorePolicy::AutoRestore,
+                capture_name: FacetName::from("test"),
             }))
             .expect("register facet");
         let capture = FacetCapture {
@@ -335,5 +344,20 @@ mod tests {
             registry.validate_capture(&capture),
             Err(FacetError::NonCanonicalMetadata)
         ));
+    }
+
+    #[test]
+    fn registry_rejects_capture_with_wrong_facet_name() {
+        let mut registry = FacetRegistry::new();
+        registry
+            .register(Box::new(TestFacet {
+                policy: RestorePolicy::AutoRestore,
+                capture_name: FacetName::from("other"),
+            }))
+            .expect("register facet");
+        let error = registry
+            .capture(&FacetName::from("test"), &FacetCaptureCtx::default())
+            .expect_err("facet name mismatch must fail closed");
+        assert!(matches!(error, FacetError::NameMismatch { .. }));
     }
 }

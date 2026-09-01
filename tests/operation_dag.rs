@@ -106,4 +106,49 @@ async fn operation_store_round_trips_objects_journal_and_head_cas() {
             .len(),
         1
     );
+
+    for (op_id, parent_op_ids) in [
+        ("op-2", vec!["op-1".to_string()]),
+        ("op-3", vec!["op-2".to_string(), "op-1".to_string()]),
+    ] {
+        store
+            .write_operation(&OperationV2 {
+                op_id: op_id.to_string(),
+                parent_op_ids,
+                pre_view_oid: view_oid,
+                post_view_oid: view_oid,
+                kind: OperationKind::Reconcile,
+                status: OperationStatusV2::Success,
+                metadata: OperationMetaV2::default(),
+                restores_op_id: None,
+                reverts_op_id: None,
+                predecessor_map_oid: None,
+            })
+            .await
+            .expect("DAG operation writes");
+    }
+    store
+        .cas_update_op_heads(
+            "repo-1",
+            "main",
+            &["op-1".to_string()],
+            &["op-2".to_string()],
+        )
+        .await
+        .expect("DAG head publish");
+    store
+        .cas_update_op_heads(
+            "repo-1",
+            "main",
+            &["op-2".to_string()],
+            &["op-3".to_string()],
+        )
+        .await
+        .expect("multi-parent head publish");
+    let heads = store
+        .read_heads_view("repo-1", "main")
+        .await
+        .expect("DAG heads read");
+    assert_eq!(heads.head_ids(), ["op-3"]);
+    assert!(heads.is_ancestor("op-1", "op-3"));
 }
