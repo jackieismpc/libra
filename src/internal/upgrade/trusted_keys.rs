@@ -147,11 +147,37 @@ mod tests {
             );
         }
 
+        // The installers' key-policy constants (generation + validity window)
+        // must track the same trust-table entry: a rotation that updates the
+        // native table but leaves an installer's window stale fails here.
+        assert!(install_sh.contains("LIBRA_RELEASE_MANIFEST_KEY_GENERATION=1"));
+        assert!(
+            install_sh.contains("LIBRA_RELEASE_MANIFEST_KEY_NOT_BEFORE=\"2026-08-31T11:09:55Z\"")
+        );
+        assert!(
+            install_sh.contains("LIBRA_RELEASE_MANIFEST_KEY_NOT_AFTER=\"2027-08-31T00:00:00Z\"")
+        );
+
         let install_ps1 = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/install.ps1"));
         assert!(install_ps1.contains("$ReleaseManifestKeyId = \"libra-release-1\""));
         assert!(install_ps1.contains(
             "$ReleaseManifestPublicKeyHex = \"68aa00ea9358d455645010d811d40702b3f67cec4bdff52d3d4fb8107afaeed3\""
         ));
+        assert!(install_ps1.contains("$ReleaseManifestKeyGeneration = 1"));
+        assert!(install_ps1.contains("$ReleaseManifestKeyNotBefore = \"2026-08-31T11:09:55Z\""));
+        assert!(install_ps1.contains("$ReleaseManifestKeyNotAfter = \"2027-08-31T00:00:00Z\""));
+
+        // The canonical-UTC window strings must equal the numeric windows in
+        // this table (chrono is the authority, not a hand-derived comment).
+        for (raw, expected) in [
+            ("2026-08-31T11:09:55Z", key.not_before),
+            ("2027-08-31T00:00:00Z", key.not_after),
+        ] {
+            let parsed = chrono::DateTime::parse_from_rfc3339(raw)
+                .expect("window constant must be RFC3339")
+                .timestamp();
+            assert_eq!(parsed, expected, "installer window constant {raw} drifted");
+        }
 
         let ceremony_record = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),

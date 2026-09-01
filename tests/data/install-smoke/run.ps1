@@ -1,4 +1,4 @@
-# install.ps1 smoke harness — six scenario families (plan-20260821 A1-05).
+# install.ps1 smoke harness — twenty-two scenarios (plan-20260821 A1-05).
 #
 #   pwsh -NoProfile -File tests/data/install-smoke/run.ps1
 #
@@ -36,6 +36,7 @@ function Fail([string]$Message) {
 try {
     # ── fixture server ──────────────────────────────────────────────────────
     $DocRoot = Join-Path $Work "docroot"
+    New-Item -ItemType Directory -Path $DocRoot -Force | Out-Null
     Copy-Item -Recurse (Join-Path $Fixtures "tree/*") $DocRoot -Force
     $PortFile = Join-Path $Work "port"
     $serverScript = @"
@@ -65,6 +66,9 @@ httpd.serve_forever()
     Rewrite '$ReleaseManifestKeyId = "libra-release-1"' '$ReleaseManifestKeyId = "libra-release-test-1"'
     Rewrite '$ReleaseManifestPublicKeyHex = "68aa00ea9358d455645010d811d40702b3f67cec4bdff52d3d4fb8107afaeed3"' '$ReleaseManifestPublicKeyHex = "a8a00ded13ddafaad525fabddc13efc717b29ebed50cd6d653196057fa8f8a43"'
     Rewrite '$ReleaseManifestOrigin = "https://download.libra.tools"' ('$ReleaseManifestOrigin = "' + $Base + '"')
+    # The test keypair's validity window (fixtures are signed inside it).
+    Rewrite '$ReleaseManifestKeyNotBefore = "2026-08-31T11:09:55Z"' '$ReleaseManifestKeyNotBefore = "2026-01-01T00:00:00Z"'
+    Rewrite '$ReleaseManifestKeyNotAfter = "2027-08-31T00:00:00Z"' '$ReleaseManifestKeyNotAfter = "2028-01-01T00:00:00Z"'
     Rewrite '[string]$DownloadBaseUrl = "https://download.libra.tools",' ('[string]$DownloadBaseUrl = "' + $Base + '",')
     $copy = $copy -replace '\$DefaultVersion = "v[0-9][0-9.]*"', '$DefaultVersion = "v9.9.8"'
     $CopyPath = Join-Path $Work "install-copy.ps1"
@@ -80,25 +84,27 @@ httpd.serve_forever()
             Copy-Item (Join-Path $Fixtures $Manifest) (Join-Path $stableDir "manifest-v1.json") -Force
         }
 
-        $home = Join-Path $Work "home-$Name"
-        New-Item -ItemType Directory -Path $home -Force | Out-Null
-        $installDir = Join-Path $home "bin"
+        $scenarioHome = Join-Path $Work "home-$Name"
+        New-Item -ItemType Directory -Path $scenarioHome -Force | Out-Null
+        $installDir = Join-Path $scenarioHome "bin"
 
         $envBackup = @{}
         $scenarioEnv = @{
             PROCESSOR_ARCHITECTURE = "AMD64"
-            LOCALAPPDATA           = $home
-            USERPROFILE            = $home
-            TEMP                   = (Join-Path $home "tmp")
+            LOCALAPPDATA           = $scenarioHome
+            USERPROFILE            = $scenarioHome
+            TEMP                   = (Join-Path $scenarioHome "tmp")
             LIBRA_VERSION          = $null
             LIBRA_ALLOW_FALLBACK   = $null
             LIBRA_NO_ALIAS         = "1"
-        } + $ExtraEnv
+        }
+        # Hashtable '+' throws on duplicate keys; ExtraEnv must OVERRIDE.
+        foreach ($key in $ExtraEnv.Keys) { $scenarioEnv[$key] = $ExtraEnv[$key] }
         foreach ($key in $scenarioEnv.Keys) {
             $envBackup[$key] = [Environment]::GetEnvironmentVariable($key)
             [Environment]::SetEnvironmentVariable($key, $scenarioEnv[$key])
         }
-        New-Item -ItemType Directory -Path (Join-Path $home "tmp") -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $scenarioHome "tmp") -Force | Out-Null
 
         $failed = $false
         $output = ""
@@ -118,7 +124,11 @@ httpd.serve_forever()
         $installed = Test-Path (Join-Path $installDir "libra.exe")
         if ($ExpectInstalled -eq "yes" -and -not $installed) { Fail "${Name}: expected an installed libra.exe`n$output" }
         if ($ExpectInstalled -eq "no" -and $installed) { Fail "${Name}: a binary landed on a fail-closed path`n$output" }
-        if ($output -notmatch [regex]::Escape($Needle)) { Fail "${Name}: output does not mention '$Needle'`n$output" }
+        # Error records wrap at console width and ConciseView inserts "|"
+        # gutter decorations between fragments; strip both so multi-word
+        # needles match regardless of where the renderer broke the line.
+        $flatOutput = ($output -replace '[|]', ' ') -replace '\s+', ' '
+        if ($flatOutput -notmatch [regex]::Escape($Needle)) { Fail "${Name}: output does not mention '$Needle'`n$output" }
         $script:ScenariosRun++
         Write-Host "ok: $Name"
     }
@@ -126,7 +136,23 @@ httpd.serve_forever()
     Run-Scenario "valid" "manifest-valid.json" "ok" "yes" "Signed stable manifest verified"
     Run-Scenario "bad-signature" "manifest-bad-signature.json" "fail" "no" "SIGNATURE VERIFICATION FAILED"
     Run-Scenario "sha-mismatch" "manifest-sha-mismatch.json" "fail" "no" "sha256 mismatch against the SIGNED manifest"
-    Run-Scenario "size-mismatch" "manifest-size-mismatch.json" "fail" "no" "size mismatch"
+    Run-Scenario "size-mismatch" "manifest-size-mismatch.json" "fail" "no" "does not match the signed size"
+    Run-Scenario "expired" "manifest-expired.json" "fail" "no" "is expired"
+    Run-Scenario "paused" "manifest-paused.json" "fail" "no" "PAUSED"
+    Run-Scenario "revoked" "manifest-revoked.json" "fail" "no" "REVOKED"
+    Run-Scenario "stale-replay" "manifest-stale-replay.json" "fail" "no" "older than this installer's baseline"
+    Run-Scenario "tampered-payload" "manifest-tampered-payload.json" "fail" "no" "SIGNATURE VERIFICATION FAILED"
+    Run-Scenario "zero-size" "manifest-zero-size.json" "fail" "no" "outside (0, 128 MiB]"
+    Run-Scenario "future-min-key" "manifest-future-min-key.json" "fail" "no" "min_key_generation"
+    Run-Scenario "key-window" "manifest-key-window.json" "fail" "no" "validity window"
+    Run-Scenario "noncanonical" "manifest-noncanonical.json" "fail" "no" "canonical serialization"
+    Run-Scenario "bad-calendar" "manifest-bad-calendar.json" "fail" "no" "2026-09-31"
+    Run-Scenario "huge-min-key" "manifest-huge-min-key.json" "fail" "no" "canonical serialization"
+    Run-Scenario "trailing-artifact" "manifest-trailing-artifact.json" "fail" "no" "canonical serialization"
+    Run-Scenario "pretty-envelope" "manifest-pretty-envelope.json" "ok" "yes" "Signed stable manifest verified"
+    Run-Scenario "undersized" "manifest-undersized.json" "fail" "no" "does not match the signed size"
+    Run-Scenario "multiline-payload" "manifest-multiline-payload.json" "fail" "no" "canonical serialization"
+    Run-Scenario "huge-semver" "manifest-huge-semver.json" "fail" "no" "not canonical X.Y.Z"
     Run-Scenario "transition-404" "-none-" "fail" "no" "signature chain is not enabled yet"
     Run-Scenario "transition-404-fallback" "-none-" "ok" "yes" "proceeding UNVERIFIED" @{ LIBRA_ALLOW_FALLBACK = "1" }
 
@@ -135,7 +161,7 @@ httpd.serve_forever()
     if (-not [System.Linq.Enumerable]::SequenceEqual($OriginalBytes, $after)) {
         Fail "the production install.ps1 was modified by the harness"
     }
-    if ($ScenariosRun -ne 6) { Fail "expected 6 scenarios, ran $ScenariosRun" }
+    if ($ScenariosRun -ne 22) { Fail "expected 22 scenarios, ran $ScenariosRun" }
     Write-Host "install.ps1 smoke: all $ScenariosRun scenarios passed"
 } finally {
     Cleanup
