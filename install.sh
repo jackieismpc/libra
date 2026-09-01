@@ -19,6 +19,19 @@ INSTALL_DIR="${LIBRA_INSTALL_DIR:-$LIBRA_HOME/bin}"
 # offline installs cannot silently regress to a stale version. Bump this on
 # every release so the opt-in fallback remains useful.
 DEFAULT_VERSION="v0.23.0"
+# Public-only trust anchor for stable-manifest verification. It deliberately
+# has no environment override: the install-smoke harness rewrites these
+# clearly-marked constants in a temporary COPY of this script, never through
+# the environment. The PEM is the same key as the hex, in SubjectPublicKeyInfo
+# form for `openssl pkeyutl` (kept in sync by the trusted_keys unit tests).
+LIBRA_RELEASE_MANIFEST_KEY_ID="libra-release-1"
+LIBRA_RELEASE_MANIFEST_PUBLIC_KEY_HEX="68aa00ea9358d455645010d811d40702b3f67cec4bdff52d3d4fb8107afaeed3"
+LIBRA_RELEASE_MANIFEST_PUBLIC_KEY_PEM="-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAaKoA6pNY1FVkUBDYEdQHArP2fOxL3/UtPU+4EHr67tM=
+-----END PUBLIC KEY-----"
+# Pinned origin of the signed stable channel (no env override; marker for the
+# smoke harness only). Signed artifact URLs must live under this origin.
+LIBRA_RELEASE_MANIFEST_ORIGIN="https://download.libra.tools"
 
 # ─── theme (Dusk) ────────────────────────────────────────────────────────────
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ -z "${LIBRA_NO_TUI:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
@@ -452,6 +465,220 @@ verify_checksum() {
     fact "checksum" "sha256 ok"
 }
 
+# ─── signed stable channel (UP-01 A1-05) ────────────────────────────────────
+# Default installs verify the Ed25519-signed stable manifest before touching
+# any binary. Failure taxonomy (ADR-UP01-03/06):
+#   verified            → version/url/sha256/size come from the signed payload
+#   manifest 404        → signature chain not enabled yet: explicit-confirm
+#                         transition path (prompt, or LIBRA_ALLOW_FALLBACK=1)
+#   verifier unavailable→ same explicit-confirm transition path
+#   anything else       → fail closed (no partial install, non-zero exit)
+
+# Whether this host can verify Ed25519 signatures: needs openssl with working
+# ed25519 sign/verify (probed end-to-end with a throwaway key, which covers
+# OpenSSL ≥ 1.1.1 and modern LibreSSL alike) plus a sha256 tool.
+manifest_verifier_available() {
+    command -v openssl >/dev/null 2>&1 || return 1
+    [ -n "$(printf 'probe' | sha256_of_stdin)" ] || return 1
+    probe_dir=$(mktemp -d 2>/dev/null) || return 1
+    (
+        cd "$probe_dir" || exit 1
+        openssl genpkey -algorithm ed25519 -out t.pem >/dev/null 2>&1 || exit 1
+        openssl pkey -in t.pem -pubout -out t.pub >/dev/null 2>&1 || exit 1
+        printf 'libra-verifier-probe' > m.bin
+        openssl pkeyutl -sign -inkey t.pem -rawin -in m.bin -out s.bin >/dev/null 2>&1 || exit 1
+        openssl pkeyutl -verify -pubin -inkey t.pub -rawin -in m.bin -sigfile s.bin >/dev/null 2>&1
+    )
+    probe_ok=$?
+    rm -rf "$probe_dir"
+    return $probe_ok
+}
+
+# sha256 of stdin (mirrors sha256_of; empty when no tool exists).
+sha256_of_stdin() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum 2>/dev/null | awk '{print $1; exit}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 2>/dev/null | awk '{print $1; exit}'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 2>/dev/null | awk '{print $NF; exit}'
+    fi
+}
+
+# Fetch the stable manifest into "$1". Prints one of: ok / missing / error.
+fetch_stable_manifest() {
+    manifest_url="${LIBRA_RELEASE_MANIFEST_ORIGIN}/libra/releases/stable/manifest-v1.json"
+    if [ "$DOWNLOADER" = "curl" ]; then
+        http_code=$(curl -sSL --connect-timeout 10 --max-time 60 \
+            -o "$1" -w '%{http_code}' "$manifest_url" 2>/dev/null) || http_code=000
+        case "$http_code" in
+            200) printf 'ok' ;;
+            404) printf 'missing' ;;
+            *)   printf 'error' ;;
+        esac
+    else
+        wget_out=$(wget -q --server-response --timeout=30 --tries=2 \
+            -O "$1" "$manifest_url" 2>&1)
+        wget_rc=$?
+        if [ "$wget_rc" -eq 0 ]; then
+            printf 'ok'
+        elif printf '%s' "$wget_out" | grep -q ' 404 '; then
+            printf 'missing'
+        else
+            printf 'error'
+        fi
+    fi
+}
+
+# POSIX lexicographic strictly-less (test's "<" is not portable).
+lex_less() {
+    [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | LC_ALL=C sort | head -n1)" = "$1" ]
+}
+
+# Extract the value of a "key":"value" string field from compact JSON in $2.
+json_string_field() {
+    sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p" "$2" | head -n1
+}
+
+# Verify the signed stable manifest at "$1" and export STABLE_VERSION,
+# STABLE_URL, STABLE_SHA256, STABLE_SIZE for this platform. Any failure here
+# is terminal (fail closed) — callers must NOT fall back to unsigned installs.
+verify_stable_manifest() {
+    manifest_file=$1
+    work_dir=$(mktemp -d 2>/dev/null) \
+        || error_exit "mktemp failed" "verify" "make sure \$TMPDIR is writable"
+
+    schema=$(sed -n 's/.*"schema_version":\([0-9][0-9]*\).*/\1/p' "$manifest_file" | head -n1)
+    [ "$schema" = "1" ] || { rm -rf "$work_dir"; error_exit "stable manifest has unsupported schema_version '${schema:-?}'" "verify" \
+        "refusing to install — report at github.com/libra-tools/libra/issues"; }
+
+    payload_b64=$(json_string_field payload "$manifest_file")
+    # The first signature entry carrying our key id (dual-signed rotations put
+    # key_id before signature, as the backend serializer guarantees).
+    sig_b64=$(sed -n "s/.*\"key_id\":\"${LIBRA_RELEASE_MANIFEST_KEY_ID}\",\"signature\":\"\\([^\"]*\\)\".*/\\1/p" "$manifest_file" | head -n1)
+    if [ -z "$payload_b64" ] || [ -z "$sig_b64" ]; then
+        rm -rf "$work_dir"
+        error_exit "stable manifest carries no signature from key '${LIBRA_RELEASE_MANIFEST_KEY_ID}'" "verify" \
+            "refusing to install — the download origin may be compromised"
+    fi
+
+    printf '%s' "$payload_b64" | openssl base64 -d -A > "$work_dir/payload.bin" 2>/dev/null \
+        || { rm -rf "$work_dir"; error_exit "stable manifest payload is not valid base64" "verify" "refusing to install"; }
+    printf '%s' "$sig_b64" | openssl base64 -d -A > "$work_dir/sig.bin" 2>/dev/null \
+        || { rm -rf "$work_dir"; error_exit "stable manifest signature is not valid base64" "verify" "refusing to install"; }
+    printf '%s' "$LIBRA_RELEASE_MANIFEST_PUBLIC_KEY_PEM" > "$work_dir/trust.pem"
+    # Domain-separated message: prefix (with one trailing NUL) || payload.
+    { printf 'libra-upgrade-manifest-v1\0'; cat "$work_dir/payload.bin"; } > "$work_dir/msg.bin"
+
+    if ! openssl pkeyutl -verify -pubin -inkey "$work_dir/trust.pem" -rawin \
+        -in "$work_dir/msg.bin" -sigfile "$work_dir/sig.bin" >/dev/null 2>&1; then
+        rm -rf "$work_dir"
+        error_exit "stable manifest SIGNATURE VERIFICATION FAILED" "verify" \
+            "refusing to install — the download origin may be compromised; report at github.com/libra-tools/libra/issues"
+    fi
+
+    payload_file="$work_dir/payload.bin"
+    channel=$(json_string_field channel "$payload_file")
+    STABLE_VERSION=$(json_string_field version "$payload_file")
+    expires_at=$(json_string_field expires_at "$payload_file")
+    paused=$(sed -n 's/.*"paused":\(true\|false\).*/\1/p' "$payload_file" | head -n1)
+
+    [ "$channel" = "stable" ] || { rm -rf "$work_dir"; error_exit "signed manifest channel '${channel:-?}' is not 'stable'" "verify" "refusing to install"; }
+    [ -n "$STABLE_VERSION" ] || { rm -rf "$work_dir"; error_exit "signed manifest carries no version" "verify" "refusing to install"; }
+    # RFC3339 UTC timestamps compare lexicographically; refuse expired manifests.
+    now_utc=$(date -u '+%Y-%m-%dT%H:%M:%S')
+    expires_cmp=$(printf '%s' "$expires_at" | cut -c1-19)
+    if [ -z "$expires_cmp" ] || ! lex_less "$now_utc" "$expires_cmp"; then
+        rm -rf "$work_dir"
+        error_exit "signed stable manifest is expired (expires_at ${expires_at:-?})" "verify" \
+            "the publisher must renew the manifest — refusing to install"
+    fi
+    if [ "$paused" = "true" ]; then
+        rm -rf "$work_dir"
+        error_exit "releases are PAUSED by the publisher (signed manifest paused=true)" "verify" \
+            "an emergency stop is active — try again later or check github.com/libra-tools/libra"
+    fi
+    if printf '%s' "$(sed -n 's/.*"revoked_versions":\[\([^]]*\)\].*/\1/p' "$payload_file")" \
+        | grep -q "\"${STABLE_VERSION}\""; then
+        rm -rf "$work_dir"
+        error_exit "signed stable version ${STABLE_VERSION} is REVOKED by a newer control decision" "verify" \
+            "refusing to install a revoked build"
+    fi
+
+    platform_key="${OS}-${ARCH}"
+    artifact_row=$(sed -n "s/.*{\"platform\":\"${platform_key}\",\"url\":\"\\([^\"]*\\)\",\"sha256\":\"\\([0-9a-f]*\\)\",\"size\":\\([0-9][0-9]*\\)}.*/\\1 \\2 \\3/p" "$payload_file" | head -n1)
+    rm -rf "$work_dir"
+    if [ -z "$artifact_row" ]; then
+        error_exit "signed manifest has no artifact for ${platform_key}" "verify" \
+            "this platform is not in the release matrix"
+    fi
+    STABLE_URL=$(printf '%s' "$artifact_row" | awk '{print $1}')
+    STABLE_SHA256=$(printf '%s' "$artifact_row" | awk '{print $2}')
+    STABLE_SIZE=$(printf '%s' "$artifact_row" | awk '{print $3}')
+    case "$STABLE_URL" in
+        "https://download.libra.tools/libra/releases/"*) ;;
+        *) error_exit "signed artifact URL is outside the pinned origin: $STABLE_URL" "verify" \
+            "refusing to install" ;;
+    esac
+    [ -n "$STABLE_SHA256" ] && [ -n "$STABLE_SIZE" ] \
+        || error_exit "signed manifest artifact row is incomplete" "verify" "refusing to install"
+}
+
+# Explicit-confirm gate for the two transition states (manifest 404 and
+# verifier unavailable). NEVER silent: requires an interactive yes or
+# LIBRA_ALLOW_FALLBACK=1, otherwise the install stops with a clear message.
+confirm_unverified_transition() {
+    reason=$1
+    if [ "${LIBRA_ALLOW_FALLBACK:-0}" = "1" ]; then
+        warn_fact "signature" "$reason — proceeding UNVERIFIED (LIBRA_ALLOW_FALLBACK=1)"
+        return 0
+    fi
+    if [ -t 0 ] && [ "$TTY" = "1" ]; then
+        printf '  %s!%s %s%s%s\n' "$C_WARN" "$C_RESET" "$C_TEXT" "$reason" "$C_RESET"
+        printf '  %sContinue with an UNVERIFIED download? [y/N]%s ' "$C_WARN" "$C_RESET"
+        read -r answer
+        case "$answer" in
+            y|Y|yes|YES) warn_fact "signature" "$reason — user confirmed UNVERIFIED install"; return 0 ;;
+        esac
+    fi
+    error_exit "$reason" "verify" \
+        "no signed manifest verification is possible; set LIBRA_ALLOW_FALLBACK=1 (or confirm interactively) to opt in to an UNVERIFIED install"
+}
+
+# Resolve the install through the signed stable channel. On success sets
+# INSTALL_VERIFIED=1 and VERSION. On a transition state (404 / no verifier),
+# gates through confirm_unverified_transition and leaves INSTALL_VERIFIED=0.
+resolve_stable_channel() {
+    INSTALL_VERIFIED=0
+    if ! manifest_verifier_available; then
+        confirm_unverified_transition \
+            "signature verifier unavailable (need openssl with Ed25519 support and a sha256 tool)"
+        return 0
+    fi
+    MANIFEST_TMP=$(mktemp 2>/dev/null) \
+        || error_exit "mktemp failed" "verify" "make sure \$TMPDIR is writable"
+    manifest_status=$(fetch_stable_manifest "$MANIFEST_TMP")
+    case "$manifest_status" in
+        ok)
+            verify_stable_manifest "$MANIFEST_TMP"
+            rm -f "$MANIFEST_TMP"
+            VERSION="v${STABLE_VERSION}"
+            INSTALL_VERIFIED=1
+            fact "signature" "stable manifest verified (Ed25519, key ${LIBRA_RELEASE_MANIFEST_KEY_ID})"
+            ;;
+        missing)
+            rm -f "$MANIFEST_TMP"
+            confirm_unverified_transition \
+                "the auto-upgrade signature chain is not enabled yet (stable manifest does not exist)"
+            ;;
+        *)
+            rm -f "$MANIFEST_TMP"
+            error_exit "could not fetch the signed stable manifest" "verify" \
+                "network problem reaching ${LIBRA_RELEASE_MANIFEST_ORIGIN} — retry; this is NOT the unsigned-fallback case"
+            ;;
+    esac
+}
+
 fetch_latest_version() {
     # Returns the latest tag, or empty string on failure. Caller decides what
     # to do with empty (fail-fast vs. opt-in fallback) — see main().
@@ -615,7 +842,14 @@ screen_install() {
     fi
 
     binary_name="libra-${OS}-${ARCH}"
-    download_url="${BASE_URL}/${VERSION}/${binary_name}"
+    if [ "${INSTALL_VERIFIED:-0}" = "1" ]; then
+        # Signed path: the URL comes from the verified manifest. The download
+        # goes through the pinned origin constant so the smoke harness can
+        # redirect a COPY; in production this substitution is a no-op.
+        download_url="${LIBRA_RELEASE_MANIFEST_ORIGIN}${STABLE_URL#https://download.libra.tools}"
+    else
+        download_url="${BASE_URL}/${VERSION}/${binary_name}"
+    fi
     TEMP_DIR=$(mktemp -d 2>/dev/null) \
         || error_exit "mktemp failed" "install" "make sure mktemp is installed and \$TMPDIR is writable"
     temp_file="${TEMP_DIR}/${binary_name}"
@@ -632,7 +866,23 @@ screen_install() {
 
     [ -s "$temp_file" ] || error_exit "downloaded file is empty" "install" "the mirror may be corrupted — please retry"
 
-    verify_checksum "$temp_file" "$download_url"
+    if [ "${INSTALL_VERIFIED:-0}" = "1" ]; then
+        # Signed path: size and sha256 come from the verified manifest and
+        # are MANDATORY — any mismatch is fatal and nothing is installed.
+        actual_size=$(wc -c <"$temp_file" 2>/dev/null | awk '{print $1}')
+        if [ "$actual_size" != "$STABLE_SIZE" ]; then
+            error_exit "size mismatch (signed manifest says $STABLE_SIZE bytes, got ${actual_size:-?})" "verify" \
+                "refusing to install — the download origin may be compromised"
+        fi
+        actual_sha=$(sha256_of "$temp_file")
+        if [ -z "$actual_sha" ] || [ "$actual_sha" != "$STABLE_SHA256" ]; then
+            error_exit "sha256 mismatch against the SIGNED manifest (expected $STABLE_SHA256, got ${actual_sha:-none})" "verify" \
+                "refusing to install — the download origin may be compromised"
+        fi
+        fact "checksum" "sha256 + size match the signed manifest"
+    else
+        verify_checksum "$temp_file" "$download_url"
+    fi
 
     BIN_SIZE=$(wc -c <"$temp_file" 2>/dev/null | awk '{printf "%.1f MB", $1/1048576}')
 
@@ -863,7 +1113,19 @@ main() {
     detect_arch
     check_dependencies
 
-    if [ -z "$VERSION" ]; then
+    # Default path: the Ed25519-signed stable channel (UP-01 A1-05). An
+    # explicit -v version or a custom mirror (LIBRA_BASE_URL) is an opt-in
+    # UNVERIFIED path and is warned about loudly below.
+    INSTALL_VERIFIED=0
+    if [ -z "$VERSION" ] && [ -z "${LIBRA_BASE_URL:-}" ]; then
+        resolve_stable_channel
+    elif [ -n "$VERSION" ]; then
+        warn_fact "signature" "-v pins a historic version: this path is NOT verified against the signed stable manifest"
+    elif [ -n "${LIBRA_BASE_URL:-}" ]; then
+        warn_fact "signature" "LIBRA_BASE_URL points at a custom mirror: this path is NOT verified against the signed stable manifest"
+    fi
+
+    if [ "$INSTALL_VERIFIED" = "0" ] && [ -z "$VERSION" ]; then
         VERSION=$(fetch_latest_version)
         if [ -z "$VERSION" ]; then
             if [ "${LIBRA_ALLOW_FALLBACK:-0}" = "1" ]; then

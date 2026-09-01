@@ -340,6 +340,10 @@ name = "compat_keyring_feature_gate_guard"
 path = "tests/compat/keyring_feature_gate_guard.rs"
 
 [[test]]
+name = "compat_release_rclone_env_guard"
+path = "tests/compat/release_rclone_env_guard.rs"
+
+[[test]]
 name = "compat_agent_capability_matrix_pin"
 path = "tests/compat/agent_capability_matrix_pin.rs"
 

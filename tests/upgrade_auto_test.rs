@@ -15,20 +15,21 @@ use std::{os::unix::fs::PermissionsExt, path::Path, process::Command};
 
 use base64::Engine as _;
 use libra::internal::upgrade::{
-    flow::{DecisionContext, SkipReason, UpgradeDecision, decide_from_envelope},
+    flow::{DecisionContext, FlowError, SkipReason, UpgradeDecision, decide_from_envelope},
     lock::InstallDir,
     manifest::{ReleaseVersion, SIGNATURE_DOMAIN_PREFIX, verify_envelope_bytes},
     marker::{
         InstallMarker, OFFICIAL_INSTALL_SOURCE, TARGET_BINARY_NAME, official_marker_for_target,
     },
     platform::Platform,
-    state::{UpgradeState, evaluate_manifest},
+    state::{StateRejection, UpgradeState, evaluate_manifest},
     trusted_keys::{TrustedKey, test_injection},
     txn::{self, CANDIDATE_NAME, OldTarget, TxnError, TxnOutcome},
 };
 use sha2::Digest as _;
 
 const SEED: [u8; 32] = [7u8; 32];
+const NEXT_GENERATION_SEED: [u8; 32] = [8u8; 32];
 /// Inside the payload lifetime `[2026-07-01, 2026-09-29)` (published_at is
 /// 1_782_864_000; this is a few minutes later).
 const GOOD_DATE: i64 = 1_782_864_100;
@@ -40,6 +41,17 @@ fn keypair() -> ring::signature::Ed25519KeyPair {
 fn pubkey() -> [u8; 32] {
     use ring::signature::KeyPair;
     keypair().public_key().as_ref().try_into().unwrap()
+}
+
+fn pubkey_for(seed: &[u8; 32]) -> [u8; 32] {
+    use ring::signature::KeyPair;
+
+    ring::signature::Ed25519KeyPair::from_seed_unchecked(seed)
+        .unwrap()
+        .public_key()
+        .as_ref()
+        .try_into()
+        .unwrap()
 }
 
 /// Install the test trust key once (idempotent; first call wins).
@@ -65,13 +77,21 @@ fn artifact(platform: &str, version: &str) -> serde_json::Value {
 }
 
 fn payload(version: &str, control: u64) -> serde_json::Value {
+    payload_with_generation(version, control, 1)
+}
+
+fn payload_with_generation(
+    version: &str,
+    control: u64,
+    min_key_generation: u32,
+) -> serde_json::Value {
     serde_json::json!({
         "channel": "stable",
         "version": version,
         "control_revision": control,
         "published_at": "2026-07-01T00:00:00Z",
         "expires_at": "2026-09-29T00:00:00Z",
-        "min_key_generation": 1,
+        "min_key_generation": min_key_generation,
         "paused": false,
         "revoked_versions": [],
         "artifacts": [
@@ -84,19 +104,42 @@ fn payload(version: &str, control: u64) -> serde_json::Value {
 }
 
 fn envelope(payload: &serde_json::Value) -> Vec<u8> {
+    envelope_with_signers(payload, &[("test-key-1", SEED)])
+}
+
+fn envelope_with_signers(payload: &serde_json::Value, signers: &[(&str, [u8; 32])]) -> Vec<u8> {
     let payload_bytes = serde_json::to_vec(payload).unwrap();
     let mut message = SIGNATURE_DOMAIN_PREFIX.to_vec();
     message.extend_from_slice(&payload_bytes);
-    let sig = keypair().sign(&message);
+    let signatures: Vec<_> = signers
+        .iter()
+        .map(|(key_id, seed)| {
+            let keypair = ring::signature::Ed25519KeyPair::from_seed_unchecked(seed).unwrap();
+            let signature = keypair.sign(&message);
+            serde_json::json!({
+                "key_id": key_id,
+                "signature": base64::engine::general_purpose::STANDARD.encode(signature.as_ref()),
+            })
+        })
+        .collect();
     serde_json::to_vec(&serde_json::json!({
         "schema_version": 1,
         "payload": base64::engine::general_purpose::STANDARD.encode(&payload_bytes),
-        "signatures": [{
-            "key_id": "test-key-1",
-            "signature": base64::engine::general_purpose::STANDARD.encode(sig.as_ref()),
-        }],
+        "signatures": signatures,
     }))
     .unwrap()
+}
+
+fn decision_context<'a>(state: &'a UpgradeState, trust: &'a [TrustedKey]) -> DecisionContext<'a> {
+    DecisionContext {
+        state,
+        https_date: Some(GOOD_DATE),
+        local_now: GOOD_DATE,
+        trust,
+        platform: Some(Platform::DarwinArm64),
+        installed_version: ReleaseVersion::parse("1.0.0").unwrap(),
+        installed_at_rfc3339: "2026-07-17T00:00:00Z",
+    }
 }
 
 fn owned_dir() -> (tempfile::TempDir, InstallDir) {
@@ -133,9 +176,15 @@ fn upgrade_full_verify_and_decide_installs_newer() {
 
 #[test]
 fn upgrade_release_binary_has_no_test_trust_root() {
-    // The production trust table (compiled without the test override) is empty
-    // — proven here by verifying an otherwise-valid envelope against it fails.
+    // The production table may contain ceremony keys, but test-only signing
+    // material is never a production trust root.
     let env = envelope(&payload("2.0.0", 5));
+    assert!(!libra::internal::upgrade::trusted_keys::PRODUCTION_TRUSTED_KEYS.is_empty());
+    assert!(
+        libra::internal::upgrade::trusted_keys::PRODUCTION_TRUSTED_KEYS
+            .iter()
+            .all(|key| key.key_id != "test-key-1")
+    );
     assert!(
         verify_envelope_bytes(
             &env,
@@ -143,6 +192,102 @@ fn upgrade_release_binary_has_no_test_trust_root() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn upgrade_persisted_generation_floor_selects_new_signer_and_rejects_lower_policy() {
+    let trust = vec![
+        TrustedKey {
+            key_id: "old-key",
+            ed25519_pubkey: pubkey_for(&SEED),
+            not_before: 0,
+            not_after: 4_102_444_800,
+            generation: 1,
+        },
+        TrustedKey {
+            key_id: "new-key",
+            ed25519_pubkey: pubkey_for(&NEXT_GENERATION_SEED),
+            not_before: 0,
+            not_after: 4_102_444_800,
+            generation: 2,
+        },
+    ];
+    let state = UpgradeState {
+        generation_floor: 2,
+        ..Default::default()
+    };
+    let old_only = envelope_with_signers(
+        &payload_with_generation("2.0.0", 5, 1),
+        &[("old-key", SEED)],
+    );
+    assert!(matches!(
+        decide_from_envelope(&decision_context(&state, &trust), &old_only),
+        Err(FlowError::State(
+            StateRejection::SignerGenerationBelowFloor {
+                offered: 1,
+                floor: 2,
+                ..
+            }
+        ))
+    ));
+
+    // The old signature deliberately appears first. Filtering by the durable
+    // floor must select the generation-2 signature rather than reject a
+    // valid dual-signed rotation envelope.
+    let dual_signed = envelope_with_signers(
+        &payload_with_generation("2.0.0", 5, 2),
+        &[("old-key", SEED), ("new-key", NEXT_GENERATION_SEED)],
+    );
+    let UpgradeDecision::Install(plan) =
+        decide_from_envelope(&decision_context(&state, &trust), &dual_signed).unwrap()
+    else {
+        panic!("expected a generation-2 dual-signed manifest to install");
+    };
+    assert_eq!(plan.marker.manifest_key_id, "new-key");
+
+    let lower_policy = envelope_with_signers(
+        &payload_with_generation("2.0.0", 5, 1),
+        &[("new-key", NEXT_GENERATION_SEED)],
+    );
+    assert!(matches!(
+        decide_from_envelope(&decision_context(&state, &trust), &lower_policy),
+        Err(FlowError::State(StateRejection::GenerationFloorRollback {
+            offered: 1,
+            floor: 2,
+        }))
+    ));
+}
+
+#[test]
+fn upgrade_persisted_floor_reports_effective_floor_when_no_key_qualifies() {
+    // Persisted floor 3, only a generation-1 key in trust, manifest
+    // min_key_generation 2: the eligible-set pass finds no key and the
+    // full-table retry rejects on the weaker signed/compile-time floor (2).
+    // The surfaced error must carry the EFFECTIVE three-source floor (3).
+    let trust = vec![TrustedKey {
+        key_id: "old-key",
+        ed25519_pubkey: pubkey_for(&SEED),
+        not_before: 0,
+        not_after: 4_102_444_800,
+        generation: 1,
+    }];
+    let state = UpgradeState {
+        generation_floor: 3,
+        ..Default::default()
+    };
+    let env = envelope_with_signers(
+        &payload_with_generation("2.0.0", 5, 2),
+        &[("old-key", SEED)],
+    );
+    assert!(matches!(
+        decide_from_envelope(&decision_context(&state, &trust), &env),
+        Err(FlowError::Manifest(
+            libra::internal::upgrade::manifest::ManifestError::KeyGenerationBelowFloor {
+                floor: 3,
+                manifest_min: 2,
+            }
+        ))
+    ));
 }
 
 #[test]
@@ -160,7 +305,10 @@ fn upgrade_windows_is_explicitly_unsupported() {
     };
     assert!(matches!(
         decide_from_envelope(&ctx, &env).unwrap(),
-        UpgradeDecision::Skip(SkipReason::UnsupportedPlatform(Platform::WindowsAmd64))
+        UpgradeDecision::Skip {
+            reason: SkipReason::UnsupportedPlatform(Platform::WindowsAmd64),
+            ..
+        }
     ));
 }
 

@@ -22,6 +22,11 @@ use std::path::{Path, PathBuf};
 
 /// Lock file name inside the install directory.
 pub const LOCK_FILE_NAME: &str = ".libra-upgrade.lock";
+/// Dedicated micro-lock for the monotone acceptance-floors side file. Held
+/// only across one atomic read-merge-write (microseconds, no probes and no
+/// network), so a BLOCKING wait on it is always short — unlike the main
+/// upgrade lock, which spans staging/probing/install.
+pub const FLOORS_LOCK_FILE_NAME: &str = ".libra-upgrade-floors.lock";
 
 /// Failures of install-dir validation and fd-relative operations.
 #[derive(Debug, thiserror::Error)]
@@ -382,6 +387,52 @@ mod unix_impl {
             )
         }
 
+        /// Blocking floors micro-lock: kernel-queued, so unlike repeated
+        /// non-blocking probes it cannot be starved by a stream of short-lived
+        /// holders. Callers bound the wait externally (worker thread +
+        /// timeout) because flock itself has none.
+        pub fn lock_floors_blocking(&self) -> Result<UpgradeLock, InstallDirError> {
+            let file = self.openat(
+                FLOORS_LOCK_FILE_NAME,
+                libc::O_RDWR | libc::O_CREAT,
+                0o600 as libc::c_int,
+            )?;
+            // SAFETY: flock on an owned fd.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if rc != 0 {
+                return Err(InstallDirError::Io {
+                    name: FLOORS_LOCK_FILE_NAME.to_string(),
+                    detail: std::io::Error::last_os_error().to_string(),
+                });
+            }
+            Ok(UpgradeLock { _file: file })
+        }
+
+        /// Non-blocking floors micro-lock (see [`FLOORS_LOCK_FILE_NAME`]):
+        /// `Ok(None)` when another process holds it. Callers retry briefly —
+        /// holders only perform one atomic read-merge-write, so contention
+        /// clears in milliseconds unless a holder is externally stalled.
+        pub fn try_lock_floors(&self) -> Result<Option<UpgradeLock>, InstallDirError> {
+            let file = self.openat(
+                FLOORS_LOCK_FILE_NAME,
+                libc::O_RDWR | libc::O_CREAT,
+                0o600 as libc::c_int,
+            )?;
+            // SAFETY: flock on an owned fd.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                return match err.raw_os_error() {
+                    Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => Ok(None),
+                    _ => Err(InstallDirError::Io {
+                        name: FLOORS_LOCK_FILE_NAME.to_string(),
+                        detail: err.to_string(),
+                    }),
+                };
+            }
+            Ok(Some(UpgradeLock { _file: file }))
+        }
+
         /// Non-blocking upgrade lock: `Ok(None)` when another process holds
         /// it (auto-upgrade treats that as Skip, §A.5).
         pub fn try_lock(&self) -> Result<Option<UpgradeLock>, InstallDirError> {
@@ -466,6 +517,14 @@ impl InstallDir {
     }
 
     pub fn lock_blocking(&self) -> Result<UpgradeLock, InstallDirError> {
+        Err(InstallDirError::UnsupportedPlatform)
+    }
+
+    pub fn lock_floors_blocking(&self) -> Result<UpgradeLock, InstallDirError> {
+        Err(InstallDirError::UnsupportedPlatform)
+    }
+
+    pub fn try_lock_floors(&self) -> Result<Option<UpgradeLock>, InstallDirError> {
         Err(InstallDirError::UnsupportedPlatform)
     }
 }

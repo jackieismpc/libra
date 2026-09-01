@@ -5,9 +5,16 @@ Libra can keep an official script install up to date automatically. This is
 cryptographically verified, anti-rollback protected, crash-safe, and isolated
 so it can never break or change the outcome of your normal commands.
 
-> **Status.** The auto-upgrade subsystem is present in the binary but **inert**
-> until the official release-signing keys are provisioned. Until then Libra
-> never checks for or installs upgrades regardless of `upgrade.mode`.
+> **Status.** Releases since `v0.22.1` carry the production signing trust
+> root (releases up to `v0.22.0` remain inert without it), but auto-upgrade
+> still installs nothing until a valid, signed stable manifest is published;
+> a missing or invalid manifest fails closed. The persisted monotonic
+> key-generation floor described below ships with the A1-01 release
+> (`0.22.6` on the merged baseline) — clients released before it enforce
+> only the manifest and compiled floors.
+> The install scripts (`install.sh` / `install.ps1`) verify the SAME signed
+> stable manifest on their default path before downloading anything; see
+> `docs/installation.md` for the bootstrap trust model.
 
 ## Enabling it
 
@@ -75,8 +82,11 @@ copied next to a different binary, never qualifies.
 - A crashed upgrade is detected and resolved before your next command runs:
   it is either completed, or rolled back to the previous working version.
 - Anti-rollback state (`{INSTALL_DIR}/.libra-upgrade-state.json`) prevents
-  downgrade and replay; if it is ever corrupt, Libra refuses to upgrade rather
-  than silently discarding that protection.
+  downgrade and replay. It also records the highest accepted manifest
+  `min_key_generation`: later manifests may not lower it, and a signature is
+  accepted only when its key generation meets the maximum of the manifest,
+  compiled, and persisted floors. If the state is ever corrupt, Libra refuses
+  to upgrade rather than silently discarding that protection.
 - If an installed version is later revoked, Libra keeps running it (it does not
   auto-downgrade) but surfaces a high-priority warning pointing at the fixed
   release.

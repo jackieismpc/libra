@@ -31,6 +31,7 @@
 | `compat_matrix_alignment` | 1 | Guards public docs/release matrices vs. real CLI/API surfaces, including `w203_revision_receipt_and_network_boundary_stay_aligned` for W2-03 digest-only receipts, the shared linear receipt index, permanent retry closure, typed revision errors, Phase 1 scanner/session-writer leases, and the Network-Allow 409 boundary | `COMPATIBILITY.md`, `CHANGELOG.md`, `docs/commands/code.md`, `docs/commands/zh-CN/code.md`, `docs/error-codes.md`, `docs/development/{commands/_compatibility,tracing/code,plan/plan-20260715}.md`, `src/internal/ai/{session/jsonl,workspace_snapshot}.rs`, `src/internal/ai/web/{headless,web_admission}.rs` |
 | `compat_install_alias` | 1 | Guards IX-01 full-installer `lba -> libra` creation, same-version repair/idempotency, CLI/env opt-outs, foreign-path preservation, and symlink-unavailable fallback with an isolated fake downloader | `install.sh`, `tests/compat/install_alias_smoke.sh`, `README.md`, `README.zh-CN.md` |
 | `compat_live_compat_workflow` | 1 | Guards optional live AI/cloud workflow remains manual/scheduled and secret-gated | `.github/workflows/live-compat.yml` |
+| `compat_release_rclone_env_guard` | 1 | Guards release workflow never exports bare `RCLONE_*` option variables in YAML, POSIX shell, or PowerShell assignments, while permitting only the configured `RCLONE_CONFIG_R2_*` remote namespace | `.github/workflows/release.yml` |
 | `compat_branch_lossy_wrapper_guard` | 1 | Guards branch-name lossy conversion wrapper | `src/internal/branch.rs` |
 | `compat_lfs_client_production_unwrap_guard` | 1 | Bans `unwrap()/expect()` in `internal/protocol/lfs_client.rs` | `src/internal/protocol/lfs_client.rs` |
 | `media_fastcdc_test` | 1 / manual interop | Feature-gated chunk/cache/verify/probe tests; ignored `mega_fastcdc_http_interop` exercises real Mega HTTP upload, dedup, resume and download (requires `MEGA_FASTCDC_READY_FILE`) | `src/utils/media/`, `src/internal/protocol/lfs_client.rs` |
@@ -393,7 +394,8 @@ dedicated feature-on steps.
 | target | wave | one-line purpose | relevant src |
 |---|---|---|---|
 | `upgrade_auto_test` | 1 | plan-20260714 §A.11 auto-upgrade end-to-end: signature+decision chain, anti-rollback/revocation replay, real-binary `__upgrade-probe` self-check, install/rollback transaction (`--features test-upgrade`) | `src/internal/upgrade/`, `src/command/upgrade.rs` |
-| `upgrade_publish_contract_test` | 1 | plan-20260714 §A.9/§A.11 manifest/publish contract: matrix coverage, URL binding, size bounds, renew preserves pause/revocations (`--features test-upgrade`) | `src/internal/upgrade/manifest.rs` |
+| `upgrade_publish_contract_test` | 1 | plan-20260714 §A.9/§A.11 manifest/publish contract: matrix coverage, URL binding, size bounds, renew preserves pause/revocations; plan-20260821 A1-06 Backend B1-02 transition contract vectors (cross-implementation verify, anti-vv placeholder) (`--features test-upgrade`) | `src/internal/upgrade/manifest.rs`, `tests/data/up01-transition-vectors-v1.json` |
+| `install_smoke_test` | 1 | plan-20260821 A1-05 installer verification smoke: eight `install.sh` scenarios (signed install, tampered signature, sha/size mismatch, manifest-404 and verifier-unavailable transitions ± `LIBRA_ALLOW_FALLBACK`) plus the `install.ps1` runner when `pwsh` exists; needs bash+python3+openssl, otherwise prints skipped | `install.sh`, `install.ps1`, `tests/data/install-smoke/` |
 
 ## Wave 4 — Live AI (test-live-ai / DEEPSEEK_API_KEY)
 
