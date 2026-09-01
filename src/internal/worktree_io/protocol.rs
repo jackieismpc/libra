@@ -412,6 +412,14 @@ pub(crate) enum IoRequest {
         #[serde(default)]
         root_session: u64,
     },
+    ReadFile {
+        /// A canonical relative path beneath `root`.
+        path: Vec<u8>,
+        /// An absolute, sealed worktree root.
+        root: Vec<u8>,
+        /// Maximum number of bytes returned by the bounded read.
+        byte_limit: u64,
+    },
     ReadObjectBlob {
         oid: String,
         objects_root: Vec<u8>,
@@ -443,7 +451,7 @@ impl IoRequest {
                 validate_worktree_path(root, left, true)?;
                 validate_worktree_path(root, right, true).map(|_| ())
             }
-            Self::FileBlobHash { path, root, .. } => {
+            Self::FileBlobHash { path, root, .. } | Self::ReadFile { path, root, .. } => {
                 validate_worktree_path(root, path, false).map(|_| ())
             }
             Self::MarkerProbe { dir, root } => validate_worktree_path(root, dir, true).map(|_| ()),

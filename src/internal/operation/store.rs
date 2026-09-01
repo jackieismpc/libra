@@ -356,6 +356,18 @@ impl OperationStoreV2 {
         &self.db
     }
 
+    /// The configured content-addressed object store used by operation
+    /// manifests and workspace snapshots.
+    pub fn storage(&self) -> &ClientStorage {
+        &self.storage
+    }
+
+    /// Repository identity carried by this store. Snapshot publication uses
+    /// the same identity for its RepoView and operation rows.
+    pub fn repo_id(&self) -> &str {
+        &self.repo_id
+    }
+
     pub async fn write_view_manifest(&self, view: &RepoViewV2) -> Result<ObjectHash, StoreError> {
         let bytes = view.to_canonical_bytes()?;
         let oid = ObjectHash::from_type_and_data(ObjectType::Blob, &bytes);

@@ -157,6 +157,12 @@ impl FacetRegistry {
         self.facets.len()
     }
 
+    /// Stable, sorted facet names for a capture pass. Keeping enumeration in
+    /// the registry makes an unregistered mutable state owner fail closed.
+    pub fn names(&self) -> Vec<FacetName> {
+        self.facets.keys().cloned().collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.facets.is_empty()
     }

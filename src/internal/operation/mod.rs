@@ -1,6 +1,7 @@
 //! Version 2 operation-log primitives.
 
 pub mod facet;
+pub mod snapshot;
 pub mod store;
 pub mod view;
 pub mod working_copy;
@@ -9,6 +10,10 @@ pub mod working_copy;
 // command integrations source-compatible while all new code uses v2 types.
 pub use facet::{
     FacetCapture, FacetCaptureCtx, FacetError, FacetName, FacetRegistry, RestorePolicy,
+};
+pub use snapshot::{
+    IndexEntrySnapshot, ScanError, ScanResult, ScannedFile, SnapshotError, SnapshotOutcome,
+    WorkspaceSnapshotter,
 };
 pub use store::{
     JournalEntry, JournalPhase, OpHeadsView, OperationKind, OperationMetaV2, OperationStatusV2,

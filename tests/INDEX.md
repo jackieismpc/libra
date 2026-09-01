@@ -20,6 +20,7 @@
 | `commit_change_id_header_spike` | 1 | OL-00 real-Git Change ID header vs sidecar-only compatibility spike | `docs/development/internal/operation-log-working-copy-change-id.md` |
 | `operation_schema_v2` | 1 | OL-02 fresh/legacy SQLite operation schema convergence and forward-only version guard | `src/internal/db.rs`, `sql/migrations/2026090101_operation_v2.sql`, `src/internal/model/` |
 | `operation_dag` | 1 | OL-04 operation object, journal, and operation-head CAS integration | `src/internal/operation/store.rs`, `sql/migrations/2026090101_operation_v2.sql` |
+| `workspace_snapshot_roundtrip` | 1 | OL-06 bounded working-copy snapshot capture and tracked/untracked tree roundtrip | `src/internal/operation/snapshot.rs`, `src/internal/worktree_io/` |
 | `command_test` | 1 | Top-level dispatcher covering most `libra <subcmd>` integration paths, including W4 `worktree doctor` read-only/schema, confirmed legacy-capture adoption, W4-08 linked-worktree `libra code`/`automation` enablement, and the W5-08 `graph_machine_survives_tui_removal` breaking guard (interactive graph entry refused with a migration hint; `--json`/`--machine` wire intact) | `src/command/`, `src/cli.rs`, `tests/command/worktree_doctor_test.rs`, `tests/command/code_agent_linked_guard_test.rs` |
 | `compat_stash_subcommand_surface` | 1 | Guards `libra stash` subcommand surface vs. git CLI | `src/command/stash.rs` |
 | `compat_bisect_subcommand_surface` | 1 | Guards `libra bisect` subcommand surface | `src/command/bisect.rs` |
