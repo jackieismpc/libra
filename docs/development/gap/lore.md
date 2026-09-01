@@ -469,32 +469,33 @@ file metadata 与 MCP tree handle 可以在 LR-02 之后、LR-09 之前做：它
 
 ## 6. 最后支持的特性：LFS FastCDC chunking
 
-> **实施状态（客户端 v1 ✅ 已落地；服务端协议冻结；#461 未合入）**：诚实 v1 交付**严格 feature-gated
-> （`fastcdc`，默认关闭，`fastcdc = []` 纯 in-tree 无新依赖，对默认二进制/CI 零影响）的
-> 客户端底座**——`libra media chunk/inspect/verify/probe`（`src/utils/media/` +
-> `src/command/media.rs`）：in-tree 确定性 gear-hash FastCDC chunker（冻结 `fastcdc-v1` 参数
-> MIN 512K/AVG 2M/MAX 8M + splitmix64 GEAR 表）、版本化 manifest（`media_oid` 恒 SHA-256、
-> 独立于 `core.objectformat`、与标准 LFS pointer 逐字节一致；`crc32c` 字段 v1 留空避免把
-> IEEE crc32 烙进 frozen schema）、私有 `.libra/media/` 内容寻址 chunk store（`objects/` 兄弟、
-> chunk **绝不**成 Git object ID、读时 sha256 重校验）、verify-then-rename 重组（绝无坏文件）、
-> 以及 §6.4 **安全回退协商**（能力探测经 `retry_idempotent` §0.2 退避；`negotiate()` 纯函数：
-> 全绿默认 Chunked、任一疑点回退标准 LFS、服务端拒 fallback + 本地无 fallback → **Block** 绝不
-> chunk-only 半写；`ProbeOutcome` 区分 NoEndpoint/ServerErrorAfterBackoff/Ok）。**冻结/延后**：
-> §6.5–6.8 全部服务端协议（真实跨机 chunked 上传/下载、finalize 生命周期、GC/fsck/heal、
-> **每条 §6.7 反侧信道保证均为服务端义务**）+ chunk-only 策略 + 接进 live LFS 热路径 + 纯 git
-> 客户端 bridge——故对今天任何可达远端，探测都回退标准 Git LFS。测试：media 单测（chunker
-> 确定性+退化契约、manifest 往返+校验、negotiate 全矩阵含 all-green→Chunked 正例、chunk-store
-> 原始字节+重校验、capability 分类）+ 集成 `tests/media_fastcdc_test.rs`（chunk--store/verify
-> 往返、坏 chunk 干净失败、probe 不可达回退）+ `compat_fastcdc_feature_gate_guard` 常驻钉门控。
-> 规划经多智能体工作流（Understand→Design→三面对抗审阅：安全/门控 NEEDS_REVISION→已修
-> negotiate 优先级+正例、可行性 SOUND、诚实/侧信道 SOUND）+ Codex 两轮（backoff 非 §0.2 +
-> banner guard cfg → 已修 → APPROVE）。以下 §6.1–6.10 为完整设计规范（客户端 + 冻结的服务端）。
+> **当前实施范围（2026-08-28）：客户端底座＋默认关闭的 Libra/Mega 传输扩展。**
+> 已有 `libra media chunk/inspect/verify/probe`、冻结的 in-tree `fastcdc-v1` 分块器
+> （MIN 512 KiB / AVG 2 MiB / MAX 8 MiB、SplitMix64 GEAR 表）、版本化 manifest 和私有
+> `.libra/media/` 缓存；块及完整文件均使用 SHA-256，不修改 Git 对象图或 LFS pointer。
+> Libra 的 `src/utils/media/transfer.rs` 接入实际 LFS 上传/下载；Mega 提供仓库 LFS URL
+> 下的 `libra/media/v1` 扩展端点。两端都须使用 `--features fastcdc` 构建，并配置绑定主机的
+> Mono Bearer 访问令牌。默认构建仍关闭，`lfs.fastcdc=false` 可在仓库中禁用传输。
 >
-> **2026-09-01**：[#461](https://github.com/libra-tools/libra/pull/461) 把既有 `fastcdc-v1`
-> chunker/manifest/本地 chunk store 接到普通 LFS push/download（配套 Mega `#2178`），默认
-> 仍关闭、`lfs.fastcdc=false` 可关。**未合入 main**。0.9.0 要求合流进该 PR 或其后续卡的
-> 完成判据：0.11 query 匹配层级、「已有则不重传」、3.3 media/LFS 范围读；服务端 GC/fsck/heal/
-> obliterate 认识 chunk 仍等 #461 之后解冻 §6.5–6.8。禁止平行第二套 media 传输。
+> 当前上传把 prepare manifest 与缺块查询合并，只上传缺块，再 finalize。Mega 校验块、
+> 完整 SHA-256 和冻结边界，先保存标准 LFS 完整对象，再原子发布可下载 manifest。
+> 下载复用已校验的本地块，完整校验后才原子替换目标；无兼容能力或无 manifest 时回退
+> 标准完整对象。一旦选择 manifest，鉴权或完整性失败就报错，不以静默回退掩盖错误。
+> 不支持 chunk-only 或按字节范围水合。实际端点及流程见
+> [media 开发设计](../commands/media.md) 和[命令文档](../../commands/media.md)。
+>
+> **尚未满足全部生产门禁。** Mega 现有 LFS 没有完整仓库 ACL，本扩展按「认证用户＋仓库路径」
+> 隔离，再由 manifest/media OID 限定访问；其他用户走既有完整对象路径。这不能替代共享仓库
+> ACL，也不宣称满足 §6.7 的全部授权和时序侧信道保证。manifest 限制为 10 MiB / 8192 块，
+> 单块最大 8 MiB；Pending 描述符 24 小时到期，但不会自动回收存储，可重新 prepare 续传。
+> 自动孤儿 GC、配额统计、服务端 fsck/heal、obliteration、备份恢复联动和跨用户去重均待实现。
+> 部署方须制定保留策略，不得无条件删除仍被 Finalized manifest 共享的块。
+>
+> 相关验证入口包括 media 单测、`tests/media_fastcdc_test.rs` 和
+> `compat_fastcdc_feature_gate_guard`；跨系统测试 `mega_fastcdc_http_interop` 需要显式启动
+> Mega 测试服务。测试是否通过以运行记录为准，不把 skipped/ignored 计为通过。
+> **以下 §6.1–6.10 仍是完整目标规范与后续生产验收要求，不是当前实现清单**；其中建议的独立
+> `chunks/exists`、预签名 URL、range、GC/ACL/quota/CAS 等接口或保证不能视为已实现。
 
 ### 6.1 为什么必须最后做
 

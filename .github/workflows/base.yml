@@ -114,11 +114,6 @@ jobs:
             exit 1
           fi
 
-  # TEMPORARILY DISABLED (2026-08-31): the compat-web-e2e Playwright job is
-  # removed while the self-hosted runner's `sudo` cannot complete the
-  # `playwright install --with-deps` system-dependency step (five-minute
-  # `sudo: timed out`, see PR #459 CI). Restore this job (git history) once
-  # the runner regains passwordless sudo for apt.
   owner-liveness-macos:
     # plan-20260714 W1 (§C.9): the operation claim decides whether a control
     # action's owner is dead by proving it — boot id + PID namespace on Linux,

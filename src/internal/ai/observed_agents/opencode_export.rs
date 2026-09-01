@@ -1124,13 +1124,16 @@ fn pin_store_under(base: &std::path::Path) -> Result<std::os::fd::OwnedFd> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
 
     /// Write an executable fake exporter script (tests never touch a real
     /// `opencode`, GC-DR-07). The script body receives argv untouched, which
-    /// is exactly what the no-shell contract must preserve.
+    /// is exactly what the no-shell contract must preserve. This fixture
+    /// requires a POSIX shell and Unix executable permission bits.
+    #[cfg(unix)]
     fn fake_exporter(dir: &std::path::Path, body: &str) -> PathBuf {
         let path = dir.join("fake-opencode");
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -1140,6 +1143,7 @@ mod tests {
 
     /// Whether an executable named `name` is resolvable on `PATH` (used to skip
     /// tests that depend on an optional system tool such as `setsid`).
+    #[cfg(unix)]
     fn binary_on_path(name: &str) -> bool {
         std::env::var_os("PATH")
             .map(|path| {
@@ -1157,13 +1161,15 @@ mod tests {
     #[tokio::test]
     async fn opencode_export_rejects_bad_session_id() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = fake_exporter(dir.path(), "echo '{}'");
+        // Invalid IDs must be rejected without spawning any executable.
+        let bin = dir.path().join("unused-exporter");
         for bad in ["", "../escape", "id with spaces", "a;b", "$(rm -rf /)"] {
+            let err = run_export_subprocess(&bin, bad, ExportLimits::default())
+                .await
+                .expect_err("invalid session id must fail");
             assert!(
-                run_export_subprocess(&bin, bad, ExportLimits::default())
-                    .await
-                    .is_err(),
-                "session id {bad:?} must be rejected before spawn"
+                err.to_string().contains("invalid OpenCode session id"),
+                "session id {bad:?} must be rejected before spawn, got {err:#}"
             );
         }
     }
@@ -1171,6 +1177,7 @@ mod tests {
     /// opencode_export_argv_no_shell: metacharacters in a (valid-charset)
     /// session id reach the child as ONE argv element — no shell ever
     /// interprets them. The fake exporter prints its argv verbatim.
+    #[cfg(unix)]
     #[tokio::test]
     async fn opencode_export_argv_no_shell() {
         let dir = tempfile::tempdir().unwrap();
@@ -1183,6 +1190,7 @@ mod tests {
 
     /// opencode_export_bytes_path_byte_cap: over-cap output kills the run —
     /// error, never a silent truncation.
+    #[cfg(unix)]
     #[tokio::test]
     async fn opencode_export_byte_cap_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
@@ -1199,6 +1207,7 @@ mod tests {
 
     /// A non-terminating writer is killed by the byte cap instead of being
     /// allowed to consume disk until the much later wall-clock deadline.
+    #[cfg(unix)]
     #[tokio::test]
     async fn opencode_export_byte_cap_kills_runaway_writer() {
         let dir = tempfile::tempdir().unwrap();
@@ -1221,6 +1230,7 @@ mod tests {
 
     /// A successful direct child cannot leave a background writer holding the
     /// inherited output descriptors after the result has been validated.
+    #[cfg(unix)]
     #[tokio::test]
     async fn opencode_export_rejects_surviving_descendant() {
         let dir = tempfile::tempdir().unwrap();
@@ -1252,6 +1262,7 @@ mod tests {
     /// over-cap bytes it writes to the inherited stdout are still refused —
     /// the byte cap is enforced on the bytes, not on group membership. Skips
     /// when `setsid` is unavailable.
+    #[cfg(unix)]
     #[tokio::test]
     async fn opencode_export_setsid_escapee_cannot_exceed_cap() {
         if !binary_on_path("setsid") {
@@ -1418,6 +1429,7 @@ mod tests {
     }
 
     /// Deadline kills a hung exporter; the wait stays bounded.
+    #[cfg(unix)]
     #[tokio::test]
     async fn opencode_export_deadline_kills_hung_exporter() {
         let dir = tempfile::tempdir().unwrap();
@@ -1440,6 +1452,7 @@ mod tests {
 
     /// A failing exporter surfaces capped, redacted stderr — and secrets in
     /// stderr never appear raw in the error text.
+    #[cfg(unix)]
     #[tokio::test]
     async fn opencode_export_failure_redacts_stderr() {
         let dir = tempfile::tempdir().unwrap();
