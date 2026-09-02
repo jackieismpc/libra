@@ -41,6 +41,7 @@ fn seal_worktree_capability(request: &IoRequest) -> io::Result<Option<WorktreeRo
         | IoRequest::CanonicalizePair { root, .. }
         | IoRequest::ReadDir { root, .. }
         | IoRequest::FileBlobHash { root, .. }
+        | IoRequest::ReadFile { root, .. }
         | IoRequest::MarkerProbe { root, .. } => root,
         IoRequest::ReadObjectBlob { .. } | IoRequest::Shutdown => return Ok(None),
     };
@@ -239,6 +240,17 @@ pub(crate) fn handle_request(request: IoRequest, stdout: &mut impl Write) -> io:
             };
             write_frame(stdout, &IoEvent::DoneHash { hex: result })?;
         }
+        IoRequest::ReadFile {
+            path, byte_limit, ..
+        } => {
+            write_frame(stdout, &IoEvent::Begin)?;
+            let path = bytes_to_path(&path);
+            let Some(capability) = worktree_capability.as_ref() else {
+                return Err(io::Error::other("missing worktree capability"));
+            };
+            let outcome = read_worktree_file_beneath(capability, &path, byte_limit);
+            write_object_blob_outcome(stdout, outcome)?;
+        }
         IoRequest::ReadObjectBlob {
             oid,
             byte_limit,
@@ -272,6 +284,35 @@ pub(crate) fn handle_request(request: IoRequest, stdout: &mut impl Write) -> io:
         }
     }
     Ok(true)
+}
+
+fn read_worktree_file_beneath(
+    capability: &WorktreeRootCapability,
+    path: &Path,
+    byte_limit: u64,
+) -> Result<Vec<u8>, ObjectBlobStatus> {
+    let relative = capability
+        .relative(path)
+        .map_err(|_| ObjectBlobStatus::Failed)?;
+    let root = crate::utils::beneath::open_root(capability.root())
+        .map_err(|_| ObjectBlobStatus::Failed)?;
+    let stat = crate::utils::beneath::lstat_beneath(&root, &relative)
+        .map_err(|_| ObjectBlobStatus::Failed)?;
+    if stat.len > byte_limit {
+        return Err(ObjectBlobStatus::TooLarge);
+    }
+    let bytes = if stat.is_symlink {
+        crate::utils::beneath::read_symlink_beneath(&root, &relative)
+    } else if stat.is_file {
+        crate::utils::beneath::read_file_beneath(&root, &relative)
+    } else {
+        Err(io::Error::other("worktree path is not a regular file"))
+    }
+    .map_err(|_| ObjectBlobStatus::Failed)?;
+    if bytes.len() as u64 > byte_limit {
+        return Err(ObjectBlobStatus::TooLarge);
+    }
+    Ok(bytes)
 }
 
 fn lstat_request(path: &Path, capability: &WorktreeRootCapability) -> WireResult<CapturedStat> {

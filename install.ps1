@@ -22,7 +22,7 @@ $ErrorActionPreference = "Stop"
 # One of the release version surfaces. `compat_version_surface_sync` pins it
 # to Cargo.toml: this value is substituted verbatim into the download URL, so
 # a stale value silently installs an old binary when -Version is not given.
-$DefaultVersion = "v0.22.5"
+$DefaultVersion = "v0.22.10"
 # Public-only trust anchor for stable-manifest verification. It deliberately
 # has no environment override: the install-smoke harness rewrites these
 # clearly-marked constants in a temporary COPY of this script.
@@ -30,6 +30,12 @@ $ReleaseManifestKeyId = "libra-release-1"
 $ReleaseManifestPublicKeyHex = "68aa00ea9358d455645010d811d40702b3f67cec4bdff52d3d4fb8107afaeed3"
 # Pinned origin of the signed stable channel (marker for the smoke harness).
 $ReleaseManifestOrigin = "https://download.libra.tools"
+# Key policy pins mirroring src/internal/upgrade/trusted_keys.rs (§7): the
+# pinned key's rotation generation and validity window as canonical UTC. The
+# window is checked against the SIGNED timestamps, like the native verifier.
+$ReleaseManifestKeyGeneration = 1
+$ReleaseManifestKeyNotBefore = "2026-08-31T11:09:55Z"
+$ReleaseManifestKeyNotAfter = "2027-08-31T00:00:00Z"
 $ExeName = "libra.exe"
 $ReleaseAsset = "libra-windows-amd64.exe"
 
@@ -198,7 +204,9 @@ function Resolve-StableChannel {
     $raw = $null
     try {
         $ProgressPreference = "SilentlyContinue"
-        $response = Invoke-WebRequest -Uri $manifestUrl -UseBasicParsing
+        # Redirects are refused: the pinned origin must serve the manifest
+        # directly, a 3xx fails closed instead of following the transport.
+        $response = Invoke-WebRequest -Uri $manifestUrl -UseBasicParsing -MaximumRedirection 0
         $raw = $response.Content
     } catch {
         $status = $null
@@ -213,9 +221,13 @@ function Resolve-StableChannel {
     }
 
     if ($raw -is [byte[]]) { $raw = [System.Text.Encoding]::UTF8.GetString($raw) }
+    # Envelope byte cap mirroring the native MAX_MANIFEST_BYTES (1 MiB).
+    if ([System.Text.Encoding]::UTF8.GetByteCount([string]$raw) -gt 1048576) {
+        throw "stable manifest exceeds the 1 MiB limit - refusing to install"
+    }
     $envelope = $raw | ConvertFrom-Json
     if ($envelope.schema_version -ne 1) { throw "stable manifest has unsupported schema_version '$($envelope.schema_version)'" }
-    $signatureEntry = @($envelope.signatures) | Where-Object { $_.key_id -eq $ReleaseManifestKeyId } | Select-Object -First 1
+    $signatureEntry = @($envelope.signatures) | Where-Object { [string]$_.key_id -ceq $ReleaseManifestKeyId } | Select-Object -First 1
     if ($null -eq $signatureEntry) { throw "stable manifest carries no signature from key '$ReleaseManifestKeyId'" }
 
     $payloadBytes = [Convert]::FromBase64String([string]$envelope.payload)
@@ -231,27 +243,121 @@ function Resolve-StableChannel {
         throw "stable manifest SIGNATURE VERIFICATION FAILED - refusing to install (the download origin may be compromised)"
     }
 
-    $payload = [System.Text.Encoding]::UTF8.GetString($payloadBytes) | ConvertFrom-Json
-    if ($payload.channel -ne "stable") { throw "signed manifest channel '$($payload.channel)' is not 'stable'" }
-    if ([datetime]::UtcNow -ge ([datetime]::Parse($payload.expires_at, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal))) {
-        throw "signed stable manifest is expired (expires_at $($payload.expires_at)) - the publisher must renew it"
+    $payloadText = [System.Text.Encoding]::UTF8.GetString($payloadBytes)
+    # The canonical payload is printable ASCII on a single line; embedded
+    # newlines or control bytes could let character classes span lines and
+    # confuse the anchored extraction below.
+    if ($payloadText -cmatch '[^\x20-\x7e]') {
+        throw "signed manifest payload does not match the canonical serialization (non-printable bytes) - refusing to install"
+    }
+    # Structural grammar gate: the payload must START with the exact canonical
+    # top-level field sequence. The RAW text is authoritative for the scalar
+    # values (ConvertFrom-Json eagerly converts ISO-8601 strings to [datetime]
+    # and cannot distinguish a nested field from a top-level one for a regex).
+    # String fields cannot contain quotes, so once this anchor matches, every
+    # captured group is pinned to the REAL top-level value.
+    # Numeric fields are bounded to nine digits so integer conversions can
+    # never overflow, and the payload must END with well-formed artifact rows
+    # (nothing can trail the array to mimic an artifact row).
+    # Bounds kept <= 255 to read identically to install.sh's grammar (whose
+    # BSD-grep ceiling is 255); the revoked list is a bracket-free class with
+    # per-entry validation below and the 1 MiB payload cap above it.
+    $rowPattern = '\{"platform":"[^"]{1,32}","url":"[^"]{1,255}","sha256":"[0-9a-f]{64}","size":(?:0|[1-9][0-9]{0,8})\}'
+    $headPattern = '^\{"channel":"(?<channel>[^"]{1,32})","version":"(?<version>[^"]{1,64})","control_revision":(?:0|[1-9][0-9]{0,8}),"published_at":"(?<published>[^"]{1,64})","expires_at":"(?<expires>[^"]{1,64})","min_key_generation":(?<mkg>0|[1-9][0-9]{0,8}),"paused":(?:true|false),"revoked_versions":\[[^\]]*\],"artifacts":\[' + $rowPattern + '(,' + $rowPattern + ')*\]\}$'
+    if ($payloadText -cnotmatch $headPattern) {
+        throw "signed manifest payload does not match the canonical serialization - refusing to install"
+    }
+    $payloadVersion = $Matches['version']
+    $publishedRaw = $Matches['published']
+    $expiresRaw = $Matches['expires']
+    $minKeyGeneration = [int]$Matches['mkg']
+    $payload = $payloadText | ConvertFrom-Json
+    if ($Matches['channel'] -cne "stable") { throw "signed manifest channel '$($Matches['channel'])' is not 'stable'" }
+    # Canonical X.Y.Z only (no leading "v", no leading zeros) — the exact
+    # grammar of the native contract, so revocation/floor comparisons can
+    # never be format-bypassed.
+    # Components bounded to nine digits (stricter than native u64 — a wider
+    # component fails closed, the safe direction).
+    $canonicalSemver = '^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$'
+    if ($payloadVersion -cnotmatch $canonicalSemver) {
+        throw "signed manifest version '$payloadVersion' is not canonical X.Y.Z - refusing to install"
+    }
+    # Stateless anti-replay floor: this installer shipped alongside
+    # $DefaultVersion, so a signed manifest older than that baseline can only
+    # be a replayed stale manifest.
+    if ([version]$payloadVersion -lt [version]$DefaultVersion.TrimStart("v")) {
+        throw "signed stable manifest carries $payloadVersion, older than this installer's baseline $($DefaultVersion.TrimStart('v')) - possible replay of a stale manifest; re-download install.ps1 and retry"
+    }
+    # Key policy (§7, mirroring the native verifier): generation floor first,
+    # then the pinned key's validity window around the SIGNED lifetime.
+    if ($minKeyGeneration -gt $ReleaseManifestKeyGeneration) {
+        throw "signed manifest min_key_generation $minKeyGeneration is above this installer's pinned key generation $ReleaseManifestKeyGeneration - a key rotation has retired this trust anchor; re-download install.ps1"
+    }
+    # Timestamps must be canonical, calendar-valid UTC ("Z"); offsets or
+    # nonsense field values are rejected rather than silently normalized.
+    $canonicalUtc = '^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])T([01]\d|2[0-3]):[0-5]\d:[0-5]\d(\.\d+)?Z$'
+    if ($expiresRaw -cnotmatch $canonicalUtc) {
+        throw "signed manifest expires_at '$expiresRaw' is not canonical UTC (YYYY-MM-DDThh:mm:ssZ) - refusing to install"
+    }
+    if ($publishedRaw -cnotmatch $canonicalUtc) {
+        throw "signed manifest published_at '$publishedRaw' is not canonical UTC (YYYY-MM-DDThh:mm:ssZ) - refusing to install"
+    }
+    $utcStyle = [System.Globalization.DateTimeStyles]::AdjustToUniversal
+    $inv = [cultureinfo]::InvariantCulture
+    try {
+        $publishedAt = [datetime]::Parse($publishedRaw, $inv, $utcStyle)
+        $expiresAt = [datetime]::Parse($expiresRaw, $inv, $utcStyle)
+    } catch {
+        # Field ranges alone admit impossible dates like 2026-09-31; .NET's
+        # calendar-aware parse is the authority, mirroring native RFC3339.
+        throw "signed manifest timestamps are not valid calendar dates (published_at $publishedRaw, expires_at $expiresRaw) - refusing to install"
+    }
+    if ($publishedAt -ge $expiresAt) {
+        throw "signed manifest published_at is not before expires_at - refusing to install"
+    }
+    if ([datetime]::UtcNow -ge $expiresAt) {
+        throw "signed stable manifest is expired (expires_at $expiresRaw) - the publisher must renew it"
+    }
+    # Pinned-key validity window (inclusive), against the signed lifetime:
+    # not_before <= published_at <= not_after AND expires_at <= not_after.
+    $keyNotBefore = [datetime]::Parse($ReleaseManifestKeyNotBefore, $inv, $utcStyle)
+    $keyNotAfter = [datetime]::Parse($ReleaseManifestKeyNotAfter, $inv, $utcStyle)
+    if ($publishedAt -lt $keyNotBefore -or $publishedAt -gt $keyNotAfter -or $expiresAt -gt $keyNotAfter) {
+        throw "signed manifest lifetime is outside the pinned key's validity window (published_at $publishedRaw, expires_at $expiresRaw) - re-download install.ps1"
     }
     if ($payload.paused -eq $true) {
         throw "releases are PAUSED by the publisher (signed manifest paused=true) - an emergency stop is active"
     }
-    if (@($payload.revoked_versions) -contains [string]$payload.version) {
-        throw "signed stable version $($payload.version) is REVOKED - refusing to install"
+    foreach ($revoked in @($payload.revoked_versions)) {
+        if ([string]$revoked -cnotmatch $canonicalSemver) {
+            throw "signed manifest revoked_versions entry '$revoked' is not canonical X.Y.Z - refusing to install"
+        }
+        if ([string]$revoked -ceq $payloadVersion) {
+            throw "signed stable version $payloadVersion is REVOKED - refusing to install"
+        }
     }
-    $artifact = @($payload.artifacts) | Where-Object { $_.platform -eq "windows-amd64" } | Select-Object -First 1
+    $artifact = @($payload.artifacts) | Where-Object { [string]$_.platform -ceq "windows-amd64" } | Select-Object -First 1
     if ($null -eq $artifact) { throw "signed manifest has no artifact for windows-amd64" }
-    if ($artifact.url -notlike "https://download.libra.tools/libra/releases/*") {
-        throw "signed artifact URL is outside the pinned origin: $($artifact.url)"
+    # Exact URL binding: origin, layout AND the tag derived from the signed
+    # version (the manifest URL grammar carries no .exe suffix).
+    $expectedUrl = "https://download.libra.tools/libra/releases/v$payloadVersion/libra-windows-amd64"
+    if ([string]$artifact.url -cne $expectedUrl) {
+        throw "signed artifact URL does not match the pinned origin/version layout: $($artifact.url)"
+    }
+    # Digest must be exactly 64 lowercase hex; size mirrors the native
+    # (0, 128 MiB] bound — a signed zero-byte or oversized row is refused.
+    if ([string]$artifact.sha256 -cnotmatch '^[0-9a-f]{64}$') {
+        throw "signed manifest artifact sha256 is not 64 lowercase hex - refusing to install"
+    }
+    $artifactSize = [long]$artifact.size
+    if ($artifactSize -le 0 -or $artifactSize -gt 134217728) {
+        throw "signed manifest artifact size $artifactSize is outside (0, 128 MiB] - refusing to install"
     }
     return @{
-        Version = "v$($payload.version)"
+        Version = "v$payloadVersion"
         Url     = $ReleaseManifestOrigin + ([string]$artifact.url).Substring("https://download.libra.tools".Length)
-        Sha256  = ([string]$artifact.sha256).ToLowerInvariant()
-        Size    = [long]$artifact.size
+        Sha256  = [string]$artifact.sha256
+        Size    = $artifactSize
     }
 }
 
@@ -441,7 +547,11 @@ if ($null -ne $stable) {
     $downloadUrl = "$DownloadBaseUrl/libra/releases/$Version/$ReleaseAsset"
 }
 
-$tempDir = Join-Path $env:TEMP "libra-install"
+# Unique, unpredictable staging directory: a fixed shared path would let
+# another local process pre-create or swap files between the hash check and
+# the final move.
+$tempBase = if ([string]::IsNullOrWhiteSpace($env:TEMP)) { [System.IO.Path]::GetTempPath() } else { $env:TEMP }
+$tempDir = Join-Path $tempBase ("libra-install-" + [System.IO.Path]::GetRandomFileName())
 $tempExe = Join-Path $tempDir $ReleaseAsset
 $targetExe = Join-Path $InstallDir $ExeName
 
@@ -453,27 +563,93 @@ Ensure-Directory $InstallDir
 
 try {
     $ProgressPreference = "SilentlyContinue"
-    Invoke-WebRequest -Uri $downloadUrl -OutFile $tempExe -UseBasicParsing
-
-    if (-not (Test-Path -LiteralPath $tempExe)) {
-        throw "Download failed: $downloadUrl"
-    }
-
     if ($null -ne $stable) {
-        # Signed path: size and sha256 come from the verified manifest and are
-        # MANDATORY - any mismatch aborts before anything is installed.
-        $actualSize = (Get-Item -LiteralPath $tempExe).Length
-        if ($actualSize -ne $stable.Size) {
-            throw "size mismatch (signed manifest says $($stable.Size) bytes, got $actualSize) - refusing to install"
+        # Verified channel: redirects are refused, and the transfer is
+        # streamed with a hard cap at the SIGNED size — a hostile origin
+        # streaming more than the manifest promised is cut off instead of
+        # filling memory or disk. The bytes never touch disk before they are
+        # verified: the same in-memory bytes are hashed and then installed,
+        # so no check-then-swap window exists at all.
+        $handler = [System.Net.Http.HttpClientHandler]::new()
+        $handler.AllowAutoRedirect = $false
+        $client = [System.Net.Http.HttpClient]::new($handler)
+        try {
+            $client.Timeout = [TimeSpan]::FromSeconds(300)
+            $response = $client.GetAsync($downloadUrl, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+            if (-not $response.IsSuccessStatusCode) {
+                throw "Download failed: HTTP $([int]$response.StatusCode) from $downloadUrl"
+            }
+            $contentLength = $response.Content.Headers.ContentLength
+            if ($null -ne $contentLength -and $contentLength -ne $stable.Size) {
+                throw "download Content-Length $contentLength does not match the signed size $($stable.Size) - refusing to install"
+            }
+            $bodyStream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+            $buffer = New-Object System.IO.MemoryStream
+            $chunk = New-Object byte[] 81920
+            while ($true) {
+                $read = $bodyStream.Read($chunk, 0, $chunk.Length)
+                if ($read -le 0) { break }
+                if (($buffer.Length + $read) -gt $stable.Size) {
+                    throw "download exceeded the signed size $($stable.Size) - refusing to install"
+                }
+                $buffer.Write($chunk, 0, $read)
+            }
+            $verifiedBytes = $buffer.ToArray()
+        } finally {
+            $client.Dispose()
         }
-        $actualSha = (Get-FileHash -LiteralPath $tempExe -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($verifiedBytes.LongLength -ne $stable.Size) {
+            throw "size mismatch (signed manifest says $($stable.Size) bytes, got $($verifiedBytes.LongLength)) - refusing to install"
+        }
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $actualSha = ([BitConverter]::ToString($sha256.ComputeHash($verifiedBytes)) -replace "-", "").ToLowerInvariant()
+        } finally {
+            $sha256.Dispose()
+        }
         if ($actualSha -ne $stable.Sha256) {
             throw "sha256 mismatch against the SIGNED manifest (expected $($stable.Sha256), got $actualSha) - refusing to install"
         }
         Write-Info "sha256 + size match the signed manifest"
+        $stagedExe = Join-Path $InstallDir ("." + [System.IO.Path]::GetRandomFileName() + ".staged.exe")
+        try {
+            [System.IO.File]::WriteAllBytes($stagedExe, $verifiedBytes)
+            Move-Item -LiteralPath $stagedExe -Destination $targetExe -Force
+        } catch {
+            Remove-Item -LiteralPath $stagedExe -Force -ErrorAction SilentlyContinue
+            throw
+        }
+        # Official-install marker (§A.2/§A.4): signed provenance for
+        # `libra upgrade` / auto-upgrade. Verified path only.
+        try {
+            $marker = [ordered]@{
+                schema_version  = 1
+                installed_at    = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+                install_source  = "official_signed_manifest"
+                platform        = "windows-amd64"
+                version         = $stable.Version.TrimStart("v")
+                sha256          = $stable.Sha256
+                size            = $stable.Size
+                manifest_key_id = $ReleaseManifestKeyId
+            } | ConvertTo-Json -Compress
+            $markerTmp = Join-Path $InstallDir (".libra-official-install.json.tmp." + [System.IO.Path]::GetRandomFileName())
+            Set-Content -LiteralPath $markerTmp -Value $marker -Encoding ASCII -NoNewline
+            Move-Item -LiteralPath $markerTmp -Destination (Join-Path $InstallDir ".libra-official-install.json") -Force
+            Write-Info "official-install marker written (enables 'libra upgrade')"
+        } catch {
+            Write-Warning "could not record the official-install marker - 'libra upgrade' will ask you to re-run this installer"
+        }
+    } else {
+        # Legacy (explicitly consented, UNVERIFIED) path: plain download to a
+        # unique staging dir, then move into place. An unverified install
+        # must not sit next to a stale official marker.
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $tempExe -UseBasicParsing
+        if (-not (Test-Path -LiteralPath $tempExe)) {
+            throw "Download failed: $downloadUrl"
+        }
+        Move-Item -LiteralPath $tempExe -Destination $targetExe -Force
+        Remove-Item -LiteralPath (Join-Path $InstallDir ".libra-official-install.json") -Force -ErrorAction SilentlyContinue
     }
-
-    Move-Item -LiteralPath $tempExe -Destination $targetExe -Force
     Write-Info "Installed to: $targetExe"
 
     Add-UserPath $InstallDir

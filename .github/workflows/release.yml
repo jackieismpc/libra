@@ -162,12 +162,7 @@ jobs:
           GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          # 1. OIDC token for the upload audience (design §5.2 broker step 1).
-          oidc_jwt="$(curl -fsSL "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=libra-release-upload" \
-            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" | jq -r .value)"
-          [ -n "$oidc_jwt" ] && [ "$oidc_jwt" != "null" ]
-
-          # 2. Per-object {key,size,sha256} list for everything in build/.
+          # 1. Per-object {key,size,sha256} list for everything in build/.
           objects="$(cd build && for f in *; do
             case "$f" in
               *.sha256|*.size) sha="$( (sha256sum "$f" 2>/dev/null || shasum -a 256 "$f") | awk '{print $1}')" ;;
@@ -186,10 +181,32 @@ jobs:
             '{tag: $tag, run_id: $run_id, run_attempt: $run_attempt,
               workflow_sha: $workflow_sha, commit_sha: $commit_sha, objects: $objects}')"
 
-          # 3. Exchange for short-TTL presigned PUT URLs (server-side scope).
-          response="$(curl -fsS -X POST "${LIBRA_RELEASE_API_BASE}/api/internal/release/upload-credential" \
-            -H "Authorization: Bearer ${oidc_jwt}" -H "Content-Type: application/json" \
-            --data-binary "$body")"
+          # 2+3. OIDC mint + credential exchange (design §5.2 broker steps
+          # 1-4), retried on 5xx: each attempt mints a FRESH token — a jti is
+          # one-time, so reusing the previous token would be a replay 401.
+          # 4xx is a real rejection and fails immediately.
+          response=""
+          for attempt in 1 2 3; do
+            oidc_jwt="$(curl -fsSL "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=libra-release-upload" \
+              -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" | jq -r .value)"
+            [ -n "$oidc_jwt" ] && [ "$oidc_jwt" != "null" ]
+            code="$(curl -sS -o credential-response.json -w '%{http_code}' \
+              -X POST "${LIBRA_RELEASE_API_BASE}/api/internal/release/upload-credential" \
+              -H "Authorization: Bearer ${oidc_jwt}" -H "Content-Type: application/json" \
+              --data-binary "$body")" || code=000
+            case "$code" in
+              2??) response="$(cat credential-response.json)"; break ;;
+              5??|000)
+                echo "::warning::credential broker returned HTTP ${code} (attempt ${attempt}/3)"
+                cat credential-response.json 2>/dev/null || true
+                [ "$attempt" -lt 3 ] && sleep $((attempt * 15)) ;;
+              *)
+                echo "::error::credential broker rejected the request with HTTP ${code}"
+                cat credential-response.json 2>/dev/null || true
+                exit 1 ;;
+            esac
+          done
+          [ -n "$response" ] || { echo "::error::credential broker unavailable after 3 attempts"; exit 1; }
 
           # 4. Upload each object with the exact signed headers. A 412 means
           #    the immutable object already exists: forward-fix with a new tag.
@@ -240,10 +257,6 @@ jobs:
           GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
           $ErrorActionPreference = "Stop"
-          $oidc = Invoke-RestMethod -Uri "$($env:ACTIONS_ID_TOKEN_REQUEST_URL)&audience=libra-release-upload" `
-            -Headers @{ Authorization = "Bearer $($env:ACTIONS_ID_TOKEN_REQUEST_TOKEN)" }
-          if (-not $oidc.value) { throw "no OIDC token" }
-
           $objects = @()
           foreach ($f in Get-ChildItem build -File) {
             if ($f.Name.EndsWith(".size")) { continue }
@@ -263,10 +276,30 @@ jobs:
             objects = $objects
           } | ConvertTo-Json -Depth 5
 
-          $response = Invoke-RestMethod -Method Post `
-            -Uri "$($env:LIBRA_RELEASE_API_BASE)/api/internal/release/upload-credential" `
-            -Headers @{ Authorization = "Bearer $($oidc.value)"; "Content-Type" = "application/json" } `
-            -Body $body
+          # OIDC mint + credential exchange, retried on 5xx with a FRESH token
+          # per attempt (a jti is one-time; reusing one would replay-401).
+          $response = $null
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            $oidc = Invoke-RestMethod -Uri "$($env:ACTIONS_ID_TOKEN_REQUEST_URL)&audience=libra-release-upload" `
+              -Headers @{ Authorization = "Bearer $($env:ACTIONS_ID_TOKEN_REQUEST_TOKEN)" }
+            if (-not $oidc.value) { throw "no OIDC token" }
+            try {
+              $response = Invoke-RestMethod -Method Post `
+                -Uri "$($env:LIBRA_RELEASE_API_BASE)/api/internal/release/upload-credential" `
+                -Headers @{ Authorization = "Bearer $($oidc.value)"; "Content-Type" = "application/json" } `
+                -Body $body
+              break
+            } catch {
+              $status = $null
+              if ($_.Exception.Response) { try { $status = [int]$_.Exception.Response.StatusCode } catch {} }
+              if ($status -ge 500 -or $null -eq $status) {
+                Write-Warning "credential broker returned HTTP $status (attempt $attempt/3)"
+                if ($attempt -lt 3) { Start-Sleep -Seconds ($attempt * 15); continue }
+              }
+              throw
+            }
+          }
+          if ($null -eq $response) { throw "credential broker unavailable after 3 attempts" }
 
           foreach ($entry in $response.objects) {
             $file = Join-Path "build" (Split-Path $entry.object_key -Leaf)
@@ -371,10 +404,6 @@ jobs:
           GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          oidc_jwt="$(curl -fsSL "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=libra-release-upload" \
-            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" | jq -r .value)"
-          [ -n "$oidc_jwt" ] && [ "$oidc_jwt" != "null" ]
-
           objects="$(for f in install.sh install.ps1; do
             jq -n --arg key "$f" \
               --arg sha "$(sha256sum "$f" | awk '{print $1}')" \
@@ -387,9 +416,29 @@ jobs:
             --argjson objects "$objects" \
             '{tag: $tag, run_id: $run_id, run_attempt: $run_attempt,
               workflow_sha: $workflow_sha, commit_sha: $commit_sha, objects: $objects}')"
-          response="$(curl -fsS -X POST "${LIBRA_RELEASE_API_BASE}/api/internal/release/upload-credential" \
-            -H "Authorization: Bearer ${oidc_jwt}" -H "Content-Type: application/json" \
-            --data-binary "$body")"
+          # 5xx-retried with a FRESH OIDC token per attempt (one-time jti).
+          response=""
+          for attempt in 1 2 3; do
+            oidc_jwt="$(curl -fsSL "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=libra-release-upload" \
+              -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" | jq -r .value)"
+            [ -n "$oidc_jwt" ] && [ "$oidc_jwt" != "null" ]
+            code="$(curl -sS -o credential-response.json -w '%{http_code}' \
+              -X POST "${LIBRA_RELEASE_API_BASE}/api/internal/release/upload-credential" \
+              -H "Authorization: Bearer ${oidc_jwt}" -H "Content-Type: application/json" \
+              --data-binary "$body")" || code=000
+            case "$code" in
+              2??) response="$(cat credential-response.json)"; break ;;
+              5??|000)
+                echo "::warning::credential broker returned HTTP ${code} (attempt ${attempt}/3)"
+                cat credential-response.json 2>/dev/null || true
+                [ "$attempt" -lt 3 ] && sleep $((attempt * 15)) ;;
+              *)
+                echo "::error::credential broker rejected the request with HTTP ${code}"
+                cat credential-response.json 2>/dev/null || true
+                exit 1 ;;
+            esac
+          done
+          [ -n "$response" ] || { echo "::error::credential broker unavailable after 3 attempts"; exit 1; }
 
           # Bucket-root installers are OVERWRITTEN each release by design, so
           # the broker signs no If-None-Match for this scope. Cache-Control is
@@ -423,7 +472,11 @@ jobs:
             while [[ "$attempt" -le 16 ]]; do
               body="$(curl -fsSL --connect-timeout 10 --max-time 30 \
                 -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "$url")" || true
-              if printf '%s\n' "$body" | grep -Fq "$needle"; then
+              # Herestring, NOT a pipeline: under pipefail, `printf | grep -q`
+              # dies of printf's SIGPIPE (grep exits at first match) once the
+              # body outgrows the pipe buffer, failing the check forever even
+              # though the needle is present.
+              if grep -Fq -- "$needle" <<<"$body"; then
                 echo "CDN $url matches $GITHUB_REF_NAME"
                 return 0
               fi
@@ -707,16 +760,27 @@ jobs:
               run_id: $run_id, run_attempt: $run_attempt,
               workflow_sha: $workflow_sha, commit_sha: $commit_sha}')"
 
-          oidc_jwt="$(curl -fsSL "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=libra-release-publish" \
-            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" | jq -r .value)"
-          [ -n "$oidc_jwt" ] && [ "$oidc_jwt" != "null" ]
-
-          code="$(curl -sS -o publish-response.json -w '%{http_code}' \
-            -X POST "${LIBRA_RELEASE_API_BASE}/api/internal/release/publish" \
-            -H "Authorization: Bearer ${oidc_jwt}" -H "Content-Type: application/json" \
-            --data-binary "$body")"
-          echo "publish HTTP ${code}"
-          cat publish-response.json
+          # 5xx-retried with a FRESH OIDC token per attempt (one-time jti).
+          # The server treats a same-run retry after a landed-but-unmarked
+          # write as a replay and returns the original 200 (B1-04
+          # reconcileOwnPending), so retrying publish is safe by design.
+          code=000
+          for attempt in 1 2 3; do
+            oidc_jwt="$(curl -fsSL "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=libra-release-publish" \
+              -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" | jq -r .value)"
+            [ -n "$oidc_jwt" ] && [ "$oidc_jwt" != "null" ]
+            code="$(curl -sS -o publish-response.json -w '%{http_code}' \
+              -X POST "${LIBRA_RELEASE_API_BASE}/api/internal/release/publish" \
+              -H "Authorization: Bearer ${oidc_jwt}" -H "Content-Type: application/json" \
+              --data-binary "$body")" || code=000
+            echo "publish HTTP ${code} (attempt ${attempt}/3)"
+            cat publish-response.json 2>/dev/null || true
+            case "$code" in
+              2??) break ;;
+              5??|000) [ "$attempt" -lt 3 ] && sleep $((attempt * 15)) ;;
+              *) break ;;
+            esac
+          done
           case "$code" in
             2??) ;;
             *)

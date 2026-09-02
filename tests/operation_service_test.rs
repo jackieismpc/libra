@@ -66,6 +66,35 @@ async fn create_operation_schema(db: &DatabaseConnection) {
     }
 }
 
+/// Create the v2 operation tables used to exercise the compatibility facade.
+async fn create_operation_v2_schema(db: &DatabaseConnection) {
+    let ddl = [
+        "CREATE TABLE operation(\
+            op_id TEXT PRIMARY KEY, repo_id TEXT NOT NULL, format_version INTEGER NOT NULL DEFAULT 2,\
+            kind TEXT NOT NULL, status TEXT NOT NULL, command_name TEXT, description TEXT,\
+            args_digest TEXT, actor TEXT, worktree_id TEXT, scope_kind TEXT NOT NULL,\
+            pre_view_oid TEXT NOT NULL, post_view_oid TEXT NOT NULL, restores_op_id TEXT,\
+            reverts_op_id TEXT, predecessor_map_oid TEXT, causal_context_id TEXT,\
+            start_ts INTEGER NOT NULL, end_ts INTEGER, scope_provenance TEXT NOT NULL DEFAULT 'declared',\
+            restorable INTEGER NOT NULL DEFAULT 1, control_slot TEXT, claim_owner TEXT\
+        )",
+        "CREATE TABLE operation_parent(\
+            op_id TEXT NOT NULL, parent_op_id TEXT NOT NULL, ordinal INTEGER NOT NULL,\
+            PRIMARY KEY(op_id, parent_op_id)\
+        )",
+        "CREATE TABLE operation_journal(\
+            journal_id TEXT PRIMARY KEY, op_id TEXT NOT NULL, phase TEXT NOT NULL,\
+            pre_view_oid TEXT, target_view_oid TEXT, owner TEXT NOT NULL, updated_at INTEGER NOT NULL,\
+            recovery_payload TEXT\
+        )",
+    ];
+    for sql in ddl {
+        db.execute_raw(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
+            .await
+            .unwrap();
+    }
+}
+
 /// Build a minimal operation record for deterministic service-layer tests.
 fn sample_operation(op_id: &str, repo_id: &str, view_id: &str, end_ts: i64) -> OperationRecord {
     OperationRecord {
@@ -137,6 +166,69 @@ async fn invalid_arguments_are_rejected() {
         .await
         .unwrap_err();
     assert!(matches!(error, OperationServiceError::InvalidArgument(_)));
+}
+
+#[tokio::test]
+/// Verifies that the legacy service API uses v2 columns when the v1 view_id is absent.
+async fn v2_compatibility_facade_reads_writes_and_closes_claims() {
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    create_operation_v2_schema(&db).await;
+
+    let record = sample_operation("op_v2", "repo_v2", "legacy-view", 20);
+    let inserted = OperationService::insert_operation_with_conn(&db, &record)
+        .await
+        .unwrap();
+    assert_eq!(inserted, record);
+
+    let listed = OperationService::list_operations_by_repo_with_conn(&db, "repo_v2", 10)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].op_id, record.op_id);
+    assert_ne!(listed[0].view_id, record.view_id);
+    let page = OperationService::list_operations_by_repo_paginated_with_conn(
+        &db,
+        "repo_v2",
+        OperationQueryPage::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.total, 1);
+    assert_eq!(page.items[0].op_id, "op_v2");
+
+    let running = OperationRecord {
+        op_id: "op_running".to_string(),
+        status: OperationStatus::Running,
+        control_slot: Some("control".to_string()),
+        claim_owner: Some("host/123".to_string()),
+        start_ts: 30,
+        end_ts: None,
+        ..record.clone()
+    };
+    OperationService::insert_operation_with_conn(&db, &running)
+        .await
+        .unwrap();
+    assert_eq!(
+        OperationService::running_control_claim_with_conn(&db, "repo_v2", "")
+            .await
+            .unwrap(),
+        Some((
+            "op_running".to_string(),
+            "commit".to_string(),
+            30,
+            Some("host/123".to_string())
+        ))
+    );
+    assert!(
+        OperationService::abandon_claim_with_conn(&db, "op_running", 40)
+            .await
+            .unwrap()
+    );
+    assert!(
+        OperationService::delete_operation_with_conn(&db, "op_running")
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]

@@ -226,16 +226,33 @@ pub async fn load_for_scope(
     let Some(stored) = load_stored_in_scope(scope.storage_key()).await? else {
         return Ok(None);
     };
+    Ok(Some(sequence_state_from_stored(stored)?))
+}
+
+/// Load sequence state through an already-opened repository connection. The
+/// operation facet uses this form so a pinned request cannot accidentally
+/// resolve a different repository while capturing state.
+pub(crate) async fn load_for_scope_with_conn<C: ConnectionTrait>(
+    db: &C,
+    scope: &crate::internal::worktree_scope::WorktreeScope,
+) -> Result<Option<SequenceState>, String> {
+    let Some(stored) = load_stored_with_conn(db, scope.storage_key()).await? else {
+        return Ok(None);
+    };
+    Ok(Some(sequence_state_from_stored(stored)?))
+}
+
+fn sequence_state_from_stored(stored: StoredSequenceState) -> Result<SequenceState, String> {
     let kind = SequenceKind::from_token(&stored.kind)
         .ok_or_else(|| format!("unknown sequence kind '{}'", stored.kind))?;
-    Ok(Some(SequenceState {
+    Ok(SequenceState {
         kind,
         head_name: stored.head_name,
         head_orig: stored.head_orig,
         current_oid: stored.current_oid,
         todo: stored.todo,
         payload: stored.payload,
-    }))
+    })
 }
 
 pub(crate) async fn load_am() -> Result<Option<AmSequenceState>, String> {
@@ -554,6 +571,31 @@ where
 {
     save_fields(
         db,
+        &current_scope_key(),
+        state.kind.as_str(),
+        &state.head_name,
+        &state.head_orig,
+        &state.current_oid,
+        &state.todo,
+        &state.payload,
+    )
+    .await
+}
+
+/// Restore sequence state for an already-resolved worktree using an existing
+/// connection. This is intentionally crate-visible: OL-07 owns the facet
+/// envelope, while this module remains the single owner of sequencer SQL.
+pub(crate) async fn save_for_scope_with_conn<C>(
+    db: &C,
+    scope: &crate::internal::worktree_scope::WorktreeScope,
+    state: &SequenceState,
+) -> Result<(), sea_orm::DbErr>
+where
+    C: ConnectionTrait,
+{
+    save_fields(
+        db,
+        scope.storage_key(),
         state.kind.as_str(),
         &state.head_name,
         &state.head_orig,
@@ -603,6 +645,7 @@ where
 {
     save_fields(
         db,
+        &current_scope_key(),
         "am",
         &state.head_name,
         &state.head_orig,
@@ -613,8 +656,12 @@ where
     .await
 }
 
+// The SQL row is deliberately expanded at this single ownership boundary;
+// the extra scope key prevents a facet restore from falling back to cwd.
+#[allow(clippy::too_many_arguments)]
 async fn save_fields<C>(
     db: &C,
+    scope_key: &str,
     kind: &str,
     head_name: &str,
     head_orig: &str,
@@ -625,14 +672,10 @@ async fn save_fields<C>(
 where
     C: ConnectionTrait,
 {
-    // Part C W1 (§C.4.2): replace only THIS worktree's row. An unscoped
-    // `DELETE FROM sequence_state` would wipe every other worktree's
-    // in-progress sequence.
-    let scope_key = current_scope_key();
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "DELETE FROM sequence_state WHERE worktree_id = ?",
-        [scope_key.clone().into()],
+        [scope_key.to_string().into()],
     ))
     .await?;
     let todo = todo.join("\n");
@@ -713,10 +756,46 @@ where
 {
     // Part C W1 (§C.4.2): scoped by worktree AND kind — a mis-routed abort can
     // erase neither a different consumer's row nor another worktree's sequence.
+    clear_for_scope_with_conn(
+        db,
+        &crate::internal::worktree_scope::WorktreeScope::for_request(),
+        kind,
+    )
+    .await
+}
+
+/// Clear one worktree's sequence row through an already-resolved scope.
+pub(crate) async fn clear_for_scope_with_conn<C>(
+    db: &C,
+    scope: &crate::internal::worktree_scope::WorktreeScope,
+    kind: SequenceKind,
+) -> Result<(), sea_orm::DbErr>
+where
+    C: ConnectionTrait,
+{
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "DELETE FROM sequence_state WHERE kind = ? AND worktree_id = ?",
-        [kind.as_str().into(), current_scope_key().into()],
+        [kind.as_str().into(), scope.storage_key().into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+/// Clear any active sequence for one already-resolved worktree. This is used
+/// when restoring an empty sequencer facet because the captured state does
+/// not carry a kind with which to scope the delete.
+pub(crate) async fn clear_for_scope_all_with_conn<C>(
+    db: &C,
+    scope: &crate::internal::worktree_scope::WorktreeScope,
+) -> Result<(), sea_orm::DbErr>
+where
+    C: ConnectionTrait,
+{
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "DELETE FROM sequence_state WHERE worktree_id = ?",
+        [scope.storage_key().into()],
     ))
     .await?;
     Ok(())

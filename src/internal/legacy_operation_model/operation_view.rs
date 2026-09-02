@@ -1,4 +1,4 @@
-//! SeaORM entity definition for operation view snapshots.
+//! SeaORM entity for the pre-OL-02 operation view table.
 
 use sea_orm::entity::prelude::*;
 

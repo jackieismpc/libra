@@ -4,18 +4,28 @@
 //! operation main-table base DAO methods while keeping transaction ownership in
 //! callers through `*_with_conn` signatures.
 
-use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, Select,
+use std::collections::BTreeMap;
+
+use git_internal::{
+    hash::{ObjectHash, get_hash_kind},
+    internal::object::types::ObjectType,
 };
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QueryResult, QuerySelect, Select, Statement, Value,
+};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::internal::model::{
-    operation, operation_parent, operation_view, operation_view_ref, operation_view_workspace,
+use crate::internal::{
+    legacy_operation_model::{
+        operation, operation_parent, operation_view, operation_view_ref, operation_view_workspace,
+    },
+    operation::view::{REPO_VIEW_SCHEMA_VERSION, RepoViewV2},
 };
 
 /// Stable status of an operation record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OperationStatus {
     Running,
     Succeeded,
@@ -52,7 +62,7 @@ impl OperationStatus {
 }
 
 /// Immutable operation record payload used by DAO/service boundaries.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationRecord {
     pub op_id: String,
     pub repo_id: String,
@@ -91,14 +101,14 @@ pub struct OperationRecord {
 }
 
 /// Parent edge for operation lineage.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationParentRecord {
     pub op_id: String,
     pub parent_op_id: String,
 }
 
 /// Snapshot header for one operation view.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationViewRecord {
     pub view_id: String,
     pub repo_id: String,
@@ -107,7 +117,7 @@ pub struct OperationViewRecord {
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationViewRefRecord {
     pub view_id: String,
     pub ref_kind: String,
@@ -116,7 +126,7 @@ pub struct OperationViewRefRecord {
     pub target_oid: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationViewWorkspaceRecord {
     pub view_id: String,
     pub pointer_kind: String,
@@ -124,7 +134,7 @@ pub struct OperationViewWorkspaceRecord {
 }
 
 /// Aggregated operation graph used by compose persistence/read APIs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationGraphRecord {
     pub operation: OperationRecord,
     pub parents: Vec<OperationParentRecord>,
@@ -200,6 +210,172 @@ pub enum OperationServiceError {
     Internal(String),
 }
 
+#[derive(Debug)]
+struct V2OperationRow {
+    op_id: String,
+    repo_id: String,
+    command_name: Option<String>,
+    description: Option<String>,
+    actor: Option<String>,
+    args_digest: Option<String>,
+    start_ts: i64,
+    end_ts: Option<i64>,
+    status: String,
+    worktree_id: Option<String>,
+    scope_provenance: Option<String>,
+    restorable: Option<i64>,
+    control_slot: Option<String>,
+    claim_owner: Option<String>,
+    scope_kind: String,
+    post_view_oid: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredGraphPayload {
+    graph: OperationGraphRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompatibilityViewFacet {
+    head_kind: String,
+    head_target: String,
+    refs: Vec<OperationViewRefRecord>,
+    workspace: Vec<OperationViewWorkspaceRecord>,
+}
+
+const V2_OPERATION_SELECT: &str = "SELECT op_id, repo_id, command_name, description, actor, args_digest, start_ts, end_ts, \
+     status, worktree_id, scope_provenance, restorable, control_slot, claim_owner, scope_kind, \
+     post_view_oid FROM operation";
+
+async fn operation_has_legacy_view_id<C: ConnectionTrait>(
+    db: &C,
+) -> Result<bool, OperationServiceError> {
+    let rows = db
+        .query_all_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "PRAGMA table_info(operation)",
+        ))
+        .await
+        .map_err(|err| {
+            OperationServiceError::Storage(format!("failed to inspect the operation schema: {err}"))
+        })?;
+    for row in rows {
+        let name: String = row.try_get_by_index(1).map_err(|err| {
+            OperationServiceError::Storage(format!("failed to read the operation schema: {err}"))
+        })?;
+        if name == "view_id" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn v2_row_from_query(row: QueryResult) -> Result<V2OperationRow, OperationServiceError> {
+    Ok(V2OperationRow {
+        op_id: read_v2_field("operation.op_id", row.try_get_by_index::<String>(0))?,
+        repo_id: read_v2_field("operation.repo_id", row.try_get_by_index::<String>(1))?,
+        command_name: read_v2_field(
+            "operation.command_name",
+            row.try_get_by_index::<Option<String>>(2),
+        )?,
+        description: read_v2_field(
+            "operation.description",
+            row.try_get_by_index::<Option<String>>(3),
+        )?,
+        actor: read_v2_field("operation.actor", row.try_get_by_index::<Option<String>>(4))?,
+        args_digest: read_v2_field(
+            "operation.args_digest",
+            row.try_get_by_index::<Option<String>>(5),
+        )?,
+        start_ts: read_v2_field("operation.start_ts", row.try_get_by_index::<i64>(6))?,
+        end_ts: read_v2_field("operation.end_ts", row.try_get_by_index::<Option<i64>>(7))?,
+        status: read_v2_field("operation.status", row.try_get_by_index::<String>(8))?,
+        worktree_id: read_v2_field(
+            "operation.worktree_id",
+            row.try_get_by_index::<Option<String>>(9),
+        )?,
+        scope_provenance: read_v2_field(
+            "operation.scope_provenance",
+            row.try_get_by_index::<Option<String>>(10),
+        )?,
+        restorable: read_v2_field(
+            "operation.restorable",
+            row.try_get_by_index::<Option<i64>>(11),
+        )?,
+        control_slot: read_v2_field(
+            "operation.control_slot",
+            row.try_get_by_index::<Option<String>>(12),
+        )?,
+        claim_owner: read_v2_field(
+            "operation.claim_owner",
+            row.try_get_by_index::<Option<String>>(13),
+        )?,
+        scope_kind: read_v2_field("operation.scope_kind", row.try_get_by_index::<String>(14))?,
+        post_view_oid: read_v2_field(
+            "operation.post_view_oid",
+            row.try_get_by_index::<String>(15),
+        )?,
+    })
+}
+
+fn operation_status_from_v2(value: &str) -> Result<OperationStatus, OperationServiceError> {
+    match value {
+        "running" => Ok(OperationStatus::Running),
+        "success" | "succeeded" => Ok(OperationStatus::Succeeded),
+        "failed" | "partial" => Ok(OperationStatus::Failed),
+        "aborted" | "canceled" => Ok(OperationStatus::Canceled),
+        other => Err(OperationServiceError::Internal(format!(
+            "unknown v2 operation status value in storage: {other}"
+        ))),
+    }
+}
+
+fn record_from_v2_row(row: V2OperationRow) -> Result<OperationRecord, OperationServiceError> {
+    Ok(OperationRecord {
+        op_id: row.op_id,
+        repo_id: row.repo_id,
+        // The v2 post-view object is the closest stable view identifier for
+        // callers that still expose the legacy record shape. Full legacy view
+        // data is retained in operation_journal's compatibility payload.
+        view_id: row.post_view_oid,
+        command_name: row.command_name.unwrap_or_default(),
+        description: row.description.unwrap_or_default(),
+        actor: row.actor.unwrap_or_default(),
+        args_digest: row.args_digest,
+        start_ts: row.start_ts,
+        end_ts: row.end_ts,
+        status: operation_status_from_v2(&row.status)?,
+        worktree_id: row.worktree_id.unwrap_or_default(),
+        scope_provenance: row
+            .scope_provenance
+            .unwrap_or_else(|| "declared".to_string()),
+        restorable: row.restorable.unwrap_or(1) != 0,
+        control_slot: row.control_slot,
+        claim_owner: row.claim_owner,
+        scope_kind: row.scope_kind,
+    })
+}
+
+fn operation_status_to_v2(status: OperationStatus) -> &'static str {
+    match status {
+        OperationStatus::Running => "running",
+        OperationStatus::Succeeded => "success",
+        OperationStatus::Failed => "failed",
+        OperationStatus::Canceled => "aborted",
+    }
+}
+
+fn zero_object_id() -> String {
+    "0".repeat(get_hash_kind().hex_len())
+}
+
+fn read_v2_field<T>(
+    field: &str,
+    result: Result<T, sea_orm::DbErr>,
+) -> Result<T, OperationServiceError> {
+    result.map_err(|err| OperationServiceError::Storage(format!("invalid v2 {field}: {err}")))
+}
+
 /// Operation service placeholder.
 ///
 /// Commit 2 adds operation main table base DAO methods. Higher-level graph
@@ -208,6 +384,265 @@ pub enum OperationServiceError {
 pub struct OperationService;
 
 impl OperationService {
+    async fn v2_rows<C: ConnectionTrait>(
+        db: &C,
+        sql: String,
+        values: Vec<Value>,
+    ) -> Result<Vec<V2OperationRow>, OperationServiceError> {
+        let rows = db
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                sql,
+                values,
+            ))
+            .await
+            .map_err(|err| {
+                OperationServiceError::Storage(format!("failed to query v2 operations: {err}"))
+            })?;
+        rows.into_iter().map(v2_row_from_query).collect()
+    }
+
+    async fn v2_list_operations<C: ConnectionTrait>(
+        db: &C,
+        repo_id: &str,
+        command_name: Option<&str>,
+        limit: u64,
+        offset: Option<u64>,
+    ) -> Result<Vec<OperationRecord>, OperationServiceError> {
+        let mut sql = format!(
+            "{V2_OPERATION_SELECT} WHERE repo_id = ?{}",
+            command_name
+                .map(|_| " AND command_name = ?")
+                .unwrap_or_default()
+        );
+        sql.push_str(" ORDER BY end_ts DESC, start_ts DESC, op_id DESC LIMIT ?");
+        if offset.is_some() {
+            sql.push_str(" OFFSET ?");
+        }
+        let mut values: Vec<Value> = vec![repo_id.into()];
+        if let Some(command_name) = command_name {
+            values.push(command_name.into());
+        }
+        values.push((limit as i64).into());
+        if let Some(offset) = offset {
+            values.push((offset as i64).into());
+        }
+        Self::v2_rows(db, sql, values)
+            .await?
+            .into_iter()
+            .map(record_from_v2_row)
+            .collect()
+    }
+
+    async fn load_stored_graph_payload<C: ConnectionTrait>(
+        db: &C,
+        op_id: &str,
+    ) -> Result<Option<StoredGraphPayload>, OperationServiceError> {
+        let row = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT recovery_payload FROM operation_journal \
+                 WHERE op_id = ? AND recovery_payload IS NOT NULL \
+                 ORDER BY updated_at DESC, journal_id DESC LIMIT 1",
+                [op_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                OperationServiceError::Storage(format!(
+                    "failed to query operation compatibility payload '{op_id}': {err}"
+                ))
+            })?;
+        let Some(row) = row else { return Ok(None) };
+        let payload: String = row.try_get_by_index(0).map_err(|err| {
+            OperationServiceError::Storage(format!(
+                "failed to read operation compatibility payload '{op_id}': {err}"
+            ))
+        })?;
+        serde_json::from_str(&payload).map(Some).map_err(|err| {
+            OperationServiceError::Storage(format!(
+                "invalid operation compatibility payload '{op_id}': {err}"
+            ))
+        })
+    }
+
+    fn write_compatibility_view_object(
+        view: &OperationViewRecord,
+        refs: &[OperationViewRefRecord],
+        workspace: &[OperationViewWorkspaceRecord],
+    ) -> Result<String, OperationServiceError> {
+        let facet = CompatibilityViewFacet {
+            head_kind: view.head_kind.clone(),
+            head_target: view.head_target.clone(),
+            refs: refs.to_vec(),
+            workspace: workspace.to_vec(),
+        };
+        let facet_bytes = serde_json::to_vec(&facet).map_err(|err| {
+            OperationServiceError::Internal(format!(
+                "failed to serialize operation compatibility facet: {err}"
+            ))
+        })?;
+        let storage = crate::utils::util::try_objects_storage().map_err(|err| {
+            OperationServiceError::Storage(format!(
+                "failed to open object storage for operation compatibility view: {err}"
+            ))
+        })?;
+        let facet_oid = ObjectHash::from_type_and_data(ObjectType::Blob, &facet_bytes);
+        storage
+            .put(&facet_oid, &facet_bytes, ObjectType::Blob)
+            .map_err(|err| {
+                OperationServiceError::Storage(format!(
+                    "failed to write operation compatibility facet: {err}"
+                ))
+            })?;
+
+        let repo_view = RepoViewV2 {
+            schema_version: REPO_VIEW_SCHEMA_VERSION,
+            repo_id: view.repo_id.clone(),
+            refs_facet_oid: facet_oid,
+            workspaces: BTreeMap::new(),
+            change_roots: Vec::new(),
+            extension_facets: BTreeMap::new(),
+        };
+        let view_bytes = repo_view.to_canonical_bytes().map_err(|err| {
+            OperationServiceError::Internal(format!(
+                "failed to serialize operation compatibility view: {err}"
+            ))
+        })?;
+        let view_oid = ObjectHash::from_type_and_data(ObjectType::Blob, &view_bytes);
+        storage
+            .put(&view_oid, &view_bytes, ObjectType::Blob)
+            .map_err(|err| {
+                OperationServiceError::Storage(format!(
+                    "failed to write operation compatibility view: {err}"
+                ))
+            })?;
+        Ok(view_oid.to_string())
+    }
+
+    async fn insert_v2_operation_with_conn<C: ConnectionTrait>(
+        db: &C,
+        record: &OperationRecord,
+    ) -> Result<OperationRecord, OperationServiceError> {
+        let zero_oid = zero_object_id();
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO operation (op_id, repo_id, format_version, kind, status, \
+             command_name, description, args_digest, actor, worktree_id, scope_kind, \
+             pre_view_oid, post_view_oid, restores_op_id, reverts_op_id, \
+             predecessor_map_oid, causal_context_id, start_ts, end_ts, scope_provenance, \
+             restorable, control_slot, claim_owner) \
+             VALUES (?, ?, 2, 'command', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)",
+            vec![
+                record.op_id.clone().into(),
+                record.repo_id.clone().into(),
+                operation_status_to_v2(record.status).into(),
+                record.command_name.clone().into(),
+                record.description.clone().into(),
+                record.args_digest.clone().into(),
+                record.actor.clone().into(),
+                record.worktree_id.clone().into(),
+                record.scope_kind.clone().into(),
+                zero_oid.clone().into(),
+                zero_oid.into(),
+                record.start_ts.into(),
+                record.end_ts.into(),
+                record.scope_provenance.clone().into(),
+                i32::from(record.restorable).into(),
+                record.control_slot.clone().into(),
+                record.claim_owner.clone().into(),
+            ],
+        ))
+        .await
+        .map_err(|err| {
+            OperationServiceError::Storage(format!(
+                "failed to insert v2 operation '{}' for repository '{}': {err}",
+                record.op_id, record.repo_id
+            ))
+        })?;
+        Ok(record.clone())
+    }
+
+    async fn persist_v2_graph_with_conn<C: ConnectionTrait>(
+        db: &C,
+        graph: &OperationGraphRecord,
+    ) -> Result<OperationGraphRecord, OperationServiceError> {
+        let post_view_oid =
+            Self::write_compatibility_view_object(&graph.view, &graph.refs, &graph.workspace)?;
+        Self::insert_v2_operation_with_conn(db, &graph.operation).await?;
+        for parent in &graph.parents {
+            Self::insert_parent_v2_with_conn(db, parent).await?;
+        }
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE operation SET pre_view_oid = ?, post_view_oid = ?, command_name = ?, \
+             description = ?, args_digest = ?, actor = ?, worktree_id = ?, scope_kind = ?, \
+             status = ?, start_ts = ?, end_ts = ?, scope_provenance = ?, restorable = ?, \
+             control_slot = ?, claim_owner = ? WHERE op_id = ?",
+            vec![
+                post_view_oid.clone().into(),
+                post_view_oid.clone().into(),
+                graph.operation.command_name.clone().into(),
+                graph.operation.description.clone().into(),
+                graph.operation.args_digest.clone().into(),
+                graph.operation.actor.clone().into(),
+                graph.operation.worktree_id.clone().into(),
+                graph.operation.scope_kind.clone().into(),
+                operation_status_to_v2(graph.operation.status).into(),
+                graph.operation.start_ts.into(),
+                graph.operation.end_ts.into(),
+                graph.operation.scope_provenance.clone().into(),
+                i32::from(graph.operation.restorable).into(),
+                graph.operation.control_slot.clone().into(),
+                graph.operation.claim_owner.clone().into(),
+                graph.operation.op_id.clone().into(),
+            ],
+        ))
+        .await
+        .map_err(|err| {
+            OperationServiceError::Storage(format!(
+                "failed to update v2 operation '{}': {err}",
+                graph.operation.op_id
+            ))
+        })?;
+
+        let payload = serde_json::to_string(&StoredGraphPayload {
+            graph: graph.clone(),
+        })
+        .map_err(|err| {
+            OperationServiceError::Internal(format!(
+                "failed to serialize operation compatibility payload: {err}"
+            ))
+        })?;
+        let journal_id = format!("legacy-compat:{}", graph.operation.op_id);
+        let updated_at = graph.operation.end_ts.unwrap_or(graph.operation.start_ts);
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO operation_journal (journal_id, op_id, phase, pre_view_oid, \
+             target_view_oid, owner, updated_at, recovery_payload) VALUES (?, ?, 'publish', \
+             ?, ?, ?, ?, ?) ON CONFLICT(journal_id) DO UPDATE SET op_id = excluded.op_id, \
+             phase = excluded.phase, pre_view_oid = excluded.pre_view_oid, \
+             target_view_oid = excluded.target_view_oid, owner = excluded.owner, \
+             updated_at = excluded.updated_at, recovery_payload = excluded.recovery_payload",
+            vec![
+                journal_id.into(),
+                graph.operation.op_id.clone().into(),
+                post_view_oid.clone().into(),
+                post_view_oid.into(),
+                graph.operation.actor.clone().into(),
+                updated_at.into(),
+                payload.into(),
+            ],
+        ))
+        .await
+        .map_err(|err| {
+            OperationServiceError::Storage(format!(
+                "failed to write operation compatibility journal '{}': {err}",
+                graph.operation.op_id
+            ))
+        })?;
+        Ok(graph.clone())
+    }
+
     fn apply_repo_operation_order(query: Select<operation::Entity>) -> Select<operation::Entity> {
         query
             .order_by_desc(operation::Column::EndTs)
@@ -259,6 +694,9 @@ impl OperationService {
         record: &OperationRecord,
     ) -> Result<OperationRecord, OperationServiceError> {
         Self::validate_record(record)?;
+        if !operation_has_legacy_view_id(db).await? {
+            return Self::insert_v2_operation_with_conn(db, record).await;
+        }
 
         let model = operation::ActiveModel {
             op_id: Set(record.op_id.clone()),
@@ -299,6 +737,43 @@ impl OperationService {
         db: &C,
         op_id: &str,
     ) -> Result<bool, OperationServiceError> {
+        if !operation_has_legacy_view_id(db).await? {
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "DELETE FROM operation_parent WHERE op_id = ?",
+                [op_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                OperationServiceError::Storage(format!(
+                    "failed to delete v2 operation parents '{op_id}': {err}"
+                ))
+            })?;
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "DELETE FROM operation_journal WHERE op_id = ?",
+                [op_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                OperationServiceError::Storage(format!(
+                    "failed to delete v2 operation journal '{op_id}': {err}"
+                ))
+            })?;
+            let deleted = db
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "DELETE FROM operation WHERE op_id = ?",
+                    [op_id.into()],
+                ))
+                .await
+                .map_err(|err| {
+                    OperationServiceError::Storage(format!(
+                        "failed to delete v2 operation '{op_id}': {err}"
+                    ))
+                })?;
+            return Ok(deleted.rows_affected() > 0);
+        }
         let deleted = operation::Entity::delete_many()
             .filter(operation::Column::OpId.eq(op_id))
             .exec(db)
@@ -318,6 +793,48 @@ impl OperationService {
         repo_id: &str,
         worktree_id: &str,
     ) -> Result<Option<(String, String, i64, Option<String>)>, OperationServiceError> {
+        if !operation_has_legacy_view_id(db).await? {
+            let row = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "SELECT op_id, COALESCE(command_name, ''), start_ts, claim_owner \
+                     FROM operation WHERE repo_id = ? AND worktree_id = ? \
+                     AND status = 'running' AND control_slot IS NOT NULL LIMIT 1",
+                    [repo_id.into(), worktree_id.into()],
+                ))
+                .await
+                .map_err(|err| {
+                    OperationServiceError::Storage(format!(
+                        "failed to read the v2 control claim: {err}"
+                    ))
+                })?;
+            return row
+                .map(|row| {
+                    Ok((
+                        row.try_get_by_index(0).map_err(|err| {
+                            OperationServiceError::Storage(format!(
+                                "invalid v2 control claim operation id: {err}"
+                            ))
+                        })?,
+                        row.try_get_by_index(1).map_err(|err| {
+                            OperationServiceError::Storage(format!(
+                                "invalid v2 control claim command: {err}"
+                            ))
+                        })?,
+                        row.try_get_by_index(2).map_err(|err| {
+                            OperationServiceError::Storage(format!(
+                                "invalid v2 control claim timestamp: {err}"
+                            ))
+                        })?,
+                        row.try_get_by_index(3).map_err(|err| {
+                            OperationServiceError::Storage(format!(
+                                "invalid v2 control claim owner: {err}"
+                            ))
+                        })?,
+                    ))
+                })
+                .transpose();
+        }
         let holder = operation::Entity::find()
             .filter(operation::Column::RepoId.eq(repo_id))
             .filter(operation::Column::WorktreeId.eq(worktree_id))
@@ -339,6 +856,22 @@ impl OperationService {
         op_id: &str,
         end_ts: i64,
     ) -> Result<bool, OperationServiceError> {
+        if !operation_has_legacy_view_id(db).await? {
+            let updated = db
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "UPDATE operation SET status = 'failed', end_ts = ?, control_slot = NULL \
+                     WHERE op_id = ? AND status = 'running'",
+                    [end_ts.into(), op_id.into()],
+                ))
+                .await
+                .map_err(|err| {
+                    OperationServiceError::Storage(format!(
+                        "failed to close v2 abandoned claim '{op_id}': {err}"
+                    ))
+                })?;
+            return Ok(updated.rows_affected() > 0);
+        }
         let updated = operation::Entity::update_many()
             .col_expr(
                 operation::Column::Status,
@@ -373,6 +906,16 @@ impl OperationService {
             return Err(OperationServiceError::InvalidArgument(
                 "op_id must not be empty".to_string(),
             ));
+        }
+
+        if !operation_has_legacy_view_id(db).await? {
+            let rows = Self::v2_rows(
+                db,
+                format!("{V2_OPERATION_SELECT} WHERE op_id = ? LIMIT 1"),
+                vec![op_id.into()],
+            )
+            .await?;
+            return rows.into_iter().next().map(record_from_v2_row).transpose();
         }
 
         let model = operation::Entity::find_by_id(op_id.to_string())
@@ -421,6 +964,32 @@ impl OperationService {
                 "limit must be greater than 0".to_string(),
             ));
         }
+        if !operation_has_legacy_view_id(db).await? {
+            let mut sql = format!(
+                "{V2_OPERATION_SELECT} WHERE repo_id = ? AND command_name = ? \
+                 AND args_digest = ? AND status IN ('success', 'succeeded') \
+                 AND end_ts >= ?"
+            );
+            if worktree_id.is_some() {
+                sql.push_str(" AND worktree_id = ?");
+            }
+            sql.push_str(" ORDER BY end_ts DESC, start_ts DESC, op_id DESC LIMIT ?");
+            let mut values: Vec<Value> = vec![
+                repo_id.into(),
+                command_name.into(),
+                args_digest.into(),
+                earliest_end_ts.into(),
+            ];
+            if let Some(worktree_id) = worktree_id {
+                values.push(worktree_id.into());
+            }
+            values.push((limit as i64).into());
+            return Self::v2_rows(db, sql, values)
+                .await?
+                .into_iter()
+                .map(record_from_v2_row)
+                .collect();
+        }
         let mut query = operation::Entity::find().filter(operation::Column::RepoId.eq(repo_id));
         if let Some(worktree_id) = worktree_id {
             query = query.filter(operation::Column::WorktreeId.eq(worktree_id));
@@ -461,6 +1030,10 @@ impl OperationService {
             return Err(OperationServiceError::InvalidArgument(
                 "limit must be greater than 0".to_string(),
             ));
+        }
+
+        if !operation_has_legacy_view_id(db).await? {
+            return Self::v2_list_operations(db, repo_id, None, limit, None).await;
         }
 
         let models = Self::apply_repo_operation_order(
@@ -509,6 +1082,59 @@ impl OperationService {
             .map(str::trim)
             .filter(|value| !value.is_empty());
         let query = query.normalized();
+        if !operation_has_legacy_view_id(db).await? {
+            let count_sql = if command_name.is_some() {
+                "SELECT COUNT(*) FROM operation WHERE repo_id = ? AND command_name = ?"
+            } else {
+                "SELECT COUNT(*) FROM operation WHERE repo_id = ?"
+            };
+            let mut count_values: Vec<Value> = vec![repo_id.into()];
+            if let Some(command_name) = command_name {
+                count_values.push(command_name.into());
+            }
+            let count_row = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    count_sql,
+                    count_values,
+                ))
+                .await
+                .map_err(|err| {
+                    OperationServiceError::Storage(format!(
+                        "failed to count v2 operation logs for repository '{repo_id}': {err}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    OperationServiceError::Storage("v2 operation count returned no row".to_string())
+                })?;
+            let total: i64 = count_row.try_get_by_index(0).map_err(|err| {
+                OperationServiceError::Storage(format!(
+                    "invalid v2 operation count for repository '{repo_id}': {err}"
+                ))
+            })?;
+            let records = Self::v2_list_operations(
+                db,
+                repo_id,
+                command_name,
+                query.per_page,
+                Some(query.offset()),
+            )
+            .await?;
+            let items = records
+                .into_iter()
+                .map(|record| {
+                    Ok(OperationLogListItem {
+                        op_id: record.op_id,
+                        command_name: record.command_name,
+                        description: record.description,
+                        actor: record.actor,
+                        end_ts: record.end_ts,
+                        status: record.status,
+                    })
+                })
+                .collect::<Result<Vec<_>, OperationServiceError>>()?;
+            return Ok(Self::new_page(items, query, total.max(0) as u64));
+        }
         let mut count_query =
             operation::Entity::find().filter(operation::Column::RepoId.eq(repo_id));
         if let Some(command_name) = command_name {
@@ -557,6 +1183,31 @@ impl OperationService {
         Ok(parent)
     }
 
+    async fn insert_parent_v2_with_conn<C: ConnectionTrait>(
+        db: &C,
+        record: &OperationParentRecord,
+    ) -> Result<OperationParentRecord, OperationServiceError> {
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO operation_parent (op_id, parent_op_id, ordinal) \
+             VALUES (?, ?, COALESCE((SELECT MAX(ordinal) + 1 FROM operation_parent \
+             WHERE op_id = ?), 0))",
+            vec![
+                record.op_id.clone().into(),
+                record.parent_op_id.clone().into(),
+                record.op_id.clone().into(),
+            ],
+        ))
+        .await
+        .map_err(|err| {
+            OperationServiceError::Storage(format!(
+                "failed to insert v2 operation parent edge ('{}' -> '{}'): {err}",
+                record.op_id, record.parent_op_id
+            ))
+        })?;
+        Ok(record.clone())
+    }
+
     pub fn validate_parent_record(
         record: &OperationParentRecord,
     ) -> Result<(), OperationServiceError> {
@@ -584,6 +1235,9 @@ impl OperationService {
         record: &OperationParentRecord,
     ) -> Result<OperationParentRecord, OperationServiceError> {
         Self::validate_parent_record(record)?;
+        if !operation_has_legacy_view_id(db).await? {
+            return Self::insert_parent_v2_with_conn(db, record).await;
+        }
 
         let model = operation_parent::ActiveModel {
             op_id: Set(record.op_id.clone()),
@@ -609,6 +1263,41 @@ impl OperationService {
             return Err(OperationServiceError::InvalidArgument(
                 "op_id must not be empty".to_string(),
             ));
+        }
+
+        if !operation_has_legacy_view_id(db).await? {
+            let rows = db
+                .query_all_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "SELECT op_id, parent_op_id FROM operation_parent \
+                     WHERE op_id = ? ORDER BY ordinal ASC, parent_op_id ASC",
+                    [op_id.into()],
+                ))
+                .await
+                .map_err(|err| {
+                    OperationServiceError::Storage(format!(
+                        "failed to list v2 parent edges for operation '{op_id}': {err}"
+                    ))
+                })?;
+            return rows
+                .into_iter()
+                .map(|row| {
+                    let parent = OperationParentRecord {
+                        op_id: row.try_get_by_index(0).map_err(|err| {
+                            OperationServiceError::Storage(format!(
+                                "invalid v2 parent operation id: {err}"
+                            ))
+                        })?,
+                        parent_op_id: row.try_get_by_index(1).map_err(|err| {
+                            OperationServiceError::Storage(format!(
+                                "invalid v2 parent operation id: {err}"
+                            ))
+                        })?,
+                    };
+                    Self::validate_parent_record(&parent)?;
+                    Ok(parent)
+                })
+                .collect();
         }
 
         let models = operation_parent::Entity::find()
@@ -706,6 +1395,26 @@ impl OperationService {
             return Err(OperationServiceError::InvalidArgument(
                 "op_id must not be empty".to_string(),
             ));
+        }
+
+        if !operation_has_legacy_view_id(db).await? {
+            let operation = Self::find_operation_by_id_with_conn(db, op_id).await?;
+            let Some(operation) = operation else {
+                return Ok(None);
+            };
+            let payload = Self::load_stored_graph_payload(db, op_id)
+                .await?
+                .ok_or_else(|| {
+                    OperationServiceError::Storage(format!(
+                        "operation '{op_id}' has no compatibility view payload"
+                    ))
+                })?;
+            if payload.graph.operation.op_id != operation.op_id {
+                return Err(OperationServiceError::Storage(format!(
+                    "operation compatibility payload '{op_id}' has a mismatched operation id"
+                )));
+            }
+            return Ok(Some(payload.graph.view));
         }
 
         let op_model = operation::Entity::find_by_id(op_id.to_string())
@@ -1020,6 +1729,9 @@ impl OperationService {
         graph: &OperationGraphRecord,
     ) -> Result<OperationGraphRecord, OperationServiceError> {
         Self::validate_graph_record(graph)?;
+        if !operation_has_legacy_view_id(db).await? {
+            return Self::persist_v2_graph_with_conn(db, graph).await;
+        }
 
         let operation = Self::insert_operation_with_conn(db, &graph.operation).await?;
         for parent in &graph.parents {
@@ -1049,6 +1761,25 @@ impl OperationService {
         db: &C,
         op_id: &str,
     ) -> Result<Option<OperationGraphRecord>, OperationServiceError> {
+        if !op_id.trim().is_empty() && !operation_has_legacy_view_id(db).await? {
+            let operation = Self::find_operation_by_id_with_conn(db, op_id).await?;
+            let Some(operation) = operation else {
+                return Ok(None);
+            };
+            let payload = Self::load_stored_graph_payload(db, op_id)
+                .await?
+                .ok_or_else(|| {
+                    OperationServiceError::Storage(format!(
+                        "operation '{op_id}' has no compatibility graph payload"
+                    ))
+                })?;
+            if payload.graph.operation.op_id != operation.op_id {
+                return Err(OperationServiceError::Storage(format!(
+                    "operation compatibility payload '{op_id}' has a mismatched operation id"
+                )));
+            }
+            return Ok(Some(payload.graph));
+        }
         let operation = match Self::find_operation_by_id_with_conn(db, op_id).await? {
             Some(record) => record,
             None => return Ok(None),

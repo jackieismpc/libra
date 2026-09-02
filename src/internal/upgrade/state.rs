@@ -480,18 +480,30 @@ fn read_floors_file(install_dir: &InstallDir) -> Result<Option<UpgradeState>, St
         })
 }
 
-/// Durably record an ACCEPTED manifest's monotone floors, independently of
-/// the main upgrade lock (§A.6/§A.7 anti-rollback).
+/// Per-leg bounded wait for the floors micro-lock (two legs total). Sized
+/// against the fence's read+journal window; test builds shrink it so the
+/// main-lock fallback is exercisable without a 30-second test.
+#[cfg(not(test))]
+const FLOORS_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+#[cfg(test)]
+const FLOORS_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Durably record an ACCEPTED manifest's monotone floors (§A.6/§A.7
+/// anti-rollback) through TWO independent channels:
 ///
-/// The side file has its own micro-lock whose holders only ever perform one
-/// atomic read-merge-write, so under normal concurrency (including a busy or
-/// wedged MAIN upgrade lock) the write completes before this returns.
-/// Exception, by design: if an EXTERNALLY-STALLED holder (e.g. SIGSTOP
-/// mid-write) keeps the micro-lock past the bounded wait, this returns an
-/// error and the attempt's floors are not yet persisted — a process that
-/// exits right then loses them until the next successful manifest check
-/// re-derives them; the detached worker still lands the merge if the holder
-/// resumes. `read_state` folds the side file into every consumer's view.
+/// 1. The floors side file, under its own micro-lock (holders: one atomic
+///    read-merge-write, or the txn commit fence's read + journal write).
+/// 2. If the micro-lock stays held past both bounded waits, a fallback
+///    merge into the MAIN state file under a bounded MAIN-lock try — a
+///    stalled micro-lock holder that is not an installer does not hold the
+///    main lock, so the floors land anyway.
+///
+/// Only when BOTH locks are wedged (a stall on this very filesystem, where
+/// any durable-write protocol would hit the same fsync wall) does this
+/// return an error — and callers must be LOUD about it: these floors are
+/// exactly the state that rejects a replayed older-but-valid signed
+/// manifest. The detached worker still lands the side-file merge if the
+/// holder resumes. `read_state` folds the side file into every view.
 pub fn record_acceptance_floors(
     install_dir: &InstallDir,
     accepted: &UpgradeState,
@@ -558,17 +570,48 @@ pub fn record_acceptance_floors(
             },
         });
     }
-    match receiver.recv_timeout(std::time::Duration::from_secs(3)) {
+    // 15 s + one 15 s second chance: sized against the commit fence
+    // (txn.rs), which holds the floors lock only across ONE state read plus
+    // ONE journal write + fsync (the commit tail runs unfenced under the
+    // PostProbePassed recovery contract).
+    let outcome = match receiver.recv_timeout(FLOORS_LOCK_WAIT) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => receiver.recv_timeout(FLOORS_LOCK_WAIT),
+        other => other,
+    };
+    match outcome {
         Ok(result) => result,
-        Err(_) => Err(StateStoreError::WriteFailed {
-            path,
-            source: InstallDirError::Io {
-                name: FLOORS_FILE_NAME.to_string(),
-                detail: "floors micro-lock stayed held past the bounded wait; \
-                         this attempt's floors were not persisted"
-                    .into(),
-            },
-        }),
+        Err(_) => {
+            // INDEPENDENT fallback channel: merge into the MAIN state file
+            // under the MAIN upgrade lock instead. A stalled floors-lock
+            // holder that is not an installer does not hold the main lock,
+            // so this lands the floors anyway. If BOTH locks are wedged the
+            // stall is on this very filesystem — where no durable-write
+            // protocol can promise persistence either (any spill/pending
+            // file needs the same fsync) — and the caller must FAIL LOUDLY
+            // rather than pretend: the floors are anti-replay state, and a
+            // silently dropped floor would let an older still-valid signed
+            // manifest be accepted again.
+            match install_dir.try_lock() {
+                Ok(Some(_main_guard)) => {
+                    let current = read_state(install_dir)?;
+                    let merged = merge_acceptance_floors(&current, accepted);
+                    if merged != current {
+                        write_state(install_dir, &merged)?;
+                    }
+                    Ok(())
+                }
+                _ => Err(StateStoreError::WriteFailed {
+                    path,
+                    source: InstallDirError::Io {
+                        name: FLOORS_FILE_NAME.to_string(),
+                        detail: "floors micro-lock stayed held past the bounded wait and the \
+                                 main-lock fallback was unavailable; this attempt's floors were \
+                                 not persisted"
+                            .into(),
+                    },
+                }),
+            }
+        }
     }
 }
 
@@ -627,6 +670,52 @@ mod tests {
 
     use super::*;
     use crate::internal::upgrade::{manifest::VerifiedArtifact, platform::Platform};
+
+    /// With the floors micro-lock wedged past both bounded waits, the
+    /// accepted floors land through the INDEPENDENT main-lock fallback —
+    /// the anti-replay state survives a stalled side-file holder.
+    #[cfg(unix)]
+    #[test]
+    fn floors_fallback_lands_in_main_state_when_the_micro_lock_is_wedged() {
+        let temp = tempfile::tempdir().expect("test fixture operation should succeed");
+        let dir = validated_dir(&temp);
+        let _wedge = dir
+            .try_lock_floors()
+            .expect("test fixture operation should succeed")
+            .expect("floors lock free in a fresh dir");
+        let accepted = UpgradeState {
+            max_control_revision: 42,
+            generation_floor: 3,
+            ..UpgradeState::default()
+        };
+        record_acceptance_floors(&dir, &accepted)
+            .expect("fallback via the main lock must persist the floors");
+        let state = read_state(&dir).expect("test fixture operation should succeed");
+        assert_eq!(state.max_control_revision, 42);
+        assert_eq!(state.generation_floor, 3);
+    }
+
+    /// Only when BOTH locks are wedged does persistence fail — and it fails
+    /// with an error, never silently.
+    #[cfg(unix)]
+    #[test]
+    fn floors_persistence_errors_when_both_locks_are_wedged() {
+        let temp = tempfile::tempdir().expect("test fixture operation should succeed");
+        let dir = validated_dir(&temp);
+        let _floors = dir
+            .try_lock_floors()
+            .expect("test fixture operation should succeed")
+            .expect("floors lock free");
+        let _main = dir
+            .try_lock()
+            .expect("test fixture operation should succeed")
+            .expect("main lock free");
+        let accepted = UpgradeState {
+            max_control_revision: 7,
+            ..UpgradeState::default()
+        };
+        assert!(record_acceptance_floors(&dir, &accepted).is_err());
+    }
 
     #[cfg(unix)]
     fn validated_dir(temp: &tempfile::TempDir) -> InstallDir {

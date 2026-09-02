@@ -18,6 +18,11 @@
 | target | wave | one-line purpose | relevant src |
 |---|---|---|---|
 | `commit_change_id_header_spike` | 1 | OL-00 real-Git Change ID header vs sidecar-only compatibility spike | `docs/development/internal/operation-log-working-copy-change-id.md` |
+| `operation_schema_v2` | 1 | OL-02 fresh/legacy SQLite operation schema convergence and guarded upgrade/rollback | `src/internal/db.rs`, `sql/migrations/2026090101_operation_v2.sql`, `src/internal/model/` |
+| `operation_dag` | 1 | OL-04 operation object, journal, and operation-head CAS integration | `src/internal/operation/store.rs`, `sql/migrations/2026090101_operation_v2.sql` |
+| `workspace_snapshot_roundtrip` | 1 | OL-06 bounded working-copy snapshot capture and tracked/untracked tree roundtrip | `src/internal/operation/snapshot.rs`, `src/internal/worktree_io/` |
+| `index_snapshot_roundtrip` | 1 | OL-07 byte-exact raw Git index facet restoration | `src/internal/operation/facet.rs`, `src/internal/operation/` |
+| `sequencer_snapshot_roundtrip` | 1 | OL-07 sequencer and sparse-view facet restoration | `src/internal/operation/facet.rs`, `src/internal/sequencer/`, `src/internal/sparse/` |
 | `command_test` | 1 | Top-level dispatcher covering most `libra <subcmd>` integration paths, including W4 `worktree doctor` read-only/schema, confirmed legacy-capture adoption, W4-08 linked-worktree `libra code`/`automation` enablement, and the W5-08 `graph_machine_survives_tui_removal` breaking guard (interactive graph entry refused with a migration hint; `--json`/`--machine` wire intact) | `src/command/`, `src/cli.rs`, `tests/command/worktree_doctor_test.rs`, `tests/command/code_agent_linked_guard_test.rs` |
 | `compat_stash_subcommand_surface` | 1 | Guards `libra stash` subcommand surface vs. git CLI | `src/command/stash.rs` |
 | `compat_bisect_subcommand_surface` | 1 | Guards `libra bisect` subcommand surface | `src/command/bisect.rs` |
@@ -390,7 +395,7 @@ dedicated feature-on steps.
 |---|---|---|---|
 | `upgrade_auto_test` | 1 | plan-20260714 §A.11 auto-upgrade end-to-end: signature+decision chain, anti-rollback/revocation replay, real-binary `__upgrade-probe` self-check, install/rollback transaction (`--features test-upgrade`) | `src/internal/upgrade/`, `src/command/upgrade.rs` |
 | `upgrade_publish_contract_test` | 1 | plan-20260714 §A.9/§A.11 manifest/publish contract: matrix coverage, URL binding, size bounds, renew preserves pause/revocations; plan-20260821 A1-06 Backend B1-02 transition contract vectors (cross-implementation verify, anti-vv placeholder) (`--features test-upgrade`) | `src/internal/upgrade/manifest.rs`, `tests/data/up01-transition-vectors-v1.json` |
-| `install_smoke_test` | 1 | plan-20260821 A1-05 installer verification smoke: eight `install.sh` scenarios (signed install, tampered signature, sha/size mismatch, manifest-404 and verifier-unavailable transitions ± `LIBRA_ALLOW_FALLBACK`) plus the `install.ps1` runner when `pwsh` exists; needs bash+python3+openssl, otherwise prints skipped | `install.sh`, `install.ps1`, `tests/data/install-smoke/` |
+| `install_smoke_test` | 2 | plan-20260821 A1-05 installer verification smoke: twenty-four `install.sh` scenarios (signed install, tampered signature/payload, sha/size mismatch, expired/paused/revoked, stale-replay floor, zero-size, min_key_generation + bounded-numeric grammar, key validity window, non-canonical/trailing-artifact serialization, calendar-invalid dates, pretty-printed envelope acceptance, oversized-response cutoff, multi-line payload smuggling, oversized SemVer components, manifest-404 and verifier-unavailable transitions ± `LIBRA_ALLOW_FALLBACK`) plus twenty-two `install.ps1` scenarios when `pwsh` exists; needs bash+python3+openssl, otherwise prints skipped | `install.sh`, `install.ps1`, `tests/data/install-smoke/` |
 
 ## Wave 4 — Live AI (test-live-ai / DEEPSEEK_API_KEY)
 

@@ -129,6 +129,83 @@ impl SparseViewStore {
         Self::set_enabled(scope, false).await
     }
 
+    /// Read both sparse-view tables through an already-opened connection.
+    /// Operation facets use this form to preserve the request-pinned
+    /// repository and to keep this module the single owner of sparse SQL.
+    pub(crate) async fn state_for_scope_with_conn<C: ConnectionTrait>(
+        db: &C,
+        scope: &WorktreeScope,
+    ) -> Result<(bool, Vec<String>), String> {
+        let enabled = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT enabled FROM sparse_view_meta WHERE worktree_id = ?",
+                [scope.storage_key().into()],
+            ))
+            .await
+            .map_err(|error| format!("failed to read the sparse view toggle: {error}"))?
+            .map(|row| row.try_get_by_index::<i32>(0).map(|value| value != 0))
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .unwrap_or(false);
+        let rows = db
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT pattern FROM sparse_view WHERE worktree_id = ? \
+                 ORDER BY ordinal ASC, id ASC",
+                [scope.storage_key().into()],
+            ))
+            .await
+            .map_err(|error| format!("failed to read the sparse view patterns: {error}"))?;
+        rows.into_iter()
+            .map(|row| row.try_get_by_index(0).map_err(|error| error.to_string()))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|patterns| (enabled, patterns))
+    }
+
+    /// Restore both sparse-view tables using the caller's transaction. The
+    /// adapter owns the facet envelope; this store owns the SQL and scope
+    /// key, so another worktree cannot be overwritten accidentally.
+    pub(crate) async fn restore_for_scope_with_conn<C: ConnectionTrait>(
+        db: &C,
+        scope: &WorktreeScope,
+        enabled: bool,
+        patterns: &[String],
+    ) -> Result<(), String> {
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM sparse_view WHERE worktree_id = ?",
+            [scope.storage_key().into()],
+        ))
+        .await
+        .map_err(|error| format!("failed to clear the sparse view: {error}"))?;
+        for (ordinal, pattern) in patterns.iter().enumerate() {
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO sparse_view (worktree_id, pattern, ordinal) VALUES (?, ?, ?)",
+                [
+                    scope.storage_key().into(),
+                    pattern.as_str().into(),
+                    (ordinal as i64).into(),
+                ],
+            ))
+            .await
+            .map_err(|error| format!("failed to restore a sparse pattern: {error}"))?;
+        }
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO sparse_view_meta (worktree_id, enabled) VALUES (?, ?) \
+             ON CONFLICT(worktree_id) DO UPDATE SET enabled = excluded.enabled",
+            [
+                scope.storage_key().into(),
+                (if enabled { 1 } else { 0 }).into(),
+            ],
+        ))
+        .await
+        .map_err(|error| format!("failed to restore the sparse view toggle: {error}"))?;
+        Ok(())
+    }
+
     async fn rewrite(scope: &WorktreeScope, patterns: &[String]) -> Result<(), String> {
         let db = crate::internal::sequencer::request_db_checked().await?;
         let txn = db.begin().await.map_err(|e| e.to_string())?;

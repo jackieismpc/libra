@@ -1,0 +1,29 @@
+//! Version 2 operation-log primitives.
+
+pub mod facet;
+pub mod snapshot;
+pub mod store;
+pub mod view;
+pub mod working_copy;
+
+// OL-15 removes this compatibility service. Re-exporting it keeps existing
+// command integrations source-compatible while all new code uses v2 types.
+pub use facet::{
+    FacetCapture, FacetCaptureCtx, FacetDiff, FacetError, FacetName, FacetRegistry,
+    FacetRestoreCtx, RAW_INDEX_FACET_NAME, RawIndexFacet, RestorePolicy, SEQUENCER_FACET_NAME,
+    SPARSE_FACET_NAME, SequencerFacet, SparseFacet, StateFacet,
+};
+pub use snapshot::{
+    IndexEntrySnapshot, ScanError, ScanResult, ScannedFile, SnapshotError, SnapshotOutcome,
+    WorkspaceSnapshotter,
+};
+pub use store::{
+    JournalEntry, JournalPhase, OpHeadsView, OperationKind, OperationMetaV2, OperationStatusV2,
+    OperationStoreV2, OperationV2, StoreError,
+};
+pub use view::{
+    CapturePolicy, Completeness, HeadState, RepoViewV2, WorkspaceId, WorkspaceSnapshotV2,
+};
+pub use working_copy::{PinnedRequestScope, PointerError, Staleness, WorkspaceStatePointer};
+
+pub use crate::internal::legacy_operation::*;
