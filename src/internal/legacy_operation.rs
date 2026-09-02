@@ -17,10 +17,12 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::internal::legacy_operation_model::{
-    operation, operation_parent, operation_view, operation_view_ref, operation_view_workspace,
+use crate::internal::{
+    legacy_operation_model::{
+        operation, operation_parent, operation_view, operation_view_ref, operation_view_workspace,
+    },
+    operation::view::{REPO_VIEW_SCHEMA_VERSION, RepoViewV2},
 };
-use crate::internal::operation::view::{REPO_VIEW_SCHEMA_VERSION, RepoViewV2};
 
 /// Stable status of an operation record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
