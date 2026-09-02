@@ -1,5 +1,28 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed: SSH host key handling now matches Git's transport behavior
+
+`libra clone`/`fetch`/`push`/`ls-remote` over SSH no longer force
+`StrictHostKeyChecking=yes` + `BatchMode=yes`. In the new default `ask` mode
+libra passes **no** `StrictHostKeyChecking` option to `ssh`, so the user's
+`~/.ssh/config` governs and OpenSSH offers its interactive trust prompt (TOFU)
+on first connection — the same experience as `git clone` on a fresh machine
+(no more "No ED25519 host key is known for …" hard failure before the host key
+has been accepted once).
+
+- Interactive sessions (TTY on stdin): stderr is inherited, so the
+  authenticity warning, fingerprint, and "Permanently added" confirmation are
+  visible live; headless contexts (CI, agents, tests) keep the previous
+  piped-stderr diagnostics and gain `BatchMode=yes` so ssh fails fast instead
+  of prompting.
+- `ssh.strictHostKeyChecking` / `LIBRA_SSH_STRICT_HOST_KEY_CHECKING` now
+  accept the four OpenSSH policies: `ask` (default), `yes`, `accept-new`, `no`.
+- Host key verification failures in clone discovery now surface a targeted
+  hint (`ssh -T <host>`, `ssh-keyscan`, or `accept-new`) instead of the generic
+  network hint.
+
 ## [0.22.0] — 2026-08-30
 
 ### Removed (breaking): the SSE wire v1 snapshot stream (plan-20260824 DF-08, ADR-DF-03)
