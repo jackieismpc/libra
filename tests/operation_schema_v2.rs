@@ -125,7 +125,7 @@ async fn fresh_and_legacy_databases_converge_to_the_same_v2_schema() {
 }
 
 #[tokio::test]
-async fn operation_v2_migration_is_forward_only_and_versioned() {
+async fn operation_v2_migration_is_versioned_and_exposes_v2_shape() {
     let dir = TempDir::new().expect("temporary schema directory");
     let path = db_path(&dir, "version.db");
     let conn = db::create_database(path.to_str().expect("UTF-8 path"))
@@ -146,5 +146,48 @@ async fn operation_v2_migration_is_forward_only_and_versioned() {
         table_columns(&conn, "operation_parent")
             .await
             .contains(&"ordinal".to_string())
+    );
+}
+
+#[tokio::test]
+async fn empty_operation_v2_database_can_round_trip_through_guarded_rollback() {
+    let dir = TempDir::new().expect("temporary schema directory");
+    let path = db_path(&dir, "rollback.db");
+    let conn = db::create_database(path.to_str().expect("UTF-8 path"))
+        .await
+        .expect("create database");
+    let runner = libra::internal::db::migration::builtin_runner().expect("builtin runner");
+
+    runner
+        .rollback_to(&conn, 2026082401)
+        .await
+        .expect("empty v2 database rolls back");
+    assert!(
+        table_columns(&conn, "operation")
+            .await
+            .contains(&"view_id".to_string())
+    );
+    assert!(
+        !table_columns(&conn, "operation")
+            .await
+            .contains(&"post_view_oid".to_string())
+    );
+    assert!(
+        table_columns(&conn, "operation_view")
+            .await
+            .contains(&"head_target".to_string())
+    );
+    assert!(table_columns(&conn, "operation_head").await.is_empty());
+
+    runner.run_pending(&conn).await.expect("v2 re-upgrade");
+    assert!(
+        table_columns(&conn, "operation")
+            .await
+            .contains(&"post_view_oid".to_string())
+    );
+    assert!(
+        !table_columns(&conn, "operation")
+            .await
+            .contains(&"view_id".to_string())
     );
 }

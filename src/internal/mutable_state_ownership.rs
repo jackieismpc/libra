@@ -416,6 +416,36 @@ pub const MUTABLE_STATE_OWNERSHIP: &[MutableStateSurface] = &[
         rationale: "operation-log companions (the log itself is the Composite row above)",
     },
     MutableStateSurface {
+        table: "operation_head",
+        owner: StateOwner::Repository,
+        rationale: "v2 operation-head index is repository-wide",
+    },
+    MutableStateSurface {
+        table: "operation_journal",
+        owner: StateOwner::Repository,
+        rationale: "v2 operation recovery journal is repository-wide",
+    },
+    MutableStateSurface {
+        table: "change_identity",
+        owner: StateOwner::Repository,
+        rationale: "v2 change identity graph is repository-wide",
+    },
+    MutableStateSurface {
+        table: "change_revision",
+        owner: StateOwner::Repository,
+        rationale: "v2 change revision graph is repository-wide",
+    },
+    MutableStateSurface {
+        table: "change_predecessor",
+        owner: StateOwner::Repository,
+        rationale: "v2 change predecessor graph is repository-wide",
+    },
+    MutableStateSurface {
+        table: "ai_operation_link",
+        owner: StateOwner::Composite,
+        rationale: "v2 AI operation link carries worktree scope",
+    },
+    MutableStateSurface {
         table: "operation_view",
         owner: StateOwner::Repository,
         rationale: "operation-log companions (the log itself is the Composite row above)",
@@ -493,6 +523,8 @@ pub const MIGRATION_ONLY_TABLES: &[&str] = &[
     "operation__down_guard_2026073003",
     "operation__down_guard_2026073004",
     "operation_scope_provenance_down_guard",
+    "operation_v2_guard",
+    "operation_v2_down_guard",
     "rebase_state__down_guard_2026072101",
     "sequence_state__down_guard_2026071901",
     "source_call_log__rebuild",

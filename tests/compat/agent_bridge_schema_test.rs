@@ -14,6 +14,7 @@ const BRIDGE_MIGRATION_VERSION: i64 = 2026081801;
 /// one mutation result can carry its operation, workspace, parent-session and
 /// evidence associations (LB-04/LB-05 VCS wiring).
 const BRIDGE_LINK_RELATIONS_VERSION: i64 = 2026082401;
+const OPERATION_V2_VERSION: i64 = 2026090101;
 
 #[test]
 fn bridge_migrations_are_registered_and_link_relations_is_the_latest() {
@@ -24,10 +25,16 @@ fn bridge_migrations_are_registered_and_link_relations_is_the_latest() {
             .any(|migration| migration.version == BRIDGE_MIGRATION_VERSION),
         "2026081801_agent_bridge_capture must stay registered"
     );
+    assert!(
+        builtin_migrations()
+            .iter()
+            .any(|migration| migration.version == BRIDGE_LINK_RELATIONS_VERSION),
+        "2026082401_agent_bridge_link_relations must stay registered"
+    );
     assert_eq!(
         runner.max_registered_version(),
-        Some(BRIDGE_LINK_RELATIONS_VERSION),
-        "2026082401_agent_bridge_link_relations must be the latest registered migration"
+        Some(OPERATION_V2_VERSION),
+        "2026090101_operation_v2 must be the latest registered migration"
     );
 }
 

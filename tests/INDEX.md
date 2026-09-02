@@ -18,7 +18,7 @@
 | target | wave | one-line purpose | relevant src |
 |---|---|---|---|
 | `commit_change_id_header_spike` | 1 | OL-00 real-Git Change ID header vs sidecar-only compatibility spike | `docs/development/internal/operation-log-working-copy-change-id.md` |
-| `operation_schema_v2` | 1 | OL-02 fresh/legacy SQLite operation schema convergence and forward-only version guard | `src/internal/db.rs`, `sql/migrations/2026090101_operation_v2.sql`, `src/internal/model/` |
+| `operation_schema_v2` | 1 | OL-02 fresh/legacy SQLite operation schema convergence and guarded upgrade/rollback | `src/internal/db.rs`, `sql/migrations/2026090101_operation_v2.sql`, `src/internal/model/` |
 | `operation_dag` | 1 | OL-04 operation object, journal, and operation-head CAS integration | `src/internal/operation/store.rs`, `sql/migrations/2026090101_operation_v2.sql` |
 | `workspace_snapshot_roundtrip` | 1 | OL-06 bounded working-copy snapshot capture and tracked/untracked tree roundtrip | `src/internal/operation/snapshot.rs`, `src/internal/worktree_io/` |
 | `index_snapshot_roundtrip` | 1 | OL-07 byte-exact raw Git index facet restoration | `src/internal/operation/facet.rs`, `src/internal/operation/` |

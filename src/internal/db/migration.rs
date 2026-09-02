@@ -1403,16 +1403,15 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026082401_agent_bridge_link_relations.sql"),
             include_str!("../../../sql/migrations/2026082401_agent_bridge_link_relations_down.sql"),
         ),
-        // OL-02: the operation log v2 schema is a direct, forward-only
-        // replacement for the development-only v1 tables.  There is no down
-        // migration because the v1 shape cannot represent v2 snapshots,
-        // journals, or operation heads without loss.
-        Migration {
-            version: 2026090101,
-            name: "operation_v2",
-            up: include_str!("../../../sql/migrations/2026090101_operation_v2.sql"),
-            down: None,
-        },
+        // OL-02: the operation log v2 schema replaces the development-only
+        // v1 tables. Both directions are guarded: upgrade refuses to discard
+        // legacy rows, and downgrade only reconstructs v1 for an empty v2 DB.
+        sql_migration(
+            2026090101,
+            "operation_v2",
+            include_str!("../../../sql/migrations/2026090101_operation_v2.sql"),
+            include_str!("../../../sql/migrations/2026090101_operation_v2_down.sql"),
+        ),
     ]
 }
 

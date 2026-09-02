@@ -366,6 +366,10 @@ pub const CODE_AGENT_TABLE_OWNERSHIP: &[(&str, ConfigOwner)] = &[
     ("ai_final_decision", ConfigOwner::Repository),
     ("ai_risk_score_breakdown", ConfigOwner::Repository),
     ("ai_validation_report", ConfigOwner::Repository),
+    (
+        "ai_operation_link",
+        ConfigOwner::RepositoryWithWorkspaceSessionScope,
+    ),
 ];
 
 /// §C.4.1.1 process-cache inventory: every `static` synchronization/cache
