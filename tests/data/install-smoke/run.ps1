@@ -134,6 +134,12 @@ httpd.serve_forever()
     }
 
     Run-Scenario "valid" "manifest-valid.json" "ok" "yes" "Signed stable manifest verified"
+    # The verified install records signed provenance for `libra upgrade`.
+    $validMarker = Join-Path $Work "home-valid/bin/.libra-official-install.json"
+    if (-not (Test-Path -LiteralPath $validMarker)) { Fail "valid: official-install marker missing" }
+    $markerText = Get-Content -Raw -LiteralPath $validMarker
+    if ($markerText -cnotmatch '"install_source":"official_signed_manifest"') { Fail "valid: marker lacks official install_source" }
+    if ($markerText -cnotmatch '"version":"9.9.9"') { Fail "valid: marker version wrong" }
     Run-Scenario "bad-signature" "manifest-bad-signature.json" "fail" "no" "SIGNATURE VERIFICATION FAILED"
     Run-Scenario "sha-mismatch" "manifest-sha-mismatch.json" "fail" "no" "sha256 mismatch against the SIGNED manifest"
     Run-Scenario "size-mismatch" "manifest-size-mismatch.json" "fail" "no" "does not match the signed size"
@@ -155,6 +161,9 @@ httpd.serve_forever()
     Run-Scenario "huge-semver" "manifest-huge-semver.json" "fail" "no" "not canonical X.Y.Z"
     Run-Scenario "transition-404" "-none-" "fail" "no" "signature chain is not enabled yet"
     Run-Scenario "transition-404-fallback" "-none-" "ok" "yes" "proceeding UNVERIFIED" @{ LIBRA_ALLOW_FALLBACK = "1" }
+    if (Test-Path -LiteralPath (Join-Path $Work "home-transition-404-fallback/bin/.libra-official-install.json")) {
+        Fail "transition-404-fallback: an UNVERIFIED install must not carry the official marker"
+    }
 
     # ── production file untouched ───────────────────────────────────────────
     $after = [IO.File]::ReadAllBytes($Installer)

@@ -18,7 +18,7 @@ INSTALL_DIR="${LIBRA_INSTALL_DIR:-$LIBRA_HOME/bin}"
 # user opts in with LIBRA_ALLOW_FALLBACK=1. Default behaviour is fail-fast so
 # offline installs cannot silently regress to a stale version. Bump this on
 # every release so the opt-in fallback remains useful.
-DEFAULT_VERSION="v0.22.6"
+DEFAULT_VERSION="v0.22.10"
 # Public-only trust anchor for stable-manifest verification. It deliberately
 # has no environment override: the install-smoke harness rewrites these
 # clearly-marked constants in a temporary COPY of this script, never through
@@ -436,6 +436,93 @@ download_file_pinned() {
     fi
 }
 
+# Official-install marker (§A.2/§A.4): records the signed provenance of the
+# target so `libra upgrade` and `upgrade.mode=auto` accept this install as
+# upgrade-manageable. Called ONLY on the verified path — an unverified
+# fallback must never claim official provenance.
+#
+# Write discipline (§A.5-lite): the install dir must be OWNED by the current
+# user and not world-writable, and the marker is composed inside a fresh
+# 0700 staging DIRECTORY created atomically by mktemp -d — no other user can
+# reach the staged file, and the unpredictable name plus private mode close
+# the pre-created/replaced-symlink redirection races a bare temp file has.
+# MARKER_WRITTEN feeds the final summary so a failure is never silent.
+MARKER_WRITTEN=0
+write_official_marker() {
+    # POSIX-portable ownership + world-writability preflight (`test -O` and
+    # `find -maxdepth` are not portable to dash/BSD): `ls -ldn` prints the
+    # numeric owner uid in field 3 and the mode string's 9th character is
+    # the others-write bit.
+    dir_ls=$(ls -ldn "$INSTALL_DIR" 2>/dev/null) || {
+        warn_fact "provenance" "cannot inspect the install dir — official-install marker skipped; re-run this installer to enable 'libra upgrade'"
+        return 0
+    }
+    dir_uid=$(printf '%s\n' "$dir_ls" | awk '{print $3}')
+    if [ "$dir_uid" != "$(id -u)" ]; then
+        warn_fact "provenance" "install dir is not owned by you — official-install marker skipped; 'libra upgrade' will not manage this install"
+        return 0
+    fi
+    # Match the Rust InstallDir policy (§A.5): group- OR others-writable
+    # install dirs are refused by `libra upgrade`, and default umask 002
+    # creates exactly such dirs. TIGHTEN the mode — but only for the
+    # script's OWN default layout ($LIBRA_HOME/bin): a custom -d directory
+    # may be group-shared on purpose, and silently stripping its group
+    # write bit is not this installer's call.
+    case "$dir_ls" in
+        ????????w*|?????w*)
+            if [ "$INSTALL_DIR" != "$LIBRA_HOME/bin" ]; then
+                warn_fact "provenance" "custom install dir is group/world-writable, which 'libra upgrade' refuses — official-install marker skipped; run: chmod go-w '$INSTALL_DIR' if that is acceptable"
+                return 0
+            fi
+            if chmod go-w "$INSTALL_DIR" 2>/dev/null; then
+                fact "provenance" "tightened install dir permissions (chmod go-w) for upgrade management"
+                # Re-verify after the change: the owner must still be us and
+                # the writable bits must actually be gone (a swapped path or
+                # a filesystem ignoring the chmod skips the marker).
+                dir_ls=$(ls -ldn "$INSTALL_DIR" 2>/dev/null) || dir_ls=""
+                case "$dir_ls" in
+                    ????????w*|?????w*|"")
+                        warn_fact "provenance" "install dir permissions could not be verified after tightening — official-install marker skipped"
+                        return 0
+                        ;;
+                esac
+                if [ "$(printf '%s\n' "$dir_ls" | awk '{print $3}')" != "$(id -u)" ]; then
+                    warn_fact "provenance" "install dir changed owner unexpectedly — official-install marker skipped"
+                    return 0
+                fi
+            else
+                warn_fact "provenance" "install dir is group/world-writable and could not be tightened — official-install marker skipped; run: chmod go-w '$INSTALL_DIR'"
+                return 0
+            fi
+            ;;
+    esac
+    marker_dir=$(mktemp -d "${INSTALL_DIR}/.libra-marker.XXXXXX" 2>/dev/null) || {
+        warn_fact "provenance" "could not record the official-install marker — re-run this installer to enable 'libra upgrade'"
+        return 0
+    }
+    # The destination must not be a directory/symlink someone pre-created:
+    # `mv file dir` would silently move INTO it. Clear a regular file (the
+    # normal overwrite case), refuse anything else.
+    marker_dst="${INSTALL_DIR}/.libra-official-install.json"
+    if [ -L "$marker_dst" ] || { [ -e "$marker_dst" ] && [ ! -f "$marker_dst" ]; }; then
+        rm -rf "$marker_dir" 2>/dev/null
+        warn_fact "provenance" "'$marker_dst' exists and is not a regular file — official-install marker skipped; remove it and re-run this installer"
+        return 0
+    fi
+    if printf '{"schema_version":1,"installed_at":"%s","install_source":"official_signed_manifest","platform":"%s","version":"%s","sha256":"%s","size":%s,"manifest_key_id":"%s"}' \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${OS}-${ARCH}" "$STABLE_VERSION" \
+        "$STABLE_SHA256" "$STABLE_SIZE" "$LIBRA_RELEASE_MANIFEST_KEY_ID" > "$marker_dir/marker.json" \
+        && chmod 644 "$marker_dir/marker.json" \
+        && mv "$marker_dir/marker.json" "$marker_dst" \
+        && [ -f "$marker_dst" ] && [ ! -L "$marker_dst" ]; then
+        MARKER_WRITTEN=1
+        fact "provenance" "official-install marker written (enables 'libra upgrade')"
+    else
+        warn_fact "provenance" "could not record the official-install marker — re-run this installer to enable 'libra upgrade'"
+    fi
+    rm -rf "$marker_dir" 2>/dev/null
+}
+
 # Print sha256 hex of "$1", or empty string if no hashing tool is available.
 sha256_of() {
     file=$1
@@ -690,8 +777,13 @@ verify_stable_manifest() {
     # contain quotes and every numeric field is bounded to nine digits (so
     # later shell integer comparisons can never overflow), and nothing can
     # precede, follow, or hide inside the artifacts array to spoof a value.
-    grammar_row='\{"platform":"[^"]{1,32}","url":"[^"]{1,256}","sha256":"[0-9a-f]{64}","size":(0|[1-9][0-9]{0,8})\}'
-    grammar_head='^\{"channel":"[^"]{1,32}","version":"[^"]{1,64}","control_revision":(0|[1-9][0-9]{0,8}),"published_at":"[^"]{1,64}","expires_at":"[^"]{1,64}","min_key_generation":(0|[1-9][0-9]{0,8}),"paused":(true|false),"revoked_versions":\[[^]]{0,1024}\],"artifacts":\['
+    # PORTABILITY: every {n,m} bound must stay <= 255 — BSD grep (macOS)
+    # rejects larger repetition counts with "maximum repetition exceeds 255"
+    # and the gate would then fail closed on every Mac. The revoked list uses
+    # an unbounded bracket-free class instead: entries are re-validated one
+    # by one below, and the whole payload is already capped at 1 MiB.
+    grammar_row='\{"platform":"[^"]{1,32}","url":"[^"]{1,255}","sha256":"[0-9a-f]{64}","size":(0|[1-9][0-9]{0,8})\}'
+    grammar_head='^\{"channel":"[^"]{1,32}","version":"[^"]{1,64}","control_revision":(0|[1-9][0-9]{0,8}),"published_at":"[^"]{1,64}","expires_at":"[^"]{1,64}","min_key_generation":(0|[1-9][0-9]{0,8}),"paused":(true|false),"revoked_versions":\[[^]]*\],"artifacts":\['
     if ! grep -qE "${grammar_head}${grammar_row}(,${grammar_row})*\\]\\}\$" "$payload_file"; then
         rm -rf "$work_dir"
         error_exit "signed manifest payload does not match the canonical serialization" "verify" \
@@ -1023,6 +1115,11 @@ screen_already_installed() {
     else
         agent_say "libra ${VERSION} is already installed at ${EXISTING_PATH}. Nothing else to install."
     fi
+    # The bootstrap re-run exists to write the marker; a failure here would
+    # otherwise hide behind the normal success screen.
+    if [ "${INSTALL_VERIFIED:-0}" = "1" ] && [ "${MARKER_WRITTEN:-0}" != "1" ]; then
+        warn_fact "provenance" "upgrade management NOT enabled (the official-install marker was not written) — 'libra upgrade' will ask you to re-run this installer"
+    fi
 
     section "installed"
     printf '  %s✓%s libra %s%s · %s%s\n\n' \
@@ -1098,6 +1195,13 @@ screen_install() {
 
     run_step "install to $target" mv "$temp_file" "$target" \
         || error_exit "could not install to $target" "install"
+
+    if [ "${INSTALL_VERIFIED:-0}" = "1" ]; then
+        write_official_marker
+    else
+        # An unverified install must not sit next to a stale official marker.
+        rm -f "${INSTALL_DIR}/.libra-official-install.json" 2>/dev/null || true
+    fi
 
     INSTALLED_PATH="$target"
     ensure_lba_alias
@@ -1258,6 +1362,11 @@ screen_success() {
     else
         agent_say "Installed in about 30 seconds. You're all set — here's what to try first:"
     fi
+    # A verified install whose provenance marker could not be recorded is
+    # working but NOT upgrade-manageable — say so where it cannot be missed.
+    if [ "${INSTALL_VERIFIED:-0}" = "1" ] && [ "${MARKER_WRITTEN:-0}" != "1" ]; then
+        warn_fact "provenance" "upgrade management NOT enabled (the official-install marker was not written) — 'libra upgrade' will ask you to re-run this installer"
+    fi
 
     pad="                                       "
     fmtcmd() {
@@ -1359,6 +1468,11 @@ main() {
             fi
         fi
         if [ "$skip_ok" = "1" ]; then
+            # Bootstrap: the already-installed binary just matched the SIGNED
+            # manifest digest, so (re)write the official marker — installs
+            # made by older script versions carry none, and this no-op branch
+            # is exactly where their re-run lands.
+            [ "${INSTALL_VERIFIED:-0}" = "1" ] && write_official_marker
             # Re-running the installer repairs a missing/legacy alias even when
             # the binary itself does not need to be downloaded again.
             ensure_lba_alias

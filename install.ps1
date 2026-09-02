@@ -22,7 +22,7 @@ $ErrorActionPreference = "Stop"
 # One of the release version surfaces. `compat_version_surface_sync` pins it
 # to Cargo.toml: this value is substituted verbatim into the download URL, so
 # a stale value silently installs an old binary when -Version is not given.
-$DefaultVersion = "v0.22.6"
+$DefaultVersion = "v0.22.10"
 # Public-only trust anchor for stable-manifest verification. It deliberately
 # has no environment override: the install-smoke harness rewrites these
 # clearly-marked constants in a temporary COPY of this script.
@@ -259,8 +259,11 @@ function Resolve-StableChannel {
     # Numeric fields are bounded to nine digits so integer conversions can
     # never overflow, and the payload must END with well-formed artifact rows
     # (nothing can trail the array to mimic an artifact row).
-    $rowPattern = '\{"platform":"[^"]{1,32}","url":"[^"]{1,256}","sha256":"[0-9a-f]{64}","size":(?:0|[1-9][0-9]{0,8})\}'
-    $headPattern = '^\{"channel":"(?<channel>[^"]{1,32})","version":"(?<version>[^"]{1,64})","control_revision":(?:0|[1-9][0-9]{0,8}),"published_at":"(?<published>[^"]{1,64})","expires_at":"(?<expires>[^"]{1,64})","min_key_generation":(?<mkg>0|[1-9][0-9]{0,8}),"paused":(?:true|false),"revoked_versions":\[[^\]]{0,1024}\],"artifacts":\[' + $rowPattern + '(,' + $rowPattern + ')*\]\}$'
+    # Bounds kept <= 255 to read identically to install.sh's grammar (whose
+    # BSD-grep ceiling is 255); the revoked list is a bracket-free class with
+    # per-entry validation below and the 1 MiB payload cap above it.
+    $rowPattern = '\{"platform":"[^"]{1,32}","url":"[^"]{1,255}","sha256":"[0-9a-f]{64}","size":(?:0|[1-9][0-9]{0,8})\}'
+    $headPattern = '^\{"channel":"(?<channel>[^"]{1,32})","version":"(?<version>[^"]{1,64})","control_revision":(?:0|[1-9][0-9]{0,8}),"published_at":"(?<published>[^"]{1,64})","expires_at":"(?<expires>[^"]{1,64})","min_key_generation":(?<mkg>0|[1-9][0-9]{0,8}),"paused":(?:true|false),"revoked_versions":\[[^\]]*\],"artifacts":\[' + $rowPattern + '(,' + $rowPattern + ')*\]\}$'
     if ($payloadText -cnotmatch $headPattern) {
         throw "signed manifest payload does not match the canonical serialization - refusing to install"
     }
@@ -616,14 +619,36 @@ try {
             Remove-Item -LiteralPath $stagedExe -Force -ErrorAction SilentlyContinue
             throw
         }
+        # Official-install marker (§A.2/§A.4): signed provenance for
+        # `libra upgrade` / auto-upgrade. Verified path only.
+        try {
+            $marker = [ordered]@{
+                schema_version  = 1
+                installed_at    = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+                install_source  = "official_signed_manifest"
+                platform        = "windows-amd64"
+                version         = $stable.Version.TrimStart("v")
+                sha256          = $stable.Sha256
+                size            = $stable.Size
+                manifest_key_id = $ReleaseManifestKeyId
+            } | ConvertTo-Json -Compress
+            $markerTmp = Join-Path $InstallDir (".libra-official-install.json.tmp." + [System.IO.Path]::GetRandomFileName())
+            Set-Content -LiteralPath $markerTmp -Value $marker -Encoding ASCII -NoNewline
+            Move-Item -LiteralPath $markerTmp -Destination (Join-Path $InstallDir ".libra-official-install.json") -Force
+            Write-Info "official-install marker written (enables 'libra upgrade')"
+        } catch {
+            Write-Warning "could not record the official-install marker - 'libra upgrade' will ask you to re-run this installer"
+        }
     } else {
         # Legacy (explicitly consented, UNVERIFIED) path: plain download to a
-        # unique staging dir, then move into place.
+        # unique staging dir, then move into place. An unverified install
+        # must not sit next to a stale official marker.
         Invoke-WebRequest -Uri $downloadUrl -OutFile $tempExe -UseBasicParsing
         if (-not (Test-Path -LiteralPath $tempExe)) {
             throw "Download failed: $downloadUrl"
         }
         Move-Item -LiteralPath $tempExe -Destination $targetExe -Force
+        Remove-Item -LiteralPath (Join-Path $InstallDir ".libra-official-install.json") -Force -ErrorAction SilentlyContinue
     }
     Write-Info "Installed to: $targetExe"
 

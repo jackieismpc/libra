@@ -215,10 +215,10 @@ thread_local! {
 }
 
 fn beneath_root_identity(root_path: &Path, root: &fs::File) -> io::Result<BeneathRootIdentity> {
-    let metadata = root.metadata()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        let metadata = root.metadata()?;
         Ok(BeneathRootIdentity {
             path: root_path.to_path_buf(),
             dev: metadata.dev(),
@@ -227,24 +227,41 @@ fn beneath_root_identity(root_path: &Path, root: &fs::File) -> io::Result<Beneat
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-        let volume = metadata
-            .volume_serial_number()
-            .ok_or_else(|| io::Error::other("cannot identify pinned worktree root volume"))?;
-        let index = metadata
-            .file_index()
-            .ok_or_else(|| io::Error::other("cannot identify pinned worktree root handle"))?;
+        // `std::os::windows::fs::MetadataExt::{volume_serial_number,
+        // file_index}` are nightly-only (`windows_by_handle`, rust#63010), so
+        // the stable release build asks the Win32 API directly for the same
+        // (volume, file index) identity pair.
+        use std::os::windows::io::AsRawHandle;
+
+        use windows_sys::Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
+        };
+
+        // SAFETY: the handle is owned by `root` and stays open across the
+        // call; the info struct is plain output memory zeroed beforehand.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe { GetFileInformationByHandle(root.as_raw_handle() as HANDLE, &mut info) };
+        if ok == 0 {
+            return Err(io::Error::other(format!(
+                "cannot identify pinned worktree root: {}",
+                io::Error::last_os_error()
+            )));
+        }
         Ok(BeneathRootIdentity {
             path: root_path.to_path_buf(),
-            volume,
-            index,
+            volume: info.dwVolumeSerialNumber,
+            index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
         })
     }
     #[cfg(not(any(unix, windows)))]
-    Ok(BeneathRootIdentity {
-        path: root_path.to_path_buf(),
-        length: metadata.len(),
-    })
+    {
+        let metadata = root.metadata()?;
+        Ok(BeneathRootIdentity {
+            path: root_path.to_path_buf(),
+            length: metadata.len(),
+        })
+    }
 }
 
 pub fn attribute_state_for_path(attr: &str, path: &Path) -> Option<AttributeState> {

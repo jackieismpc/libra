@@ -47,6 +47,10 @@ grep -q 'LIBRA_RELEASE_MANIFEST_PUBLIC_KEY[^=]*:-' "$INSTALLER" \
     && fail "trust constants must not read the environment" || true
 grep -q 'LIBRA_RELEASE_MANIFEST_ORIGIN[^=]*:-' "$INSTALLER" \
     && fail "pinned origin must not read the environment" || true
+# BSD grep (macOS) rejects {n,m} repetition counts above 255; any such bound
+# in either installer's regexes would fail closed on every Mac.
+grep -oE '\{[0-9]+,[0-9]+\}' "$INSTALLER" "$REPO_ROOT/install.ps1" | awk -F'[{,}]' '$3 > 255 {print; exit 1}' \
+    || fail "found a regex repetition bound above BSD grep's 255 ceiling"
 
 # ── fixture server ──────────────────────────────────────────────────────────
 
@@ -184,6 +188,14 @@ run_scenario valid manifest-valid.json ok yes "stable manifest verified"
 cmp -s "$WORK/home-valid/.libra/bin/libra" \
     "$FIXTURES/tree/libra/releases/v9.9.9/libra-$HOST_PLATFORM" \
     || fail "valid: installed binary differs from the signed artifact"
+# The verified install records signed provenance for `libra upgrade`.
+marker="$WORK/home-valid/.libra/bin/.libra-official-install.json"
+[ -f "$marker" ] || fail "valid: official-install marker missing"
+grep -q '"install_source":"official_signed_manifest"' "$marker" \
+    || fail "valid: marker lacks the official install_source"
+grep -q '"version":"9.9.9"' "$marker" || fail "valid: marker version wrong"
+grep -q "\"sha256\":\"$(sha256sum "$FIXTURES/tree/libra/releases/v9.9.9/libra-$HOST_PLATFORM" | awk '{print $1}')\"" "$marker" \
+    || fail "valid: marker sha256 does not match the artifact"
 
 # 2. Tampered signature → fail closed, nothing on disk.
 run_scenario bad-signature manifest-bad-signature.json fail no "SIGNATURE VERIFICATION FAILED"
@@ -258,6 +270,8 @@ run_scenario transition-404-fallback -none- ok yes "proceeding UNVERIFIED" \
 cmp -s "$WORK/home-transition-404-fallback/.libra/bin/libra" \
     "$FIXTURES/tree/libra/releases/v9.9.8/libra-$HOST_PLATFORM" \
     || fail "transition-404-fallback: legacy binary content mismatch"
+[ ! -e "$WORK/home-transition-404-fallback/.libra/bin/.libra-official-install.json" ] \
+    || fail "transition-404-fallback: an UNVERIFIED install must not carry the official marker"
 
 # 23. Verifier unavailable without opt-in → explicit stop (third state).
 SMOKE_PATH="$WORK/no-openssl:$PATH"

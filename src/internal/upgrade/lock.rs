@@ -22,10 +22,12 @@ use std::path::{Path, PathBuf};
 
 /// Lock file name inside the install directory.
 pub const LOCK_FILE_NAME: &str = ".libra-upgrade.lock";
-/// Dedicated micro-lock for the monotone acceptance-floors side file. Held
-/// only across one atomic read-merge-write (microseconds, no probes and no
-/// network), so a BLOCKING wait on it is always short — unlike the main
-/// upgrade lock, which spans staging/probing/install.
+/// Dedicated micro-lock for the monotone acceptance-floors side file. Two
+/// holder classes, both bounded-tiny: writers hold it across one atomic
+/// read-merge-write, and the txn commit fence holds it across one state
+/// read plus one journal write + fsync. Never take it around probes,
+/// network, or the commit tail — writers wait at most 15 s (state.rs) and
+/// size that bound on these windows.
 pub const FLOORS_LOCK_FILE_NAME: &str = ".libra-upgrade-floors.lock";
 
 /// Failures of install-dir validation and fd-relative operations.
