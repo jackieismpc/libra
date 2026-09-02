@@ -160,8 +160,8 @@ pnpm --dir worker build
 
 - `build.rs` embeds `web/out/` with `rust-embed`; setting
   `LIBRA_SKIP_WEB_BUILD=1` writes a stub output for Rust-only builds. When
-  changing `web/`, run the real `pnpm --dir web build` and keep static export
-  drift clean.
+  changing `web/`, run the real `pnpm --dir web build`; `web/out/` is generated
+  and ignored, so never add its static export to a commit.
 - The `web/` UI is an operational Code UI, not a marketing landing page. Favor
   dense, predictable controls and existing components in `web/src/components/ui/`.
 - The `worker/` app serves publish snapshots from D1/R2. Validate request input,

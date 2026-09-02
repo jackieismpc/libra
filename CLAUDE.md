@@ -98,7 +98,7 @@ pnpm --dir web install --frozen-lockfile && pnpm --dir web build
 All PRs must pass these jobs on the `[self-hosted]` runner pool:
 1. **compat-rustfmt** — `cargo +nightly fmt --all --check`
 2. **compat-clippy** — `cargo clippy --all-targets --all-features -- -D warnings` (with `LIBRA_SKIP_WEB_BUILD=1`)
-3. **compat-web-check** — `pnpm --dir web lint` + `pnpm --dir web build` so `web/out/` cannot drift from `WebAssets`
+3. **compat-web-check** — `pnpm --dir web lint` + test + build, followed by `cargo check --lib` against the generated `WebAssets`; `web/out/` is ignored build output
 4. **compat-redundancy** — directory-shape check on `third-party/rust/crates`
 5. **compat-offline-core** — `cargo test --test compat_matrix_alignment compatibility_matrix_matches_cli_commands -- --exact` + pinned `cargo nextest run --all --no-fail-fast --retries 2` (one process per test; external-resource mutual exclusion from the generated `.config/nextest.toml`; the former `compat-offline-command` shard job is merged in) + `cargo test --doc` + a `--features test-provider` nextest pass (`--profile test-provider`, ten Code UI automation targets — `code_ui_scenarios`, `harness_self_test`, `code_codex_default_web_test`, `ai_code_ui_headless_test`, `code_codex_runtime_test`, `code_ui_remote_lease_matrix`, `code_ui_remote_sse_matrix`, `code_ui_remote_state_matrix`, `code_mcp_dual_entry_test`, `code_ui_perf_smoke_test`; the profile carries the section's single-threaded semantic) + the `otlp`/`keyring`/`test-upgrade` feature sections verbatim on `cargo test`
 6. **compat-network-remotes** — `cargo test --features test-network --test network_remotes_test`
@@ -234,7 +234,7 @@ The publish Worker uses its own D1 schema in `sql/publish/` (`0001_publish.sql`,
 `LIBRA_D1_ACCOUNT_ID`, `LIBRA_D1_API_TOKEN`, `LIBRA_D1_DATABASE_ID`
 
 ### Build & Runtime
-- `LIBRA_SKIP_WEB_BUILD=1` — skip the Next.js web build in `build.rs` (set by every CI job except `compat-web-check`)
+- `LIBRA_SKIP_WEB_BUILD=1` — skip the Next.js web build in `build.rs` (used by Rust-oriented CI jobs; `compat-web-check` generates the export explicitly before embedding it)
 - `LIBRA_LOG`, `RUST_LOG` — `tracing-subscriber` env filter
 - `LIBRA_LOG_FILE` — tracing sink path (append-mode by default; time-rolled when `LIBRA_LOG_ROTATION` is set)
 - `LIBRA_LOG_ROTATION` — rolling strategy for `LIBRA_LOG_FILE`: `never` (default) / `minutely` / `hourly` / `daily` (`tracing-appender`, time-split only — no old-file pruning); inspect via `libra logfile info`
