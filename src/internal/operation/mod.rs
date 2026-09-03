@@ -12,6 +12,7 @@ use thiserror::Error;
 
 pub mod facet;
 pub mod facets;
+pub mod middleware;
 pub mod snapshot;
 pub mod store;
 pub mod view;

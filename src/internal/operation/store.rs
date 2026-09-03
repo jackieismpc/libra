@@ -297,6 +297,23 @@ impl OperationStore {
         Ok(Some(operation_from_model(model, parents)?))
     }
 
+    pub async fn update_operation_status(
+        &self,
+        op_id: &str,
+        status: OperationStatusV2,
+        end_ts: Option<i64>,
+    ) -> Result<(), StoreError> {
+        let mut model = operation_v2::Entity::find_by_id(op_id.to_string())
+            .one(&self.db)
+            .await?
+            .ok_or_else(|| StoreError::InvalidArgument(format!("unknown operation '{op_id}'")))?
+            .into_active_model();
+        model.status = Set(status.as_str().to_string());
+        model.end_ts = Set(end_ts);
+        model.update(&self.db).await?;
+        Ok(())
+    }
+
     pub async fn current_op_heads(
         &self,
         repo_id: &str,
