@@ -282,6 +282,29 @@ impl ToolRegistry {
             return execute().await;
         }
 
+        // Unit callers may give a registry an isolated working directory
+        // without changing the process CWD. The operation runtime resolves
+        // HEAD and object storage from the ambient repository, so entering it
+        // here would either panic outside a repository or write the wrong
+        // repository's operation log. In those cases the handler still runs
+        // under the registry's normal sandbox/hardening boundary; only the
+        // repository-backed operation envelope is unavailable.
+        let target_storage =
+            match crate::utils::util::try_get_storage_path(Some(self.working_dir.clone())) {
+                Ok(storage) => storage,
+                Err(_) => return execute().await,
+            };
+        let ambient_storage = match crate::utils::util::try_get_storage_path(None) {
+            Ok(storage) => storage,
+            Err(_) => return execute().await,
+        };
+        let canonical_storage = |path: &std::path::Path| {
+            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        };
+        if canonical_storage(&target_storage) != canonical_storage(&ambient_storage) {
+            return execute().await;
+        }
+
         let db = crate::internal::db::get_db_conn_instance().await;
         let repo_id = ConfigKv::get("libra.repoid")
             .await

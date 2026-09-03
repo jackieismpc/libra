@@ -4226,7 +4226,7 @@ fn concurrent_control_slots_are_held_per_worktree() {
         let rows = match sqlite_query_no_wait(
             &db,
             "SELECT worktree_id FROM operation WHERE status = 'running' \
-             AND control_slot IS NOT NULL ORDER BY worktree_id",
+             ORDER BY worktree_id",
         ) {
             Ok(rows) => rows,
             Err(err) => {

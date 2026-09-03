@@ -6,9 +6,11 @@
 
 use std::path::PathBuf;
 
+use anyhow::Result;
 use libra::internal::db::migration::{
-    Migration, MigrationError, MigrationRunner, builtin_migrations, builtin_runner,
-    run_builtin_migrations,
+    Migration, MigrationError, MigrationRunner, builtin_migrations,
+    builtin_runner as current_builtin_runner,
+    run_builtin_migrations as current_run_builtin_migrations,
 };
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement};
 use tempfile::TempDir;
@@ -28,6 +30,36 @@ async fn connect(url: &str) -> DatabaseConnection {
     let mut opts = ConnectOptions::new(url.to_string());
     opts.sqlx_logging(false);
     Database::connect(opts).await.expect("connect")
+}
+
+/// Build the historical migration set used by tests that exercise a
+/// pre-operation-v2 schema. The v2 migration is intentionally forward-only,
+/// so a full current runner cannot be used to roll a fixture back across it.
+fn builtin_runner_before_operation_log_v2() -> MigrationRunner {
+    let mut runner = MigrationRunner::new();
+    for migration in builtin_migrations()
+        .into_iter()
+        .filter(|migration| migration.version <= 2026082401)
+    {
+        runner
+            .register(migration)
+            .expect("historical builtin registry must build clean");
+    }
+    runner
+}
+
+/// Most migration tests intentionally exercise the last pre-v2 schema shape.
+/// Keep their existing concise call sites on that historical runner; tests
+/// whose purpose is current-registry wiring call the aliased production
+/// helpers explicitly below.
+fn builtin_runner() -> Result<MigrationRunner> {
+    Ok(builtin_runner_before_operation_log_v2())
+}
+
+async fn run_builtin_migrations(conn: &DatabaseConnection) -> Result<Vec<i64>> {
+    Ok(builtin_runner_before_operation_log_v2()
+        .run_pending(conn)
+        .await?)
 }
 
 // ---------------------------------------------------------------------------
@@ -55,7 +87,7 @@ fn builtin_migrations_register_current_schema_migrations() {
             2026072302, 2026072303, 2026072304, 2026072401, 2026072402, 2026072403, 2026072501,
             2026072502, 2026072901, 2026072902, 2026073001, 2026073002, 2026073003, 2026073004,
             2026073005, 2026073101, 2026080401, 2026080402, 2026080403, 2026081301, 2026081801,
-            2026082401
+            2026082401, 2026090301
         ]
     );
     assert_eq!(
@@ -118,13 +150,14 @@ fn builtin_migrations_register_current_schema_migrations() {
             "approved_permission_provenance",
             "agent_bridge_capture",
             "agent_bridge_link_relations",
+            "operation_log_v2",
         ]
     );
 
-    let runner = builtin_runner().expect("builtin registry must build clean");
+    let runner = current_builtin_runner().expect("builtin registry must build clean");
     assert!(!runner.is_empty());
-    assert_eq!(runner.len(), 57);
-    assert_eq!(runner.max_registered_version(), Some(2026082401));
+    assert_eq!(runner.len(), 58);
+    assert_eq!(runner.max_registered_version(), Some(2026090301));
 }
 
 // ---------------------------------------------------------------------------
@@ -1128,18 +1161,22 @@ async fn fresh_create_database_runs_migrations_just_like_reopen() {
 
 #[tokio::test]
 async fn establish_connection_auto_upgrades_stale_schema() {
-    use libra::internal::db::{create_database, establish_connection};
+    use libra::internal::db::establish_connection;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("stale.db");
     let path_str = path.to_str().unwrap();
-    let conn = create_database(path_str).await.unwrap();
+    let conn = connect(&format!("sqlite://{path_str}")).await;
 
     let runner = builtin_runner().expect("builtin runner builds clean");
     runner
+        .run_pending(&conn)
+        .await
+        .expect("create stale schema");
+    runner
         .rollback_to(&conn, 2026050601)
         .await
-        .expect("roll back latest migration");
+        .expect("roll back latest historical migration");
     conn.close().await.unwrap();
 
     // Opening the connection now applies any pending migrations automatically,
@@ -1149,10 +1186,10 @@ async fn establish_connection_auto_upgrades_stale_schema() {
         .expect("ordinary connect should auto-upgrade a stale schema");
 
     let raw = connect(&format!("sqlite://{}", path.display())).await;
-    let latest = builtin_runner()
+    let latest = current_builtin_runner()
         .expect("builtin runner builds clean")
         .max_registered_version();
-    let current = builtin_runner()
+    let current = current_builtin_runner()
         .expect("builtin runner builds clean")
         .current_version_readonly(&raw)
         .await
@@ -1194,7 +1231,7 @@ async fn describe_schema_versions(conn: &DatabaseConnection) -> Vec<String> {
 async fn run_builtin_migrations_applies_current_builtin_registry() {
     let (_dir, url, _path) = fresh_db_url();
     let conn = connect(&url).await;
-    let applied = run_builtin_migrations(&conn)
+    let applied = current_run_builtin_migrations(&conn)
         .await
         .expect("run_builtin_migrations");
     assert_eq!(
@@ -1208,7 +1245,7 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
             2026072302, 2026072303, 2026072304, 2026072401, 2026072402, 2026072403, 2026072501,
             2026072502, 2026072901, 2026072902, 2026073001, 2026073002, 2026073003, 2026073004,
             2026073005, 2026073101, 2026080401, 2026080402, 2026080403, 2026081301, 2026081801,
-            2026082401
+            2026082401, 2026090301
         ]
     );
     assert!(table_exists(&conn, "schema_versions").await);

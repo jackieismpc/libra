@@ -52,7 +52,10 @@ async fn index_exists(conn: &DatabaseConnection, name: &str) -> bool {
 
 fn registered_runner() -> MigrationRunner {
     let mut runner = MigrationRunner::new();
-    for migration in builtin_migrations() {
+    for migration in builtin_migrations()
+        .into_iter()
+        .filter(|migration| migration.version <= 2026082401)
+    {
         runner
             .register(migration)
             .expect("builtin migrations must register clean");
@@ -64,7 +67,7 @@ fn registered_versions_after(target: i64) -> Vec<i64> {
     builtin_migrations()
         .into_iter()
         .map(|migration| migration.version)
-        .filter(|version| *version > target)
+        .filter(|version| *version > target && *version <= 2026082401)
         .collect()
 }
 

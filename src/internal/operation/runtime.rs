@@ -437,6 +437,50 @@ pub async fn list_operations_by_repo_paginated<C: ConnectionTrait>(
     })
 }
 
+/// Load the v2 operation row using the legacy service's record shape.
+///
+/// The v1 `OperationService` remains part of the public internal surface
+/// until OL-15 removes it. Keeping this conversion here means callers that
+/// have not yet moved to the v2 model do not issue a v1-only `operation.view_id`
+/// query against a v2 repository.
+pub async fn find_operation_record<C: ConnectionTrait>(
+    db: &C,
+    op_id: &str,
+) -> Result<Option<OperationRecord>, OperationServiceError> {
+    load_v2_operation(db, op_id)
+        .await
+        .map(|operation| operation.map(|operation| operation_record_from_v2(&operation)))
+}
+
+/// List v2 operation rows using the legacy record shape.
+pub async fn list_operation_records<C: ConnectionTrait>(
+    db: &C,
+    repo_id: &str,
+    limit: u64,
+) -> Result<Vec<OperationRecord>, OperationServiceError> {
+    if limit == 0 {
+        return Err(OperationServiceError::InvalidArgument(
+            "limit must be greater than 0".to_string(),
+        ));
+    }
+    let models = operation_v2::Entity::find()
+        .filter(operation_v2::Column::RepoId.eq(repo_id))
+        .order_by_desc(operation_v2::Column::EndTs)
+        .order_by_desc(operation_v2::Column::StartTs)
+        .order_by_desc(operation_v2::Column::OpId)
+        .limit(limit)
+        .all(db)
+        .await
+        .map_err(storage_error)?;
+    models
+        .into_iter()
+        .map(|model| {
+            operation_from_model(model, Vec::new())
+                .map(|operation| operation_record_from_v2(&operation))
+        })
+        .collect()
+}
+
 pub async fn recent_duplicate_candidates<C: ConnectionTrait>(
     db: &C,
     repo_id: &str,

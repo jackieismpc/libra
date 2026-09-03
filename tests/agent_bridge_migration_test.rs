@@ -6,7 +6,7 @@
 //! row exists (never deleting acked events/evidence) and only drops the tables
 //! on an empty database.
 
-use libra::internal::db::migration::{builtin_runner, run_builtin_migrations};
+use libra::internal::db::migration::{MigrationRunner, builtin_migrations, run_builtin_migrations};
 use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
 
 const BRIDGE_TABLES: &[&str] = &[
@@ -29,6 +29,19 @@ async fn table_exists(db: &sea_orm::DatabaseConnection, table: &str) -> bool {
     !rows.is_empty()
 }
 
+fn historical_runner() -> MigrationRunner {
+    let mut runner = MigrationRunner::new();
+    for migration in builtin_migrations()
+        .into_iter()
+        .filter(|migration| migration.version <= 2026082401)
+    {
+        runner
+            .register(migration)
+            .expect("historical registry builds clean");
+    }
+    runner
+}
+
 /// Fresh bootstrap: applying every builtin migration creates all five bridge
 /// tables.
 #[tokio::test]
@@ -47,7 +60,7 @@ async fn fresh_bootstrap_creates_bridge_tables() {
 #[tokio::test]
 async fn old_db_upgrade_adds_bridge_tables() {
     let db = Database::connect("sqlite::memory:").await.expect("connect");
-    let runner = builtin_runner().expect("registry builds");
+    let runner = historical_runner();
     runner
         .run_pending_up_to(&db, 2026081301)
         .await
@@ -89,7 +102,7 @@ async fn repeated_apply_is_idempotent() {
 #[tokio::test]
 async fn migration_up_down_preserves_acked_events() {
     let db = Database::connect("sqlite::memory:").await.expect("connect");
-    let runner = builtin_runner().expect("registry builds");
+    let runner = historical_runner();
     runner.run_pending(&db).await.expect("apply all");
     assert!(table_exists(&db, "agent_bridge_event").await);
 

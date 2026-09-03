@@ -384,6 +384,12 @@ impl OperationService {
             ));
         }
 
+        if runtime::is_v2_schema(db).await.map_err(|err| {
+            OperationServiceError::Storage(format!("failed to inspect operation schema: {err}"))
+        })? {
+            return runtime::find_operation_record(db, op_id).await;
+        }
+
         let model = operation::Entity::find_by_id(op_id.to_string())
             .one(db)
             .await
@@ -430,6 +436,20 @@ impl OperationService {
                 "limit must be greater than 0".to_string(),
             ));
         }
+        if runtime::is_v2_schema(db).await.map_err(|err| {
+            OperationServiceError::Storage(format!("failed to inspect operation schema: {err}"))
+        })? {
+            return runtime::recent_duplicate_candidates(
+                db,
+                repo_id,
+                worktree_id,
+                command_name,
+                args_digest,
+                earliest_end_ts,
+                limit,
+            )
+            .await;
+        }
         let mut query = operation::Entity::find().filter(operation::Column::RepoId.eq(repo_id));
         if let Some(worktree_id) = worktree_id {
             query = query.filter(operation::Column::WorktreeId.eq(worktree_id));
@@ -472,6 +492,12 @@ impl OperationService {
             ));
         }
 
+        if runtime::is_v2_schema(db).await.map_err(|err| {
+            OperationServiceError::Storage(format!("failed to inspect operation schema: {err}"))
+        })? {
+            return runtime::list_operation_records(db, repo_id, limit).await;
+        }
+
         let models = Self::apply_repo_operation_order(
             operation::Entity::find().filter(operation::Column::RepoId.eq(repo_id)),
         )
@@ -512,6 +538,12 @@ impl OperationService {
             return Err(OperationServiceError::InvalidArgument(
                 "repo_id must not be empty".to_string(),
             ));
+        }
+
+        if runtime::is_v2_schema(db).await.map_err(|err| {
+            OperationServiceError::Storage(format!("failed to inspect operation schema: {err}"))
+        })? {
+            return runtime::list_operations_by_repo_paginated(db, repo_id, None, query).await;
         }
 
         let command_name = command_name
@@ -1058,6 +1090,12 @@ impl OperationService {
         db: &C,
         op_id: &str,
     ) -> Result<Option<OperationGraphRecord>, OperationServiceError> {
+        if runtime::is_v2_schema(db).await.map_err(|err| {
+            OperationServiceError::Storage(format!("failed to inspect operation schema: {err}"))
+        })? {
+            return runtime::load_graph(db, op_id).await;
+        }
+
         let operation = match Self::find_operation_by_id_with_conn(db, op_id).await? {
             Some(record) => record,
             None => return Ok(None),

@@ -1811,11 +1811,132 @@ async fn runtime_repo_id() -> CliResult<String> {
 /// Operation middleware's mutation classes. `command_scope` has no wildcard,
 /// so a newly added command cannot silently bypass this classification.
 fn operation_class_for_command(command: &Commands) -> MutationClass {
+    if !command_has_mutation(command) {
+        return MutationClass::ReadOnly;
+    }
     match command_scope(command) {
         CommandScope::ReadOnly => MutationClass::ReadOnly,
         CommandScope::Worktree => MutationClass::WorkingCopy,
         CommandScope::Repository => MutationClass::Ref,
         CommandScope::Composite => MutationClass::Repository,
+    }
+}
+
+/// Return whether this particular invocation changes repository or worktree
+/// state. The scope inventory deliberately classifies whole command families,
+/// but several Git-compatible families contain read-only subcommands and
+/// previews. Those invocations must not create an operation record or acquire
+/// the shared maintenance lock: apart from being unnecessary, doing so breaks
+/// commands that are explicitly usable outside a repository.
+fn command_has_mutation(command: &Commands) -> bool {
+    match command {
+        Commands::Cache(args) => matches!(
+            &args.command,
+            command::cache::CacheCommand::Evict { dry_run: false, .. }
+        ),
+        Commands::Code(_) | Commands::Sandbox(_) => false,
+        Commands::Config(args) => match &args.command {
+            Some(
+                command::config::ConfigCommand::Get { .. }
+                | command::config::ConfigCommand::List { .. }
+                | command::config::ConfigCommand::Path
+                | command::config::ConfigCommand::Edit,
+            ) => false,
+            Some(_) => true,
+            None => {
+                args.add
+                    || args.import
+                    || args.unset
+                    || args.unset_all
+                    || args.remove_section
+                    || args.rename_section
+                    || args.key.is_some() && args.valuepattern.is_some()
+            }
+        },
+        Commands::Credential(args) => {
+            !matches!(&args.command, command::credential::CredentialCommand::Fill)
+        }
+        Commands::HashObject(args) => args.write,
+        Commands::MergeFile(args) => !args.stdout,
+        Commands::Merge(args) => !args.dry_run,
+        Commands::Dirty(args) => !args.list,
+        Commands::Metadata(args) => !matches!(
+            &args.command,
+            command::metadata::MetadataCommand::Get { .. }
+                | command::metadata::MetadataCommand::List { .. }
+        ),
+        Commands::Revision(args) => matches!(
+            &args.command,
+            command::revision::RevisionCommand::Index { rebuild: true, .. }
+        ),
+        Commands::Remote(command) => !matches!(
+            command,
+            command::remote::RemoteCmds::List
+                | command::remote::RemoteCmds::Show { .. }
+                | command::remote::RemoteCmds::GetUrl { .. }
+        ),
+        Commands::Service(args) => {
+            matches!(&args.command, command::service::ServiceCommand::Run { .. })
+        }
+        Commands::Auth(_) | Commands::Login(_) | Commands::Whoami(_) | Commands::Logout(_) => false,
+        Commands::Alternates(args) => !matches!(
+            &args.command,
+            command::alternates::AlternatesCommand::List
+                | command::alternates::AlternatesCommand::Prune { dry_run: true, .. }
+        ),
+        Commands::Maintenance(args) => !matches!(
+            &args.command,
+            command::maintenance::MaintenanceSubcommand::Status
+                | command::maintenance::MaintenanceSubcommand::Run { dry_run: true, .. }
+        ),
+        Commands::File(args) => matches!(
+            &args.command,
+            command::file::FileCommand::Obliterate { dry_run: false, .. }
+        ),
+        Commands::Notes(args) => !matches!(
+            &args.subcommand,
+            None | Some(
+                command::notes::NotesSubcommand::List { .. }
+                    | command::notes::NotesSubcommand::Show { .. }
+                    | command::notes::NotesSubcommand::GetRef,
+            )
+        ),
+        Commands::Tag(args) => {
+            args.delete
+                || (args.name.is_some()
+                    && !args.list
+                    && !args.verify
+                    && args.n_lines.is_none()
+                    && args.points_at.is_none()
+                    && args.contains.is_none()
+                    && args.no_contains.is_none()
+                    && args.merged.is_none()
+                    && args.no_merged.is_none()
+                    && args.sort.is_none()
+                    && args.column.is_none())
+        }
+        Commands::Cloud(args) => matches!(
+            &args.command,
+            command::cloud::CloudCommand::Sync(_) | command::cloud::CloudCommand::Restore(_)
+        ),
+        Commands::Publish(args) => matches!(
+            &args.command,
+            command::publish::PublishCommand::Init(_)
+                | command::publish::PublishCommand::Deploy(_)
+                | command::publish::PublishCommand::Unpublish(_)
+                | command::publish::PublishCommand::Sync(command::publish::SyncArgs {
+                    dry_run: false,
+                    ..
+                })
+        ),
+        Commands::Worktree(args) => !matches!(
+            &args.command,
+            command::worktree::WorktreeSubcommand::List { .. }
+                | command::worktree::WorktreeSubcommand::Doctor { .. }
+                | command::worktree::WorktreeSubcommand::Repair { .. }
+        ),
+        Commands::Op(_) | Commands::Branch(_) => false,
+        _ => true,
     }
 }
 
@@ -2061,7 +2182,7 @@ fn command_scope(command: &Commands) -> CommandScope {
 /// plumbing) stay allowed in a legacy-symlink worktree — they behave
 /// identically from any scope.
 fn command_mutates_worktree_state(command: &Commands) -> bool {
-    command_scope(command).mutates_worktree_state()
+    command_has_mutation(command) && command_scope(command).mutates_worktree_state()
 }
 
 /// Does this command hold the SHARED maintenance lock for its whole run
@@ -2072,6 +2193,9 @@ fn command_mutates_worktree_state(command: &Commands) -> bool {
 /// same lock EXCLUSIVELY around the phase that unlinks payloads, so taking
 /// it shared here first would only make them wait on themselves.
 fn command_holds_shared_maintenance_lock(command: &Commands) -> bool {
+    if !command_has_mutation(command) || cli_has_explicit_operation_boundary(command) {
+        return false;
+    }
     // The deletion family takes the lock itself, in the mode each phase
     // needs — `maintenance` per task, `repack` shared for its pack write and
     // exclusive for `-d`, `cache evict` / `file obliterate` / `agent clean`
