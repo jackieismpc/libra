@@ -1,4 +1,4 @@
-//! Operation service skeleton for command-level audit persistence.
+//! Operation services and the v2 operation-log building blocks.
 //!
 //! This module defines stable public types for A-6. Commit 2 introduces the
 //! operation main-table base DAO methods while keeping transaction ownership in
@@ -9,6 +9,9 @@ use sea_orm::{
     QueryFilter, QueryOrder, QuerySelect, Select,
 };
 use thiserror::Error;
+
+pub mod facet;
+pub mod view;
 
 use crate::internal::model::{
     operation, operation_parent, operation_view, operation_view_ref, operation_view_workspace,
