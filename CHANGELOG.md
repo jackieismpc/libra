@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### Changed: `diff` scan progress is deferred, TTY-gated, and self-erasing (#466)
+
+`libra diff` no longer prints `Scanning working tree ...` on every invocation.
+The working-tree scan is a fast local read (a normal tree finishes in tens of
+milliseconds), so the line is now a liveness cue only:
+
+- It appears only when the scan has actually been running for more than 2
+  seconds (very large working trees), and is erased when the scan completes —
+  no more terminal scrollback residue.
+- Under the default `--progress=auto` it is TTY-gated: stderr redirected to a
+  file or pipe (CI logs, `2>&1`) never receives the line or any ANSI escape,
+  matching git's output conventions.
+- It never fires for `--staged`, rev-vs-rev comparisons, `--quiet`, or
+  `--json`/`--machine` runs — it only describes the unstaged working-tree scan.
+- `--progress=json` keeps emitting immediate `diff_scan.start` NDJSON events;
+  `--progress=none` suppresses everything. An explicit `--progress=text` with
+  redirected stderr receives the bare line text (no escape bytes).
+
 ### Changed: SSH host key handling now matches Git's transport behavior
 
 `libra clone`/`fetch`/`push`/`ls-remote` over SSH no longer force
