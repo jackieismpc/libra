@@ -96,6 +96,15 @@ storage initialization would query, the global config DB is unnecessary and the
 command continues with a warning rather than `LBR-CONFIG-001`. The
 compatibility guard is pinned by `compat_global_config_schema_future`.
 
+## Operation Log storage migration
+
+The development Operation Log v2 replaces the v1 `operation_view*` tables with
+the eight-table operation/change/journal schema. This is a forward-only schema
+replacement in the current development line; v1 audit rows are not maintained
+through a long-term compatibility adapter. The public `libra op` command
+surface remains intentionally different from Git and will consume the v2
+store as the later operation tasks land.
+
 ## Top-level commands (from `src/cli.rs`)
 
 | Command | Tier | Notes |

@@ -86,7 +86,7 @@ CREATE INDEX IF NOT EXISTS idx_operation_repo_order
     ON `operation`(`repo_id`, `end_ts` DESC, `start_ts` DESC, `op_id` DESC);
 
 CREATE TABLE IF NOT EXISTS `operation_parent` (
-    `op_id` TEXT NOT NULL,
+    `op_id`        TEXT NOT NULL,
     `parent_op_id` TEXT NOT NULL,
     PRIMARY KEY (`op_id`, `parent_op_id`)
 );

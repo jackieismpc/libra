@@ -1403,6 +1403,16 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026082401_agent_bridge_link_relations.sql"),
             include_str!("../../../sql/migrations/2026082401_agent_bridge_link_relations_down.sql"),
         ),
+        // plan-20260822 OL-02: replace the development-only v1 operation
+        // tables with the v2 operation/change/journal schema.  The replacement
+        // is deliberately forward-only; this plan does not maintain a v1
+        // compatibility layer.
+        Migration {
+            version: 2026090301,
+            name: "operation_log_v2",
+            up: include_str!("../../../sql/migrations/2026090301_operation_log_v2.sql"),
+            down: None,
+        },
     ]
 }
 

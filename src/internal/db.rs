@@ -554,55 +554,113 @@ const BOOTSTRAP_SQL: &str = include_str!("../../sql/sqlite_20260309_init.sql");
 /// Phase 0 AI runtime contract migration; safe to run repeatedly.
 const AI_RUNTIME_CONTRACT_MIGRATION_SQL: &str =
     include_str!("../../sql/sqlite_20260415_ai_runtime_contract.sql");
+#[allow(dead_code)]
 const OPERATION_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS `operation` (
-    `op_id` TEXT PRIMARY KEY,
-    `repo_id` TEXT NOT NULL,
-    `view_id` TEXT NOT NULL,
-    `command_name` TEXT NOT NULL,
-    `description` TEXT NOT NULL,
-    `actor` TEXT NOT NULL,
-    `args_digest` TEXT,
-    `start_ts` INTEGER NOT NULL,
-    `end_ts` INTEGER,
-    `status` TEXT NOT NULL
+    `op_id`               TEXT PRIMARY KEY,
+    `repo_id`             TEXT NOT NULL,
+    `format_version`      INTEGER NOT NULL DEFAULT 2,
+    `kind`                TEXT NOT NULL,
+    `status`              TEXT NOT NULL,
+    `command_name`        TEXT,
+    `description`         TEXT,
+    `args_digest`         TEXT,
+    `actor`               TEXT,
+    `worktree_id`         TEXT,
+    `scope_kind`          TEXT NOT NULL,
+    `pre_view_oid`        TEXT NOT NULL,
+    `post_view_oid`       TEXT NOT NULL,
+    `restores_op_id`      TEXT,
+    `reverts_op_id`       TEXT,
+    `predecessor_map_oid` TEXT,
+    `causal_context_id`   TEXT,
+    `start_ts`            INTEGER NOT NULL,
+    `end_ts`              INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_operation_repo_order
     ON `operation`(`repo_id`, `end_ts` DESC, `start_ts` DESC, `op_id` DESC);
+CREATE INDEX IF NOT EXISTS idx_operation_repo_scope_order
+    ON `operation`(`repo_id`, `scope_kind`, `end_ts` DESC, `op_id` DESC);
 
 CREATE TABLE IF NOT EXISTS `operation_parent` (
-    `op_id` TEXT NOT NULL,
+    `op_id`        TEXT NOT NULL,
     `parent_op_id` TEXT NOT NULL,
+    `ordinal`      INTEGER NOT NULL,
     PRIMARY KEY (`op_id`, `parent_op_id`)
 );
 CREATE INDEX IF NOT EXISTS idx_operation_parent_parent
     ON `operation_parent`(`parent_op_id`, `op_id`);
 
-CREATE TABLE IF NOT EXISTS `operation_view` (
-    `view_id` TEXT PRIMARY KEY,
-    `repo_id` TEXT NOT NULL,
-    `head_kind` TEXT NOT NULL,
-    `head_target` TEXT NOT NULL,
-    `created_at` INTEGER NOT NULL
+CREATE TABLE IF NOT EXISTS `operation_head` (
+    `repo_id`    TEXT NOT NULL,
+    `scope_key`  TEXT NOT NULL,
+    `op_id`      TEXT NOT NULL,
+    `generation` INTEGER NOT NULL,
+    PRIMARY KEY (`repo_id`, `scope_key`, `op_id`)
 );
-CREATE INDEX IF NOT EXISTS idx_operation_view_repo_created
-    ON `operation_view`(`repo_id`, `created_at` DESC);
+CREATE INDEX IF NOT EXISTS idx_operation_head_generation
+    ON `operation_head`(`repo_id`, `scope_key`, `generation` DESC);
 
-CREATE TABLE IF NOT EXISTS `operation_view_ref` (
-    `view_id` TEXT NOT NULL,
-    `ref_kind` TEXT NOT NULL,
-    `ref_name` TEXT NOT NULL,
-    `ref_remote` TEXT NOT NULL,
-    `target_oid` TEXT NOT NULL,
-    PRIMARY KEY (`view_id`, `ref_kind`, `ref_name`, `ref_remote`)
+CREATE TABLE IF NOT EXISTS `operation_journal` (
+    `journal_id`       TEXT PRIMARY KEY,
+    `op_id`            TEXT NOT NULL,
+    `phase`            TEXT NOT NULL,
+    `pre_view_oid`     TEXT,
+    `target_view_oid`  TEXT,
+    `owner`            TEXT NOT NULL,
+    `updated_at`       INTEGER NOT NULL,
+    `recovery_payload` TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_operation_journal_op
+    ON `operation_journal`(`op_id`, `updated_at` DESC);
 
-CREATE TABLE IF NOT EXISTS `operation_view_workspace` (
-    `view_id` TEXT NOT NULL,
-    `pointer_kind` TEXT NOT NULL,
-    `pointer_value` TEXT NOT NULL,
-    PRIMARY KEY (`view_id`, `pointer_kind`)
+CREATE TABLE IF NOT EXISTS `change_identity` (
+    `change_id`     TEXT PRIMARY KEY,
+    `repo_id`       TEXT NOT NULL,
+    `origin`        TEXT NOT NULL,
+    `created_op_id` TEXT NOT NULL,
+    `created_at`    INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_change_identity_repo
+    ON `change_identity`(`repo_id`, `created_at` DESC);
+
+CREATE TABLE IF NOT EXISTS `change_revision` (
+    `change_id`        TEXT NOT NULL,
+    `commit_oid`       TEXT NOT NULL,
+    `created_op_id`    TEXT NOT NULL,
+    `visibility`       TEXT NOT NULL,
+    `revision_ordinal` INTEGER NOT NULL,
+    PRIMARY KEY (`change_id`, `commit_oid`)
+);
+CREATE INDEX IF NOT EXISTS idx_change_revision_commit
+    ON `change_revision`(`commit_oid`);
+
+CREATE TABLE IF NOT EXISTS `change_predecessor` (
+    `successor_oid`   TEXT NOT NULL,
+    `predecessor_oid` TEXT NOT NULL,
+    `op_id`           TEXT NOT NULL,
+    `relation_kind`   TEXT NOT NULL,
+    `ordinal`         INTEGER NOT NULL,
+    PRIMARY KEY (`successor_oid`, `predecessor_oid`, `op_id`)
+);
+CREATE INDEX IF NOT EXISTS idx_change_predecessor_predecessor
+    ON `change_predecessor`(`predecessor_oid`, `ordinal`);
+
+CREATE TABLE IF NOT EXISTS `ai_operation_link` (
+    `operation_id`             TEXT PRIMARY KEY,
+    `session_id`               TEXT,
+    `run_id`                   TEXT,
+    `tool_invocation_id`       TEXT,
+    `intent_id`                TEXT,
+    `repo_id`                  TEXT NOT NULL,
+    `worktree_id`              TEXT,
+    `workspace_id`             TEXT,
+    `lease_generation`         INTEGER,
+    `config_provenance_digest` TEXT,
+    `redaction_version`        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ai_operation_link_repo
+    ON `ai_operation_link`(`repo_id`, `operation_id`);
 "#;
 const AI_PROJECTION_SCHEMA_START: &str = "-- BEGIN AI PROJECTION SCHEMA";
 /// Marker delimiting the end of the AI projection schema inside `BOOTSTRAP_SQL`.
@@ -751,6 +809,7 @@ pub async fn ensure_ai_runtime_contract_schema(conn: &DatabaseConnection) -> Res
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn ensure_operation_schema(conn: &DatabaseConnection) -> Result<(), IOError> {
     let backend = conn.get_database_backend();
     conn.execute_raw(Statement::from_string(backend, OPERATION_SCHEMA_SQL))
@@ -790,9 +849,6 @@ async fn apply_database_schema_upgrades(
                 "Failed to ensure AI runtime contract schema: {err}"
             ))
         })?;
-    ensure_operation_schema(conn)
-        .await
-        .map_err(|err| IOError::other(format!("Failed to ensure operation schema: {err}")))?;
     // CEX-12.5: apply every migration registered in
     // `migration::builtin_migrations`. The runner is idempotent — on a
     // fresh DB or a legacy DB it ensures the `schema_versions` tracking

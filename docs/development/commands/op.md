@@ -19,10 +19,13 @@ extension rather than a Git command. The current public surface supports:
 
 - CLI entry: `src/cli.rs::Commands::Op`.
 - Command implementation: `src/command/op.rs`.
-- Storage/service layer: `src/internal/operation.rs`.
+- Storage/service layer: `src/internal/operation.rs` (legacy service) and the
+  v2 schema entities under `src/internal/model/`.
 - Transaction wrapper: `src/internal/operation_wrapper.rs`.
-- Operation tables are part of the bootstrap schema and are also ensured by the
-  explicit database upgrade path for older repositories.
+- Operation Log v2 owns the eight tables `operation`, `operation_parent`,
+  `operation_head`, `operation_journal`, `change_identity`, `change_revision`,
+  `change_predecessor`, and `ai_operation_link`. The v1 view tables are removed
+  by the forward-only `operation_log_v2` migration.
 
 ## Current Behavior
 
