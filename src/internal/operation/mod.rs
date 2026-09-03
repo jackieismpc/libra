@@ -13,6 +13,7 @@ use thiserror::Error;
 pub mod facet;
 pub mod store;
 pub mod view;
+pub mod working_copy;
 
 use crate::internal::model::{
     operation, operation_parent, operation_view, operation_view_ref, operation_view_workspace,
