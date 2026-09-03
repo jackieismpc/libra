@@ -13,11 +13,13 @@ use super::{
     error::{ToolError, ToolResult},
     spec::ToolSpec,
 };
-use crate::internal::ai::{
-    agent::TaskIntent,
-    runtime::{ToolBoundaryRuntime, ToolOperation},
+use crate::internal::{
+    ai::{
+        agent::TaskIntent,
+        runtime::{ToolBoundaryRuntime, ToolOperation},
+    },
+    config::ConfigKv,
 };
-
 /// Handler trait that all tools must implement.
 ///
 /// This trait defines the interface for tools that can be invoked by an AI agent.
@@ -264,6 +266,60 @@ impl ToolRegistry {
             .collect()
     }
 
+    async fn dispatch_handler_with_operation(
+        &self,
+        handler: Arc<dyn ToolHandler>,
+        invocation: ToolInvocation,
+        tool_name: &str,
+        mutates_state: bool,
+    ) -> ToolResult<ToolOutput> {
+        let execute = || async move {
+            handler.handle(invocation).await.map(|output| {
+                redact_workspace_paths_in_output(output, &self.working_dir, &self.path_aliases)
+            })
+        };
+        if !mutates_state {
+            return execute().await;
+        }
+
+        let db = crate::internal::db::get_db_conn_instance().await;
+        let repo_id = ConfigKv::get("libra.repoid")
+            .await
+            .map_err(|error| {
+                ToolError::ExecutionFailed(format!("failed to read repository id: {error}"))
+            })?
+            .map(|entry| entry.value)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                ToolError::ExecutionFailed(
+                    "mutating Agent tools require libra.repoid to be configured".to_string(),
+                )
+            })?;
+        let scope_key = crate::internal::worktree_scope::WorktreeScope::for_request()
+            .storage_key()
+            .to_string();
+        let command_name = format!("agent/{tool_name}");
+        let description = format!("Agent tool {tool_name}");
+        crate::internal::operation::runtime::run_cli_operation(
+            &db,
+            &repo_id,
+            &scope_key,
+            &command_name,
+            &description,
+            "agent",
+            None,
+            crate::internal::operation::middleware::MutationClass::External,
+            execute,
+        )
+        .await
+        .map_err(|error| match error {
+            crate::internal::operation::runtime::RuntimeOperationError::Action(error) => error,
+            crate::internal::operation::runtime::RuntimeOperationError::Middleware(error) => {
+                ToolError::ExecutionFailed(format!("operation boundary failed: {error}"))
+            }
+        })
+    }
+
     /// Dispatch a tool invocation to the appropriate handler.
     ///
     /// This method validates the tool name, checks payload compatibility,
@@ -324,9 +380,14 @@ impl ToolRegistry {
                 return Err(ToolError::ExecutionFailed(decision.reason));
             }
 
-            let result = handler.handle(invocation).await.map(|output| {
-                redact_workspace_paths_in_output(output, &self.working_dir, &self.path_aliases)
-            });
+            let result = self
+                .dispatch_handler_with_operation(
+                    handler.clone(),
+                    invocation,
+                    &tool_name,
+                    mutates_state,
+                )
+                .await;
             let summary = match &result {
                 Ok(output) => format!(
                     "success={} output={}",
@@ -349,9 +410,8 @@ impl ToolRegistry {
             return result;
         }
 
-        handler.handle(invocation).await.map(|output| {
-            redact_workspace_paths_in_output(output, &self.working_dir, &self.path_aliases)
-        })
+        self.dispatch_handler_with_operation(handler, invocation, &tool_name, mutates_state)
+            .await
     }
 
     /// Return the handler's conservative mutability classification without

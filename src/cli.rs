@@ -1664,6 +1664,149 @@ enum CommandScope {
     ReadOnly,
 }
 
+/// Return the stable operation label for a top-level CLI command.
+fn operation_command_name(command: &Commands) -> &'static str {
+    match command {
+        Commands::Init(_) => "init",
+        Commands::Clone(_) => "clone",
+        Commands::Config(_) => "config",
+        Commands::Status(_) => "status",
+        Commands::Add(_) => "add",
+        Commands::Rm(_) => "rm",
+        Commands::Mv(_) => "mv",
+        Commands::Restore(_) => "restore",
+        Commands::Clean(_) => "clean",
+        Commands::Stash(_) => "stash",
+        Commands::Lfs(_) => "lfs",
+        Commands::LsFiles(_) => "ls-files",
+        Commands::Worktree(_) => "worktree",
+        Commands::Checkout(_) => "checkout",
+        Commands::Log(_) => "log",
+        Commands::Logfile(_) => "logfile",
+        Commands::Upgrade(_) => "upgrade",
+        Commands::Cache(_) => "cache",
+        Commands::Layer(_) => "layer",
+        Commands::File(_) => "file",
+        Commands::Alternates(_) => "alternates",
+        Commands::Deps(_) => "deps",
+        Commands::Hydrate(_) => "hydrate",
+        #[cfg(feature = "fastcdc")]
+        Commands::Media(_) => "media",
+        Commands::SparseView(_) => "sparse-view",
+        Commands::Metadata(_) => "metadata",
+        Commands::Dirty(_) => "dirty",
+        Commands::Auth(_) => "auth",
+        Commands::Login(_) => "login",
+        Commands::Whoami(_) => "whoami",
+        Commands::Logout(_) => "logout",
+        Commands::Revision(_) => "revision",
+        Commands::Service(_) => "service",
+        Commands::Shortlog(_) => "shortlog",
+        Commands::Show(_) => "show",
+        Commands::ShowRef(_) => "show-ref",
+        Commands::FormatPatch(_) => "format-patch",
+        Commands::Am(_) => "am",
+        Commands::Mailinfo(_) => "mailinfo",
+        Commands::ForEachRef(_) => "for-each-ref",
+        Commands::LsRemote(_) => "ls-remote",
+        Commands::LsTree(_) => "ls-tree",
+        Commands::SymbolicRef(_) => "symbolic-ref",
+        Commands::Branch(_) => "branch",
+        Commands::Tag(_) => "tag",
+        Commands::Commit(_) => "commit",
+        Commands::Switch(_) => "switch",
+        Commands::Rebase(_) => "rebase",
+        Commands::Merge(_) => "merge",
+        Commands::MergeFile(_) => "merge-file",
+        Commands::MergeBase(_) => "merge-base",
+        Commands::Apply(_) => "apply",
+        Commands::DiffTree(_) => "diff-tree",
+        Commands::DiffIndex(_) => "diff-index",
+        Commands::DiffFiles(_) => "diff-files",
+        Commands::Credential(_) => "credential",
+        Commands::Rerere(_) => "rerere",
+        Commands::Reset(_) => "reset",
+        Commands::RevParse(_) => "rev-parse",
+        Commands::RevList(_) => "rev-list",
+        Commands::Describe(_) => "describe",
+        Commands::Notes(_) => "notes",
+        Commands::CherryPick(_) => "cherry-pick",
+        Commands::Push(_) => "push",
+        Commands::CatFile(_) => "cat-file",
+        Commands::CheckIgnore(_) => "check-ignore",
+        Commands::CheckAttr(_) => "check-attr",
+        Commands::CheckMailmap(_) => "check-mailmap",
+        Commands::FastExport(_) => "fast-export",
+        Commands::Bundle(_) => "bundle",
+        Commands::FastImport(_) => "fast-import",
+        Commands::Completions(_) => "completions",
+        Commands::WriteTree(_) => "write-tree",
+        Commands::CommitTree(_) => "commit-tree",
+        Commands::ReadTree(_) => "read-tree",
+        Commands::UpdateIndex(_) => "update-index",
+        Commands::UpdateRef(_) => "update-ref",
+        Commands::Archive(_) => "archive",
+        Commands::HashObject(_) => "hash-object",
+        Commands::VerifyPack(_) => "verify-pack",
+        Commands::IndexPack(_) => "index-pack",
+        Commands::PackObjects(_) => "pack-objects",
+        Commands::Fetch(_) => "fetch",
+        Commands::Fsck(_) => "fsck",
+        Commands::Maintenance(_) => "maintenance",
+        Commands::Repack(_) => "repack",
+        Commands::Diff(_) => "diff",
+        Commands::Grep(_) => "grep",
+        Commands::Blame(_) => "blame",
+        Commands::Revert(_) => "revert",
+        Commands::Replace(_) => "replace",
+        Commands::Reflog(_) => "reflog",
+        Commands::Remote(_) => "remote",
+        Commands::Open(_) => "open",
+        Commands::Pull(_) => "pull",
+        Commands::Op(_) => "op",
+        Commands::Cloud(_) => "cloud",
+        Commands::Publish(_) => "publish",
+        Commands::Agent(_) => "agent",
+        Commands::Review(_) => "review",
+        Commands::Investigate(_) => "investigate",
+        Commands::Hooks(_) => "hooks",
+        Commands::Bisect(_) => "bisect",
+        Commands::Code(_) => "code",
+        Commands::Automation(_) => "automation",
+        Commands::Usage(_) => "usage",
+        Commands::Graph(_) => "graph",
+        Commands::Sandbox(_) => "sandbox",
+    }
+}
+
+fn cli_has_explicit_operation_boundary(command: &Commands) -> bool {
+    matches!(command, Commands::Branch(_) | Commands::Op(_))
+        || matches!(
+            command,
+            Commands::Worktree(args)
+                if matches!(
+                    &args.command,
+                    command::worktree::WorktreeSubcommand::Doctor { .. }
+                        | command::worktree::WorktreeSubcommand::Repair { .. }
+                )
+        )
+}
+
+async fn runtime_repo_id() -> CliResult<String> {
+    if let Some(entry) = ConfigKv::get("libra.repoid")
+        .await
+        .map_err(|error| CliError::fatal(format!("failed to read repository id: {error}")))?
+        && !entry.value.trim().is_empty()
+    {
+        return Ok(entry.value);
+    }
+    let repo_id = uuid::Uuid::new_v4().to_string();
+    ConfigKv::set("libra.repoid", &repo_id, false)
+        .await
+        .map_err(|error| CliError::fatal(format!("failed to initialize repository id: {error}")))?;
+    Ok(repo_id)
+}
+
 /// Compile-time census bridge from the exhaustive CLI scope inventory to the
 /// Operation middleware's mutation classes. `command_scope` has no wildcard,
 /// so a newly added command cannot silently bypass this classification.
@@ -2755,7 +2898,13 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
         None => None,
     };
 
-    let command_result: CliResult<()> = async {
+    let command_name = operation_command_name(&args.command).to_string();
+    let wrap_command = operation_class != MutationClass::ReadOnly
+        && operation_class != MutationClass::InternalWorker
+        && !matches!(&args.command, Commands::Init(_) | Commands::Clone(_))
+        && control_boundary.is_none()
+        && !cli_has_explicit_operation_boundary(&args.command);
+    let command_action = async {
         match args.command {
             Commands::Init(cmd_args) => {
                 let original_dir = utils::util::cur_dir();
@@ -3005,9 +3154,52 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
             }
         }
         Ok(())
-    }
-    .await;
+    };
 
+    let command_result: CliResult<()> = if wrap_command {
+        let db = db::get_db_conn_instance().await;
+        let schema_is_v2 = crate::internal::operation::runtime::is_v2_schema(&db)
+            .await
+            .map_err(|error| {
+                CliError::fatal(format!("failed to inspect operation schema: {error}"))
+            })?;
+        if schema_is_v2 {
+            let repo_id = runtime_repo_id().await?;
+            let actor = ConfigKv::get("user.name")
+                .await
+                .ok()
+                .flatten()
+                .map(|entry| entry.value)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "libra-user".to_string());
+            let scope_key = crate::internal::worktree_scope::WorktreeScope::for_request()
+                .storage_key()
+                .to_string();
+            let description = format!("libra {command_name}");
+            crate::internal::operation::runtime::run_cli_operation(
+                &db,
+                &repo_id,
+                &scope_key,
+                &command_name,
+                &description,
+                &actor,
+                None,
+                operation_class,
+                || command_action,
+            )
+            .await
+            .map_err(|error| match error {
+                crate::internal::operation::runtime::RuntimeOperationError::Action(error) => error,
+                crate::internal::operation::runtime::RuntimeOperationError::Middleware(error) => {
+                    CliError::fatal(format!("operation boundary failed: {error}"))
+                }
+            })
+        } else {
+            command_action.await
+        }
+    } else {
+        command_action.await
+    };
     background_index_guard.finish().await;
 
     // Close the control-action claim BEFORE propagating the command's own

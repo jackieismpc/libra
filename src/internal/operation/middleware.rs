@@ -75,6 +75,7 @@ pub struct OperationMiddleware {
     store: OperationStore,
     repo_id: String,
     scope_key: String,
+    scope_kind: String,
     pointer_path: Option<std::path::PathBuf>,
 }
 
@@ -85,10 +86,17 @@ impl OperationMiddleware {
         scope_key: impl Into<String>,
         pointer_path: Option<impl AsRef<Path>>,
     ) -> Self {
+        let scope_key = scope_key.into();
+        let scope_kind = if scope_key.trim().is_empty() || scope_key == "main" {
+            "main"
+        } else {
+            "linked"
+        };
         Self {
             store,
             repo_id: repo_id.into(),
-            scope_key: scope_key.into(),
+            scope_key,
+            scope_kind: scope_kind.to_string(),
             pointer_path: pointer_path.map(|path| path.as_ref().to_path_buf()),
         }
     }
@@ -133,7 +141,7 @@ impl OperationMiddleware {
                 kind: OperationKind::ExternalSnapshot,
                 status: OperationStatusV2::Success,
                 metadata: OperationMetaV2 {
-                    scope_kind: self.scope_key.clone(),
+                    scope_kind: self.scope_kind.clone(),
                     ..Default::default()
                 },
                 restores_op_id: None,
@@ -175,7 +183,7 @@ impl OperationMiddleware {
             status: OperationStatusV2::Running,
             metadata: OperationMetaV2 {
                 command_name: Some(command_name.to_string()),
-                scope_kind: self.scope_key.clone(),
+                scope_kind: self.scope_kind.clone(),
                 ..Default::default()
             },
             restores_op_id: None,

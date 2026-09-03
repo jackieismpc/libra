@@ -3298,6 +3298,94 @@ pub const GC_OBJECT_SOURCE_INVENTORY: &[GcObjectSource] = &[
         corruption: GcCorruptionPolicy::NotApplicable,
         note: "identity of an on-disk overlay file; never enters the object store",
     },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "operation",
+        column: "pre_view_oid",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "operation-log v2 SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "v2 operation pre-view manifest",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "operation",
+        column: "post_view_oid",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "operation-log v2 SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "v2 operation post-view manifest",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "operation",
+        column: "predecessor_map_oid",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "operation-log v2 SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "v2 change genealogy predecessor map",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "operation_journal",
+        column: "pre_view_oid",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "operation-log v2 SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "v2 journal pre-view recovery root",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "operation_journal",
+        column: "target_view_oid",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "operation-log v2 SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "v2 journal target-view recovery root",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "change_revision",
+        column: "commit_oid",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "operation-log v2 SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "v2 change revision commit",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "change_predecessor",
+        column: "successor_oid",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "operation-log v2 SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "v2 change genealogy successor",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "change_predecessor",
+        column: "predecessor_oid",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "operation-log v2 SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "v2 change genealogy predecessor",
+    },
 ];
 
 /// W2 §C.4.3: roots from REGISTERED STORES that anchor object-store OIDs
@@ -3331,7 +3419,7 @@ async fn collect_registered_store_roots<C: sea_orm::ConnectionTrait>(
         &'static [&'static str],
         CellMode,
     );
-    let sources: &[Source] = &[
+    let mut sources: Vec<Source> = vec![
         (
             "notes",
             "SELECT blob FROM notes",
@@ -3394,7 +3482,43 @@ async fn collect_registered_store_roots<C: sea_orm::ConnectionTrait>(
             CellMode::StrictOid,
         ),
     ];
-    for (table, sql, columns, mode) in sources {
+    let schema_is_v2 = crate::internal::operation::runtime::is_v2_schema(db)
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "failed to inspect operation schema for GC roots: {error}"
+            ))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+    if schema_is_v2 {
+        sources.extend([
+            (
+                "operation",
+                "SELECT pre_view_oid, post_view_oid, predecessor_map_oid FROM operation",
+                &["pre_view_oid", "post_view_oid", "predecessor_map_oid"][..],
+                CellMode::StrictOid,
+            ),
+            (
+                "operation_journal",
+                "SELECT pre_view_oid, target_view_oid FROM operation_journal",
+                &["pre_view_oid", "target_view_oid"][..],
+                CellMode::StrictOid,
+            ),
+            (
+                "change_revision",
+                "SELECT commit_oid FROM change_revision",
+                &["commit_oid"][..],
+                CellMode::StrictOid,
+            ),
+            (
+                "change_predecessor",
+                "SELECT successor_oid, predecessor_oid FROM change_predecessor",
+                &["successor_oid", "predecessor_oid"][..],
+                CellMode::StrictOid,
+            ),
+        ]);
+    }
+    for (table, sql, columns, mode) in &sources {
         match db.query_all_raw(stmt_of(sql)).await {
             Ok(rows) => {
                 for row in rows {

@@ -279,6 +279,127 @@ impl OperationStore {
         Ok(())
     }
 
+    /// Write an operation using a caller-owned connection or transaction.
+    ///
+    /// The transaction-taking form is the bridge used by the command runtime:
+    /// the business mutation and its v2 operation record must commit together.
+    pub async fn write_operation_with_conn<C: sea_orm::ConnectionTrait>(
+        db: &C,
+        operation: &OperationV2,
+    ) -> Result<(), StoreError> {
+        validate_operation(operation)?;
+        let model = operation_v2::ActiveModel {
+            op_id: Set(operation.op_id.clone()),
+            repo_id: Set(operation.repo_id.clone()),
+            format_version: Set(2),
+            kind: Set(operation.kind.as_str().to_string()),
+            status: Set(operation.status.as_str().to_string()),
+            command_name: Set(operation.metadata.command_name.clone()),
+            description: Set(operation.metadata.description.clone()),
+            args_digest: Set(operation.metadata.args_digest.clone()),
+            actor: Set(operation.metadata.actor.clone()),
+            worktree_id: Set(operation.metadata.worktree_id.clone()),
+            scope_kind: Set(operation.metadata.scope_kind.clone()),
+            pre_view_oid: Set(operation.pre_view_oid.to_string()),
+            post_view_oid: Set(operation.post_view_oid.to_string()),
+            restores_op_id: Set(operation.restores_op_id.clone()),
+            reverts_op_id: Set(operation.reverts_op_id.clone()),
+            predecessor_map_oid: Set(operation.predecessor_map_oid.map(|oid| oid.to_string())),
+            causal_context_id: Set(operation.metadata.causal_context_id.clone()),
+            start_ts: Set(operation.start_ts),
+            end_ts: Set(operation.end_ts),
+        };
+        model.insert(db).await?;
+        for (ordinal, parent_op_id) in operation.parent_op_ids.iter().enumerate() {
+            operation_parent_v2::ActiveModel {
+                op_id: Set(operation.op_id.clone()),
+                parent_op_id: Set(parent_op_id.clone()),
+                ordinal: Set(i32::try_from(ordinal).map_err(|_| {
+                    StoreError::InvalidArgument("too many operation parents".to_string())
+                })?),
+            }
+            .insert(db)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Replace one scope's operation heads inside a caller-owned transaction.
+    pub async fn replace_op_heads_with_conn<C: sea_orm::ConnectionTrait>(
+        db: &C,
+        repo_id: &str,
+        scope_key: &str,
+        heads: &[OpHead],
+    ) -> Result<(), StoreError> {
+        operation_head::Entity::delete_many()
+            .filter(operation_head::Column::RepoId.eq(repo_id.to_string()))
+            .filter(operation_head::Column::ScopeKey.eq(scope_key.to_string()))
+            .exec(db)
+            .await?;
+        for head in heads {
+            operation_head::ActiveModel {
+                repo_id: Set(repo_id.to_string()),
+                scope_key: Set(scope_key.to_string()),
+                op_id: Set(head.op_id.clone()),
+                generation: Set(head.generation),
+            }
+            .insert(db)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Finish an operation in a caller-owned transaction and publish its view.
+    pub async fn complete_operation_with_conn<C: sea_orm::ConnectionTrait>(
+        db: &C,
+        op_id: &str,
+        post_view_oid: ObjectHash,
+        status: OperationStatusV2,
+        end_ts: i64,
+    ) -> Result<(), StoreError> {
+        let mut model = operation_v2::Entity::find_by_id(op_id.to_string())
+            .one(db)
+            .await?
+            .ok_or_else(|| StoreError::InvalidArgument(format!("unknown operation '{op_id}'")))?
+            .into_active_model();
+        model.post_view_oid = Set(post_view_oid.to_string());
+        model.status = Set(status.as_str().to_string());
+        model.end_ts = Set(Some(end_ts));
+        model.update(db).await?;
+        Ok(())
+    }
+
+    /// Update the descriptive fields after a command boundary has run.
+    ///
+    /// The middleware must create the operation before the command executes,
+    /// while the CLI/Agent adapter only knows the final command metadata at
+    /// the dispatch seam. Keeping this update on the caller's connection
+    /// preserves the v2-only write path and avoids any v1 column dependency.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_operation_metadata_with_conn<C: sea_orm::ConnectionTrait>(
+        db: &C,
+        op_id: &str,
+        command_name: Option<String>,
+        description: Option<String>,
+        args_digest: Option<String>,
+        actor: Option<String>,
+        worktree_id: Option<String>,
+        scope_kind: String,
+    ) -> Result<(), StoreError> {
+        let mut model = operation_v2::Entity::find_by_id(op_id.to_string())
+            .one(db)
+            .await?
+            .ok_or_else(|| StoreError::InvalidArgument(format!("unknown operation '{op_id}'")))?
+            .into_active_model();
+        model.command_name = Set(command_name);
+        model.description = Set(description);
+        model.args_digest = Set(args_digest);
+        model.actor = Set(actor);
+        model.worktree_id = Set(worktree_id);
+        model.scope_kind = Set(scope_kind);
+        model.update(db).await?;
+        Ok(())
+    }
     pub async fn load_operation(&self, op_id: &str) -> Result<Option<OperationV2>, StoreError> {
         let Some(model) = operation_v2::Entity::find_by_id(op_id.to_string())
             .one(&self.db)

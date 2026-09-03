@@ -1698,6 +1698,29 @@ impl ClientStorage {
         Ok(result)
     }
 
+    /// Persist an object without scheduling a cloud object-index update.
+    ///
+    /// v2 operation view manifests are written while a caller-owned SQLite
+    /// transaction may be open. They are already rooted by the operation
+    /// graph, so queueing the asynchronous repair marker here can deadlock
+    /// against that transaction's object-index writer.
+    pub(crate) fn put_without_index(
+        &self,
+        obj_id: &ObjectHash,
+        content: &[u8],
+        obj_type: ObjectType,
+    ) -> Result<String, io::Error> {
+        let storage = self.storage.clone();
+        let hash = *obj_id;
+        let data = content.to_vec();
+        self.block_on_storage(async move {
+            storage
+                .put(&hash, &data, obj_type)
+                .await
+                .map_err(|e| io::Error::other(e.to_string()))
+        })
+    }
+
     /// Register an object that is already present in the configured storage.
     /// This is the retry path for callers whose payload write succeeded but
     /// durable marker registration failed. It intentionally avoids rewriting a

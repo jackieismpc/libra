@@ -16,7 +16,7 @@ use crate::{
         head::Head,
         operation::{
             OperationGraphRecord, OperationLogListItem, OperationPage, OperationQueryPage,
-            OperationService, OperationStatus,
+            OperationService, OperationStatus, runtime,
         },
         operation_wrapper::{OperationMeta, OperationScope, with_operation_log},
     },
@@ -256,6 +256,14 @@ async fn query_operation_log_page<C: sea_orm::ConnectionTrait>(
     let command_filter = command_filter
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    if runtime::is_v2_schema(db)
+        .await
+        .map_err(|e| CliError::fatal(format!("failed to inspect operation schema: {e}")))?
+    {
+        return runtime::list_operations_by_repo_paginated(db, repo_id, command_filter, query_page)
+            .await
+            .map_err(|e| CliError::fatal(format!("failed to query v2 operations: {e}")));
+    }
     OperationService::list_operations_by_repo_and_command_paginated_with_conn(
         db,
         repo_id,
@@ -698,6 +706,15 @@ async fn load_operation_graph<C: sea_orm::ConnectionTrait>(
     db: &C,
     op_id: &str,
 ) -> CliResult<OperationGraphRecord> {
+    if runtime::is_v2_schema(db)
+        .await
+        .map_err(|e| CliError::fatal(format!("failed to inspect operation schema: {e}")))?
+    {
+        return runtime::load_graph(db, op_id)
+            .await
+            .map_err(|e| CliError::fatal(format!("failed to load operation '{op_id}': {e}")))?
+            .ok_or_else(|| CliError::fatal(format!("operation '{op_id}' not found")));
+    }
     OperationService::load_restore_view_by_operation_with_conn(db, op_id)
         .await
         .map_err(|e| CliError::fatal(format!("failed to load operation '{op_id}': {e}")))?
@@ -725,6 +742,24 @@ async fn resolve_op_ref<C: sea_orm::ConnectionTrait>(
             page: 1,
             per_page: (index + 1) as u64,
         };
+        if runtime::is_v2_schema(db)
+            .await
+            .map_err(|e| CliError::fatal(format!("failed to inspect operation schema: {e}")))?
+        {
+            let result = runtime::list_operations_by_repo_paginated(db, repo_id, None, page)
+                .await
+                .map_err(|e| CliError::fatal(format!("failed to query v2 operations: {e}")))?;
+            return result
+                .items
+                .into_iter()
+                .nth(index)
+                .map(|op| op.op_id)
+                .ok_or_else(|| {
+                    CliError::fatal(format!("operation index {index} out of range"))
+                        .with_stable_code(StableErrorCode::CliInvalidTarget)
+                        .with_hint("use 'libra op log' to see available operations")
+                });
+        }
         let result =
             OperationService::list_operations_by_repo_paginated_with_conn(db, repo_id, page)
                 .await

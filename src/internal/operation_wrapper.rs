@@ -28,7 +28,8 @@ use crate::internal::{
     operation::{
         OperationGraphRecord, OperationParentRecord, OperationQueryPage, OperationRecord,
         OperationService, OperationStatus, OperationViewRecord, OperationViewRefRecord,
-        OperationViewWorkspaceRecord,
+        OperationViewWorkspaceRecord, runtime,
+        store::{OperationKind, OperationMetaV2, OperationStatusV2, OperationStore, OperationV2},
     },
 };
 
@@ -334,6 +335,40 @@ async fn ensure_not_recent_duplicate_with_conn<C: sea_orm::ConnectionTrait>(
         return Ok(());
     };
 
+    if runtime::is_v2_schema(db).await.map_err(|err| {
+        OperationError::begin(format!("failed to inspect operation schema: {err}"))
+    })? {
+        let earliest_end_ts = now_ts.saturating_sub(DEDUP_WINDOW_SECS);
+        let records = runtime::recent_duplicate_candidates(
+            db,
+            &meta.repo_id,
+            scope_key,
+            &meta.command_name,
+            digest,
+            earliest_end_ts,
+            DEDUP_CANDIDATE_LIMIT,
+        )
+        .await
+        .map_err(|err| {
+            OperationError::begin(format!(
+                "failed to query recent v2 operations for repository '{}': {err}",
+                meta.repo_id
+            ))
+        })?;
+        if records.iter().any(|record| {
+            record
+                .end_ts
+                .map(|end_ts| now_ts.saturating_sub(end_ts) <= DEDUP_WINDOW_SECS)
+                .unwrap_or(false)
+        }) {
+            return Err(OperationError::business(format!(
+                "duplicate operation rejected within {}s window for command '{}'",
+                DEDUP_WINDOW_SECS, meta.command_name
+            )));
+        }
+        return Ok(());
+    }
+
     // Part C W1 (§C.9): a SCOPE POINT QUERY, not a repo-wide page filtered in
     // memory. The old form took the newest 50 rows for the whole repository
     // and kept the ones belonging to this worktree — so fifty newer
@@ -436,6 +471,11 @@ where
 {
     meta.validate()?;
     validate_parent_policy(scope.parent_policy)?;
+    if runtime::is_v2_schema(db).await.map_err(|err| {
+        OperationError::begin(format!("failed to inspect operation schema: {err}"))
+    })? {
+        return with_operation_log_v2_with_conn(db, meta, scope, operation).await;
+    }
 
     let op_id = Uuid::now_v7().to_string();
     let view_id = Uuid::now_v7().to_string();
@@ -643,6 +683,168 @@ where
     })
 }
 
+async fn with_operation_log_v2_with_conn<T, F>(
+    db: &DatabaseConnection,
+    meta: OperationMeta,
+    scope: OperationScope,
+    operation: F,
+) -> Result<OperationResult<T>, OperationError>
+where
+    for<'b> F: FnOnce(
+        &'b DatabaseTransaction,
+    ) -> Pin<Box<dyn Future<Output = Result<T, DbErr>> + Send + 'b>>,
+    F: Send + 'static,
+{
+    let op_id = Uuid::now_v7().to_string();
+    let start_ts = Utc::now().timestamp();
+    let scope_key = crate::internal::worktree_scope::WorktreeScope::for_request()
+        .storage_key()
+        .to_string();
+    let dedup_scope = dedup_scope_key(&scope_key, scope.ownership);
+    let _active_dedup_guard = operation_dedup_key(&meta, dedup_scope.as_deref())
+        .map(try_acquire_active_dedup_guard)
+        .transpose()?;
+    ensure_not_recent_duplicate_with_conn(db, &meta, start_ts, dedup_scope.as_deref()).await?;
+
+    let txn = crate::internal::db::begin_write_transaction(db)
+        .await
+        .map_err(|err| {
+            OperationError::begin(format!(
+                "failed to open v2 operation transaction for command '{}': {err}",
+                meta.command_name
+            ))
+        })?;
+    let selection_started_at = Instant::now();
+    let selection = resolve_parent_selection_with_conn(
+        &txn,
+        &meta.repo_id,
+        ParentSelectionMode::SingleLatestSuccess,
+    )
+    .await?;
+    let selection_latency_us = selection_started_at.elapsed().as_micros() as u64;
+    let selected_parents = selection
+        .selected
+        .into_iter()
+        .take(scope.parent_policy.max_parents)
+        .collect::<Vec<_>>();
+
+    let _pre_view = runtime::capture_view(
+        &txn,
+        &meta.repo_id,
+        scope.include_refs,
+        scope.include_remote_tracking,
+    )
+    .await
+    .map_err(|err| {
+        OperationError::snapshot(format!(
+            "failed to capture pre-operation view for command '{}': {err}",
+            meta.command_name
+        ))
+    })?;
+
+    let payload = match operation(&txn).await {
+        Ok(payload) => payload,
+        Err(err) => {
+            txn.rollback().await.map_err(|rollback_err| {
+                OperationError::rollback(format!(
+                    "business step failed with '{err}', and rollback also failed: {rollback_err}"
+                ))
+            })?;
+            return Err(OperationError::business(format!(
+                "command '{}' business write failed: {err}",
+                meta.command_name
+            )));
+        }
+    };
+
+    let post_view = runtime::capture_view(
+        &txn,
+        &meta.repo_id,
+        scope.include_refs,
+        scope.include_remote_tracking,
+    )
+    .await
+    .map_err(|err| {
+        OperationError::snapshot(format!(
+            "failed to capture post-operation view for command '{}': {err}",
+            meta.command_name
+        ))
+    })?;
+    let end_ts = Utc::now().timestamp();
+    let parent_metrics = ParentSelectionMetrics {
+        resolver_mode: selection.mode,
+        scanned_pages: selection.scanned_pages,
+        scanned_items: selection.scanned_items,
+        success_candidates: selection.success_candidates,
+        selected_parent_count: selected_parents.len() as u64,
+        selection_latency_us,
+    };
+    let operation_record = OperationRecord {
+        op_id: op_id.clone(),
+        repo_id: meta.repo_id.clone(),
+        view_id: post_view.manifest_oid.to_string(),
+        command_name: meta.command_name.clone(),
+        description: format!(
+            "{} | resolver_mode=single_latest_success scanned_pages={} scanned_items={} \
+             success_candidates={} selected_parents={} selection_latency_us={}",
+            meta.description,
+            parent_metrics.scanned_pages,
+            parent_metrics.scanned_items,
+            parent_metrics.success_candidates,
+            parent_metrics.selected_parent_count,
+            parent_metrics.selection_latency_us,
+        ),
+        actor: meta.actor.clone(),
+        args_digest: meta.normalized_digest().map(str::to_string),
+        start_ts,
+        end_ts: Some(end_ts),
+        status: OperationStatus::Succeeded,
+        worktree_id: scope_key.clone(),
+        scope_provenance: "declared".to_string(),
+        restorable: true,
+        control_slot: None,
+        claim_owner: None,
+        scope_kind: declared_scope_kind(&scope_key, scope.ownership),
+    };
+    let graph = OperationGraphRecord {
+        operation: operation_record,
+        parents: selected_parents
+            .into_iter()
+            .map(|parent_op_id| OperationParentRecord {
+                op_id: op_id.clone(),
+                parent_op_id,
+            })
+            .collect(),
+        view: OperationViewRecord {
+            view_id: post_view.manifest_oid.to_string(),
+            repo_id: meta.repo_id.clone(),
+            head_kind: post_view.snapshot.head_kind.clone(),
+            head_target: post_view.snapshot.head_target.clone(),
+            created_at: end_ts,
+        },
+        refs: post_view.snapshot.refs.clone(),
+        workspace: post_view.snapshot.workspace.clone(),
+    };
+    runtime::persist_graph(&txn, &graph).await.map_err(|err| {
+        OperationError::persist(format!("failed to persist v2 operation graph: {err}"))
+    })?;
+    txn.commit().await.map_err(|err| {
+        OperationError::commit(format!(
+            "failed to commit v2 operation transaction for command '{}': {err}",
+            meta.command_name
+        ))
+    })?;
+
+    Ok(OperationResult {
+        payload,
+        op_id,
+        view_id: post_view.manifest_oid.to_string(),
+        end_ts,
+        view: post_view.snapshot,
+        parent_metrics,
+    })
+}
+
 #[cfg(test)]
 mod claim_owner_tests {
     use super::*;
@@ -745,6 +947,7 @@ pub struct OperationBoundary {
     selected_parents: Vec<String>,
     parent_metrics: ParentSelectionMetrics,
     _dedup_guard: Option<ActiveDedupGuard>,
+    v2: bool,
 }
 
 /// How a boundary-recorded operation ended.
@@ -773,6 +976,11 @@ pub async fn begin_operation_with_conn(
 ) -> Result<OperationBoundary, OperationError> {
     meta.validate()?;
     validate_parent_policy(scope.parent_policy)?;
+    if runtime::is_v2_schema(db).await.map_err(|err| {
+        OperationError::begin(format!("failed to inspect operation schema: {err}"))
+    })? {
+        return begin_operation_v2_with_conn(db, meta, scope).await;
+    }
 
     let op_id = Uuid::now_v7().to_string();
     let view_id = Uuid::now_v7().to_string();
@@ -922,6 +1130,117 @@ pub async fn begin_operation_with_conn(
             selection_latency_us,
         },
         _dedup_guard: dedup_guard,
+        v2: false,
+    })
+}
+
+async fn begin_operation_v2_with_conn(
+    db: &DatabaseConnection,
+    meta: OperationMeta,
+    scope: OperationScope,
+) -> Result<OperationBoundary, OperationError> {
+    let op_id = Uuid::now_v7().to_string();
+    let start_ts = Utc::now().timestamp();
+    let scope_key = crate::internal::worktree_scope::WorktreeScope::for_request()
+        .storage_key()
+        .to_string();
+    let dedup_scope = dedup_scope_key(&scope_key, scope.ownership);
+    let dedup_guard = operation_dedup_key(&meta, dedup_scope.as_deref())
+        .map(try_acquire_active_dedup_guard)
+        .transpose()?;
+    if scope.duplicate_window {
+        ensure_not_recent_duplicate_with_conn(db, &meta, start_ts, dedup_scope.as_deref()).await?;
+    }
+
+    let txn = crate::internal::db::begin_write_transaction(db)
+        .await
+        .map_err(|err| {
+            OperationError::begin(format!(
+                "failed to open v2 operation claim transaction: {err}"
+            ))
+        })?;
+    if let Some((_, command, _, owner)) = runtime::running_control(&txn, &meta.repo_id, &scope_key)
+        .await
+        .map_err(|err| {
+            OperationError::persist(format!("failed to inspect v2 control claim: {err}"))
+        })?
+    {
+        let _ = txn.rollback().await;
+        return Err(OperationError::business(format!(
+            "'{command}' is already running in this worktree (owner {}); wait for it to finish",
+            owner.unwrap_or_else(|| "unknown".to_string())
+        )));
+    }
+    let selection_started_at = Instant::now();
+    let selection = resolve_parent_selection_with_conn(
+        &txn,
+        &meta.repo_id,
+        ParentSelectionMode::SingleLatestSuccess,
+    )
+    .await?;
+    let selection_latency_us = selection_started_at.elapsed().as_micros() as u64;
+    let selected_parents = selection.selected;
+    let pre_view = runtime::capture_view(
+        &txn,
+        &meta.repo_id,
+        scope.include_refs,
+        scope.include_remote_tracking,
+    )
+    .await
+    .map_err(|err| {
+        OperationError::snapshot(format!("failed to capture v2 pre-operation view: {err}"))
+    })?;
+
+    let operation = OperationV2 {
+        op_id: op_id.clone(),
+        repo_id: meta.repo_id.clone(),
+        parent_op_ids: selected_parents.clone(),
+        pre_view_oid: pre_view.manifest_oid,
+        post_view_oid: pre_view.manifest_oid,
+        kind: OperationKind::Command,
+        status: OperationStatusV2::Running,
+        metadata: OperationMetaV2 {
+            command_name: Some(meta.command_name.clone()),
+            description: Some(meta.description.clone()),
+            args_digest: meta.normalized_digest().map(str::to_string),
+            actor: Some(meta.actor.clone()),
+            worktree_id: Some(scope_key.clone()),
+            scope_kind: declared_scope_kind(&scope_key, scope.ownership),
+            ..OperationMetaV2::default()
+        },
+        restores_op_id: None,
+        reverts_op_id: None,
+        predecessor_map_oid: None,
+        start_ts,
+        end_ts: None,
+    };
+    OperationStore::write_operation_with_conn(&txn, &operation)
+        .await
+        .map_err(|err| {
+            OperationError::persist(format!("failed to write v2 operation claim: {err}"))
+        })?;
+    txn.commit().await.map_err(|err| {
+        OperationError::commit(format!("failed to commit v2 operation claim: {err}"))
+    })?;
+
+    Ok(OperationBoundary {
+        op_id,
+        view_id: pre_view.manifest_oid.to_string(),
+        start_ts,
+        meta,
+        scope,
+        scope_key,
+        selected_parents,
+        parent_metrics: ParentSelectionMetrics {
+            resolver_mode: selection.mode,
+            scanned_pages: selection.scanned_pages,
+            scanned_items: selection.scanned_items,
+            success_candidates: selection.success_candidates,
+            selected_parent_count: 0,
+            selection_latency_us,
+        },
+        _dedup_guard: dedup_guard,
+        v2: true,
     })
 }
 
@@ -1202,6 +1521,78 @@ async fn retry_claim(
         })
 }
 
+async fn finish_operation_v2_with_conn(
+    boundary: OperationBoundary,
+    db: &DatabaseConnection,
+    outcome: BoundaryOutcome,
+) -> Result<(), OperationError> {
+    let txn = crate::internal::db::begin_write_transaction(db)
+        .await
+        .map_err(|err| {
+            OperationError::begin(format!(
+                "failed to open v2 operation completion transaction: {err}"
+            ))
+        })?;
+    let view = runtime::capture_view(
+        &txn,
+        &boundary.meta.repo_id,
+        boundary.scope.include_refs,
+        boundary.scope.include_remote_tracking,
+    )
+    .await
+    .map_err(|err| OperationError::snapshot(format!("failed to capture v2 final view: {err}")))?;
+    let status = match outcome {
+        BoundaryOutcome::Succeeded => OperationStatusV2::Success,
+        BoundaryOutcome::Failed => OperationStatusV2::Failed,
+    };
+    OperationStore::complete_operation_with_conn(
+        &txn,
+        &boundary.op_id,
+        view.manifest_oid,
+        status,
+        Utc::now().timestamp(),
+    )
+    .await
+    .map_err(|err| OperationError::persist(format!("failed to close v2 operation: {err}")))?;
+    if status == OperationStatusV2::Success {
+        let current = crate::internal::model::operation_head::Entity::find()
+            .filter(
+                crate::internal::model::operation_head::Column::RepoId.eq(&boundary.meta.repo_id),
+            )
+            .filter(
+                crate::internal::model::operation_head::Column::ScopeKey
+                    .eq(boundary.scope_key.clone()),
+            )
+            .all(&txn)
+            .await
+            .map_err(|err| {
+                OperationError::persist(format!("failed to read v2 operation heads: {err}"))
+            })?;
+        let generation = current
+            .iter()
+            .map(|head| head.generation)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        OperationStore::replace_op_heads_with_conn(
+            &txn,
+            &boundary.meta.repo_id,
+            &boundary.scope_key,
+            &[crate::internal::operation::store::OpHead {
+                op_id: boundary.op_id,
+                generation,
+            }],
+        )
+        .await
+        .map_err(|err| {
+            OperationError::persist(format!("failed to publish v2 operation head: {err}"))
+        })?;
+    }
+    txn.commit().await.map_err(|err| {
+        OperationError::commit(format!("failed to commit v2 operation completion: {err}"))
+    })
+}
+
 impl OperationBoundary {
     /// The operation id this boundary claimed.
     pub fn op_id(&self) -> &str {
@@ -1223,6 +1614,9 @@ impl OperationBoundary {
         db: &DatabaseConnection,
         outcome: BoundaryOutcome,
     ) -> Result<(), OperationError> {
+        if self.v2 {
+            return finish_operation_v2_with_conn(self, db, outcome).await;
+        }
         let end_ts = Utc::now().timestamp();
         // Completion READS the final view before it replaces the claim row,
         // so it takes the write lock up front — otherwise a concurrent writer
@@ -1366,6 +1760,58 @@ pub async fn resolve_parent_selection_with_conn<C: sea_orm::ConnectionTrait>(
 ) -> Result<ParentSelectionResult, OperationError> {
     if repo_id.trim().is_empty() {
         return Err(OperationError::validation("repo_id must not be empty"));
+    }
+
+    if runtime::is_v2_schema(db).await.map_err(|err| {
+        OperationError::begin(format!("failed to inspect operation schema: {err}"))
+    })? {
+        let mut page = 1;
+        let mut scanned_pages = 0;
+        let mut scanned_items = 0;
+        let mut success_candidates = 0;
+        loop {
+            let records = runtime::list_operations_by_repo_paginated(
+                db,
+                repo_id,
+                None,
+                OperationQueryPage {
+                    page,
+                    per_page: PARENT_RESOLUTION_PAGE_SIZE,
+                },
+            )
+            .await
+            .map_err(|err| {
+                OperationError::begin(format!(
+                    "failed to resolve v2 parent operation for repository '{}': {err}",
+                    repo_id
+                ))
+            })?;
+            scanned_pages += 1;
+            let items_len = records.items.len() as u64;
+            scanned_items += items_len;
+            for item in records.items {
+                if item.status == OperationStatus::Succeeded {
+                    success_candidates += 1;
+                    return Ok(ParentSelectionResult {
+                        selected: vec![item.op_id],
+                        scanned_pages,
+                        scanned_items,
+                        success_candidates,
+                        mode,
+                    });
+                }
+            }
+            if items_len < records.per_page {
+                return Ok(ParentSelectionResult {
+                    selected: Vec::new(),
+                    scanned_pages,
+                    scanned_items,
+                    success_candidates,
+                    mode,
+                });
+            }
+            page += 1;
+        }
     }
 
     let mut page: u64 = 1;
