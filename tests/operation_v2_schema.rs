@@ -61,7 +61,9 @@ async fn assert_only_v2_operation_tables(conn: &DatabaseConnection) {
 async fn fresh_database_uses_operation_v2_schema() {
     let dir = tempdir().expect("temp directory");
     let db_path = dir.path().join("fresh.db");
-    let conn = create_database(db_path.to_str().expect("db path")).await.expect("create db");
+    let conn = create_database(db_path.to_str().expect("db path"))
+        .await
+        .expect("create db");
 
     assert_only_v2_operation_tables(&conn).await;
     let schema = schema_columns(&conn).await;
@@ -78,7 +80,9 @@ async fn fresh_database_uses_operation_v2_schema() {
 async fn legacy_operation_schema_converges_to_v2() {
     let dir = tempdir().expect("temp directory");
     let db_path = dir.path().join("legacy.db");
-    let conn = create_database(db_path.to_str().expect("db path")).await.expect("create db");
+    let conn = create_database(db_path.to_str().expect("db path"))
+        .await
+        .expect("create db");
 
     conn.execute_unprepared(
         "DROP TABLE IF EXISTS operation_view_workspace; DROP TABLE IF EXISTS operation_view_ref; DROP TABLE IF EXISTS operation_view; DROP TABLE IF EXISTS operation_journal; DROP TABLE IF EXISTS operation_head; DROP TABLE IF EXISTS operation_parent; DROP TABLE IF EXISTS operation; DROP TABLE IF EXISTS change_identity; DROP TABLE IF EXISTS change_revision; DROP TABLE IF EXISTS change_predecessor; DROP TABLE IF EXISTS ai_operation_link; CREATE TABLE operation(op_id TEXT PRIMARY KEY, repo_id TEXT NOT NULL, view_id TEXT NOT NULL, command_name TEXT NOT NULL, description TEXT NOT NULL, actor TEXT NOT NULL, args_digest TEXT, start_ts INTEGER NOT NULL, end_ts INTEGER, status TEXT NOT NULL); CREATE TABLE operation_parent(op_id TEXT NOT NULL, parent_op_id TEXT NOT NULL, PRIMARY KEY(op_id, parent_op_id)); CREATE TABLE operation_view(view_id TEXT PRIMARY KEY, repo_id TEXT NOT NULL, head_kind TEXT NOT NULL, head_target TEXT NOT NULL, created_at INTEGER NOT NULL); CREATE TABLE operation_view_ref(view_id TEXT NOT NULL, ref_kind TEXT NOT NULL, ref_name TEXT NOT NULL, ref_remote TEXT NOT NULL, target_oid TEXT NOT NULL, PRIMARY KEY(view_id, ref_kind, ref_name, ref_remote)); CREATE TABLE operation_view_workspace(view_id TEXT NOT NULL, pointer_kind TEXT NOT NULL, pointer_value TEXT NOT NULL, PRIMARY KEY(view_id, pointer_kind)); DELETE FROM schema_versions WHERE version = 2026090301",
@@ -86,6 +90,8 @@ async fn legacy_operation_schema_converges_to_v2() {
     .await
     .expect("plant legacy schema");
 
-    run_builtin_migrations(&conn).await.expect("upgrade legacy schema");
+    run_builtin_migrations(&conn)
+        .await
+        .expect("upgrade legacy schema");
     assert_only_v2_operation_tables(&conn).await;
 }

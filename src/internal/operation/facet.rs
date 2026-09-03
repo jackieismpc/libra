@@ -60,11 +60,7 @@ pub trait StateFacet: Send + Sync {
     fn restore_policy(&self) -> RestorePolicy;
     fn capture(&self, ctx: &FacetCaptureCtx) -> Result<FacetCapture, FacetError>;
     fn validate(&self, capture: &FacetCapture) -> Result<(), FacetError>;
-    fn restore(
-        &self,
-        capture: &FacetCapture,
-        ctx: &mut FacetRestoreCtx,
-    ) -> Result<(), FacetError>;
+    fn restore(&self, capture: &FacetCapture, ctx: &mut FacetRestoreCtx) -> Result<(), FacetError>;
     fn diff(&self, from: &FacetCapture, to: &FacetCapture) -> Result<FacetDiff, FacetError>;
     fn roots(&self, capture: &FacetCapture) -> Vec<ObjectHash>;
 }
@@ -102,7 +98,10 @@ impl FacetRegistry {
     }
 
     pub fn capture_all(&self, ctx: &FacetCaptureCtx) -> Result<Vec<FacetCapture>, FacetError> {
-        self.facets.values().map(|facet| facet.capture(ctx)).collect()
+        self.facets
+            .values()
+            .map(|facet| facet.capture(ctx))
+            .collect()
     }
 
     pub fn validate_all(&self, captures: &[FacetCapture]) -> Result<(), FacetError> {

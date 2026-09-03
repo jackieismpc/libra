@@ -2,10 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use git_internal::{
-    hash::ObjectHash,
-    internal::object::types::ObjectType,
-};
+use git_internal::{hash::ObjectHash, internal::object::types::ObjectType};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -66,7 +63,8 @@ pub struct WorkspaceSnapshotV2 {
     pub worktree_generation: u64,
     pub capture_policy: CapturePolicy,
     pub completeness: Completeness,
-    pub facet_restore_policies: BTreeMap<FacetName, crate::internal::operation::facet::RestorePolicy>,
+    pub facet_restore_policies:
+        BTreeMap<FacetName, crate::internal::operation::facet::RestorePolicy>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -280,9 +278,15 @@ mod tests {
         )
         .expect("valid view");
         let bytes = view.canonical_bytes().expect("encode");
-        assert_eq!(RepoViewV2::from_canonical_bytes(&bytes).expect("decode"), view);
+        assert_eq!(
+            RepoViewV2::from_canonical_bytes(&bytes).expect("decode"),
+            view
+        );
         assert_eq!(view.roots().len(), 4);
-        assert!(view.validate_closure(|candidate| candidate != &oid(4)).is_err());
+        assert!(
+            view.validate_closure(|candidate| candidate != &oid(4))
+                .is_err()
+        );
     }
 
     #[test]
@@ -300,7 +304,10 @@ mod tests {
             &serde_json::to_vec(&value).expect("encode invalid version"),
         )
         .expect_err("unknown schema must fail");
-        assert!(matches!(error, ViewCodecError::UnsupportedSchemaVersion { .. }));
+        assert!(matches!(
+            error,
+            ViewCodecError::UnsupportedSchemaVersion { .. }
+        ));
     }
 
     #[test]

@@ -280,6 +280,10 @@ name = "operation_v2_schema"
 path = "tests/operation_v2_schema.rs"
 
 [[test]]
+name = "operation_dag"
+path = "tests/operation_dag.rs"
+
+[[test]]
 name = "compat_r0_9_doc_closeout"
 path = "tests/compat/r0_9_doc_closeout.rs"
 
