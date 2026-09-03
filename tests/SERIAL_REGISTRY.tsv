@@ -781,6 +781,7 @@ test_status_porcelain_v2_file_modes_and_hashes	lane:cwd	changes the process work
 test_status_porcelain_v2_untracked_files_all	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_status_porcelain_v2_untracked_files_no	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_status_rejects_bare_repository	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_status_short_branch_reports_up_to_date_with_fully_qualified_tracking_ref	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_status_short_format	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_status_short_format_with_branch	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_status_show_stash_with_existing_stash	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)

@@ -386,7 +386,9 @@ Deletion targets are resolved against the refs the remote actually advertises:
 - A **short name** tries `refs/heads/<name>` first, then `refs/tags/<name>`; the single
   advertised match is deleted. A name matching both namespaces is refused with
   `dst refspec '<name>' matches more than one remote ref` (Git parity) — qualify the
-  target explicitly.
+  target explicitly. Git's broader short-name matching — bare `<name>`, `refs/<name>`,
+  `refs/remotes/<name>`, `refs/remotes/<name>/HEAD`, with weak/strong preference — is
+  deliberately not implemented; use a fully-qualified target for those namespaces.
 - A **fully-qualified name** (`refs/heads/x`, `refs/tags/x`) is used verbatim.
 - A deletion naming a ref the remote does not advertise fails with
   `unable to delete '<name>': remote ref does not exist` instead of reporting
