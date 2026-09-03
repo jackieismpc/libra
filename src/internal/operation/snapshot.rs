@@ -178,6 +178,11 @@ impl WorkspaceSnapshotter {
         root: &Path,
         snapshot: &WorkspaceSnapshotV2,
     ) -> Result<(), SnapshotError> {
+        let metadata = fs::symlink_metadata(root)?;
+        if metadata.file_type().is_symlink() {
+            return Err(SnapshotError::UnsafePath(root.display().to_string()));
+        }
+        let root = root.canonicalize()?;
         let bytes = self
             .storage
             .get(&snapshot.untracked_manifest_oid)

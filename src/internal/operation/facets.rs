@@ -51,7 +51,7 @@ impl FileStateFacet {
             facet: self.name.clone(),
             schema_version: FACET_SCHEMA_VERSION,
             payload_oid: Some(oid),
-            meta: serde_json::json!({ "path": self.path.display().to_string(), "workspace_id": "redacted" }),
+            meta: serde_json::json!({}),
         })
     }
 

@@ -199,6 +199,16 @@ impl OperationMiddleware {
                 0,
             )
             .await?;
+        self.store
+            .record_journal_phase(
+                &journal_id,
+                JournalPhase::Mutation,
+                Some(effective_pre_view),
+                None,
+                None,
+                0,
+            )
+            .await?;
         let result = action().await;
         match result {
             Ok(value) => {
@@ -230,6 +240,16 @@ impl OperationMiddleware {
                             op_id: op_id.clone(),
                             generation,
                         }],
+                    )
+                    .await?;
+                self.store
+                    .record_journal_phase(
+                        &journal_id,
+                        JournalPhase::Publish,
+                        Some(effective_pre_view),
+                        Some(post_view_oid),
+                        None,
+                        1,
                     )
                     .await?;
                 if let Some(path) = &self.pointer_path {
