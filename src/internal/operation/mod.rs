@@ -11,6 +11,7 @@ use sea_orm::{
 use thiserror::Error;
 
 pub mod facet;
+pub mod facets;
 pub mod snapshot;
 pub mod store;
 pub mod view;
