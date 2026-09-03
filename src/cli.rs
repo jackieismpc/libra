@@ -26,7 +26,7 @@ use sea_orm::{ConnectionTrait, Statement};
 use crate::{
     command,
     command::code::ControlMode,
-    internal::{config::ConfigKv, db},
+    internal::{config::ConfigKv, db, operation::middleware::MutationClass},
     utils,
     utils::{
         error::{CliError, CliResult},
@@ -1664,6 +1664,18 @@ enum CommandScope {
     ReadOnly,
 }
 
+/// Compile-time census bridge from the exhaustive CLI scope inventory to the
+/// Operation middleware's mutation classes. `command_scope` has no wildcard,
+/// so a newly added command cannot silently bypass this classification.
+fn operation_class_for_command(command: &Commands) -> MutationClass {
+    match command_scope(command) {
+        CommandScope::ReadOnly => MutationClass::ReadOnly,
+        CommandScope::Worktree => MutationClass::WorkingCopy,
+        CommandScope::Repository => MutationClass::Ref,
+        CommandScope::Composite => MutationClass::Repository,
+    }
+}
+
 impl CommandScope {
     /// Does this scope write the CURRENT worktree's HEAD / index / files?
     fn mutates_worktree_state(self) -> bool {
@@ -2549,6 +2561,8 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
             _ => return Err(classify_parse_error(&argv, &err)),
         },
     };
+    let operation_class = operation_class_for_command(&args.command);
+    tracing::debug!(?operation_class, "CLI operation mutation class selected");
     if let Commands::Diff(diff_args) = &mut args.command {
         command::diff::record_algorithm_selector_events(diff_args, &utf8_argv);
     }

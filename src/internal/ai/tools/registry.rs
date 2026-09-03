@@ -288,6 +288,16 @@ impl ToolRegistry {
 
         let mutates_state = handler.is_mutating(&invocation).await;
         let requires_network = handler.requires_network(&invocation).await;
+        let operation_class = if mutates_state {
+            crate::internal::operation::middleware::MutationClass::External
+        } else {
+            crate::internal::operation::middleware::MutationClass::ReadOnly
+        };
+        tracing::debug!(
+            tool = %tool_name,
+            ?operation_class,
+            "Agent tool operation mutation class selected"
+        );
 
         if let Some(hardening) = &self.hardening {
             let operation = ToolOperation::tool(tool_name.clone(), mutates_state, requires_network);
