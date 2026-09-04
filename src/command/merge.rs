@@ -24,7 +24,7 @@ use git_internal::{
 use serde::{Deserialize, Serialize};
 
 use super::{
-    get_target_commit, load_object, reset,
+    get_target_commit, load_object, load_object_raw, reset,
     restore::{self, RestoreArgs},
     save_object, status, switch,
 };
@@ -1707,6 +1707,28 @@ async fn preflight_merge_gitlinks(
     {
         return Ok(());
     }
+    if bases.len() <= 1 && incremental_tree_walk_enabled() {
+        // MG-03: the same read-only gate the engine runs, on the trees — no
+        // flattening, so the preflight's reads are bounded like the merge's.
+        let root = |id: ObjectHash| WalkEntry {
+            id,
+            mode: TreeItemMode::Tree,
+        };
+        let mut source = ObjectStoreTrees::new();
+        // Root trees through `refs/replace`, as the flattening path's root
+        // `load_object` does (see `perform_incremental_three_way_merge`).
+        return incremental_gitlink_gate(
+            &mut source,
+            &[
+                bases
+                    .first()
+                    .map(|base| root(super::replace::resolve(base.tree_id))),
+                Some(root(super::replace::resolve(current_commit.tree_id))),
+                Some(root(super::replace::resolve(target_commit.tree_id))),
+            ],
+        )
+        .map(|_| ());
+    }
     ensure_merge_gitlinks_uniform(
         &bases,
         &commit_gitlink_entries(&current_commit)?,
@@ -2094,8 +2116,24 @@ async fn perform_three_way_merge(
     }
 
     let head_name = current_head_name().await?;
+    // MG-03: a merge against ONE real base (or none) walks the three trees
+    // incrementally, opening only the directories the sides disagree about.
+    // The recursive fold of several bases (MG-02) has already read every input
+    // to build its virtual ancestor, so that shape keeps the flattening path.
+    if base_commits.len() <= 1 && incremental_tree_walk_enabled() {
+        return perform_incremental_three_way_merge(
+            current_commit,
+            target_commit,
+            base_commits.first(),
+            head_name,
+            upstream,
+            options,
+        )
+        .await;
+    }
     let (our_items, our_gitlinks) = commit_tree_split(&current_commit)?;
     let (their_items, their_gitlinks) = commit_tree_split(&target_commit)?;
+    report_tree_walk_stats("flat", None);
     // ADR-MG-01 fail-closed gate: refuse before the first write (this runs
     // ahead of the `--dry-run` report as well, so the preview is honest) if any
     // submodule pointer diverged — for EVERY merge base, so the recursive fold
@@ -4090,6 +4128,974 @@ fn materialize_virtual_ancestor(
     Ok(commit.id)
 }
 
+// ---------------------------------------------------------------------------
+// MG-03: incremental (directory-pruning) three-way tree merge.
+//
+// The flattening path (`commit_tree_split` → `merge_tree_items`) reads every
+// tree and lists every leaf of all three inputs before deciding anything —
+// O(whole tree) object reads for a merge that may touch one file. The walk
+// below is Git's `collect_merge_info_callback` (merge-ort.c:1259) reduced to
+// what Libra's engine decides: it descends a directory ONLY when the three
+// sides disagree about it, adopts a subtree verbatim when one side equals the
+// base (the other side's subtree IS the result there), and skips a directory
+// all three agree on without opening it. Leaves still go through
+// `resolve_three_way`, so the resolution set is the flattening path's.
+// ---------------------------------------------------------------------------
+
+/// Where the incremental walk reads tree objects from. The object store is the
+/// real source; unit tests supply an in-memory graph that COUNTS reads, which
+/// is how the pruning guarantees (G1/G2) are asserted rather than assumed.
+trait TreeSource {
+    fn tree(&mut self, id: &ObjectHash) -> Result<Tree, PullMergeError>;
+}
+
+/// Tree objects read from the object store by every [`ObjectStoreTrees`] in
+/// this process — the preflight gate's and the engine's alike — so the
+/// `LIBRA_TEST_MERGE_TREE_STATS` seam reports the whole production read set
+/// of a merge, not one pass of it.
+static MERGE_TREE_STORE_READS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Object-store [`TreeSource`], one read per tree id per walk.
+struct ObjectStoreTrees {
+    cache: HashMap<ObjectHash, Tree>,
+    /// Object-store read ATTEMPTS so far (cache hits excluded; a failed load
+    /// counts, it was still a read) — what the `LIBRA_TEST_MERGE_TREE_STATS`
+    /// seam reports for the production walk.
+    reads: usize,
+    /// Whether `refs/replace` substitutions apply to the trees read. The merge
+    /// walk and its gate read RAW — matching the flattening path's `Tree::load`
+    /// for nested trees — while the `--dry-run` availability probe reads
+    /// replacement-aware, matching the checkout it stands in for
+    /// (`reset::rebuild_index_from_tree` uses `load_object`). A source is one
+    /// or the other for its whole life; the two views are never mixed in one
+    /// cache.
+    replacement_aware: bool,
+}
+
+impl ObjectStoreTrees {
+    fn new() -> Self {
+        Self {
+            cache: HashMap::new(),
+            reads: 0,
+            replacement_aware: false,
+        }
+    }
+
+    /// The checkout's view of trees, for the preview probe.
+    fn as_checkout_sees_them() -> Self {
+        Self {
+            replacement_aware: true,
+            ..Self::new()
+        }
+    }
+}
+
+impl TreeSource for ObjectStoreTrees {
+    fn tree(&mut self, id: &ObjectHash) -> Result<Tree, PullMergeError> {
+        if let Some(tree) = self.cache.get(id) {
+            return Ok(tree.clone());
+        }
+        // Counted as an attempt before the load: a failed read was a read.
+        self.reads += 1;
+        MERGE_TREE_STORE_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let loaded = if self.replacement_aware {
+            load_object(id)
+        } else {
+            // RAW, exactly like the flattening path's `Tree::load`:
+            // `refs/replace` substitutions are not applied to merge inputs on
+            // either path, so the two paths see — and record — the same ids.
+            load_object_raw(id)
+        };
+        let tree: Tree = loaded.map_err(|error| PullMergeError::TreeLoad {
+            tree_id: id.to_string(),
+            detail: error.to_string(),
+        })?;
+        self.cache.insert(*id, tree.clone());
+        Ok(tree)
+    }
+}
+
+/// One side's view of a directory entry during the walk.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct WalkEntry {
+    id: ObjectHash,
+    mode: TreeItemMode,
+}
+
+impl WalkEntry {
+    fn is_tree(self) -> bool {
+        self.mode == TreeItemMode::Tree
+    }
+
+    fn leaf(self) -> MergeTreeEntry {
+        MergeTreeEntry {
+            hash: self.id,
+            mode: self.mode,
+        }
+    }
+}
+
+/// What the incremental walk produced for one merge.
+///
+/// `merged` holds leaves AND adopted subtrees: an entry whose mode is
+/// [`TreeItemMode::Tree`] names a whole subtree taken verbatim from one side,
+/// which `create_tree_from_items_map` writes as-is. Consumers that need leaves
+/// (the conflict-path index, the untracked-collision check) expand adopted
+/// subtrees with [`expand_adopted_subtrees`] — reading the ADOPTED side only,
+/// never the side that equalled the base.
+#[derive(Debug)]
+struct IncrementalMergeResult {
+    merged: HashMap<PathBuf, MergeTreeEntry>,
+    conflicts: Vec<(PathBuf, ConflictKind)>,
+    /// Paths whose resolution differs from `ours`, for `files_changed`. Adopted
+    /// subtrees contribute through [`pruned_subtree_diff`] against ours' subtree.
+    changed_paths: usize,
+    /// Subtrees adopted from theirs (or added by theirs) in place of what ours
+    /// had there — `(path, ours' entry if any, adopted entry)` — recorded at
+    /// adoption time so the ADR-MG-01 scan never looks anything up again.
+    adopted_from_theirs: Vec<(PathBuf, Option<WalkEntry>, WalkEntry)>,
+}
+
+/// Read one directory of each side (where present) into name-keyed maps.
+fn read_walk_level(
+    source: &mut dyn TreeSource,
+    sides: [Option<WalkEntry>; 3],
+) -> Result<[BTreeMap<String, WalkEntry>; 3], PullMergeError> {
+    let mut levels: [BTreeMap<String, WalkEntry>; 3] = Default::default();
+    // Identical tree ids are read once and shared: the object is the same.
+    let mut loaded: HashMap<ObjectHash, BTreeMap<String, WalkEntry>> = HashMap::new();
+    for (index, side) in sides.iter().enumerate() {
+        let Some(entry) = side.filter(|entry| entry.is_tree()) else {
+            continue;
+        };
+        if let Some(level) = loaded.get(&entry.id) {
+            levels[index] = level.clone();
+            continue;
+        }
+        let tree = source.tree(&entry.id)?;
+        let level: BTreeMap<String, WalkEntry> = tree
+            .tree_items
+            .iter()
+            .map(|item| {
+                (
+                    item.name.clone(),
+                    WalkEntry {
+                        id: item.id,
+                        mode: item.mode,
+                    },
+                )
+            })
+            .collect();
+        loaded.insert(entry.id, level.clone());
+        levels[index] = level;
+    }
+    Ok(levels)
+}
+
+/// Git's `collect_merge_info_callback` shape: walk the three trees together,
+/// deciding each directory from its three ids before (and instead of) opening
+/// it wherever possible.
+fn incremental_merge_walk(
+    source: &mut dyn TreeSource,
+    dir: &Path,
+    sides: [Option<WalkEntry>; 3],
+    context: &mut TreeMergeContext<'_>,
+    out: &mut IncrementalMergeResult,
+) -> Result<(), PullMergeError> {
+    let levels = read_walk_level(source, sides)?;
+    let mut names: BTreeSet<&String> = BTreeSet::new();
+    for level in &levels {
+        names.extend(level.keys());
+    }
+    for name in names {
+        let path = dir.join(name);
+        let entry = |index: usize| levels[index].get(name).copied();
+        let (base, ours, theirs) = (entry(0), entry(1), entry(2));
+        let all_trees = |entries: &[Option<WalkEntry>]| {
+            entries
+                .iter()
+                .all(|entry| entry.is_none_or(|entry| entry.is_tree()))
+        };
+
+        // Gitlinks are never merged (ADR-MG-01). `incremental_gitlink_gate` has
+        // already refused every pointer the three sides disagree about, so a
+        // gitlink reached here is the same on all three sides: carry it through
+        // verbatim, exactly as the flattening path does.
+        let is_gitlink = |entry: Option<WalkEntry>| {
+            entry.is_some_and(|entry| entry.mode == TreeItemMode::Commit)
+        };
+        if is_gitlink(base) || is_gitlink(ours) || is_gitlink(theirs) {
+            if let (Some(b), Some(o), Some(t)) = (base, ours, theirs)
+                && b == o
+                && o == t
+            {
+                out.merged.insert(path, o.leaf());
+            }
+            continue;
+        }
+
+        if all_trees(&[base, ours, theirs])
+            && (base.is_some() || ours.is_some() || theirs.is_some())
+        {
+            // Directory on every present side. Decide from the three ids.
+            match (base, ours, theirs) {
+                // All three agree: nothing under here can differ. Not opened.
+                (Some(b), Some(o), Some(t)) if b == o && o == t => {
+                    out.merged.insert(path, o.leaf());
+                }
+                // Ours equals base: theirs' subtree is the result, verbatim.
+                (Some(b), Some(o), Some(t)) if b == o => {
+                    out.merged.insert(path.clone(), t.leaf());
+                    out.adopted_from_theirs.push((path, Some(o), t));
+                }
+                // Theirs equals base: ours' subtree is the result, verbatim.
+                (Some(b), Some(o), Some(t)) if b == t => {
+                    out.merged.insert(path, o.leaf());
+                }
+                // Both sides made the SAME change: take it, verbatim.
+                (_, Some(o), Some(t)) if o == t => {
+                    out.merged.insert(path, o.leaf());
+                }
+                // Added on one side only (no base): take it, verbatim.
+                (None, Some(o), None) => {
+                    out.merged.insert(path, o.leaf());
+                }
+                (None, None, Some(t)) => {
+                    out.merged.insert(path.clone(), t.leaf());
+                    out.adopted_from_theirs.push((path, None, t));
+                }
+                // Deleted on one side, untouched on the other: gone.
+                (Some(b), Some(o), None) if b == o => {
+                    let mut gone = SubtreeDiff::default();
+                    pruned_subtree_diff(source, &path, Some(o), None, &mut gone)?;
+                    out.changed_paths += gone.changed_leaves;
+                }
+                (Some(b), None, Some(t)) if b == t => {}
+                // Anything else needs the entries: recurse.
+                _ => incremental_merge_walk(source, &path, [base, ours, theirs], context, out)?,
+            }
+            continue;
+        }
+
+        if base.is_some_and(|entry| entry.is_tree())
+            || ours.is_some_and(|entry| entry.is_tree())
+            || theirs.is_some_and(|entry| entry.is_tree())
+        {
+            // A directory on some side and a file on another. The flattening
+            // path saw the directory's leaves and the file as unrelated paths;
+            // reproduce that exactly: recurse into the tree sides with the
+            // file sides absent, and resolve the file with the tree sides
+            // absent.
+            let tree_sides =
+                [base, ours, theirs].map(|entry| entry.filter(|entry| entry.is_tree()));
+            incremental_merge_walk(source, &path, tree_sides, context, out)?;
+            let file_sides =
+                [base, ours, theirs].map(|entry| entry.filter(|entry| !entry.is_tree()));
+            resolve_walk_leaf(&path, file_sides, context, out)?;
+            continue;
+        }
+
+        resolve_walk_leaf(&path, [base, ours, theirs], context, out)?;
+    }
+    Ok(())
+}
+
+/// Leaves go through the same [`resolve_three_way`] the flattening path uses,
+/// so the two paths cannot disagree about a file.
+fn resolve_walk_leaf(
+    path: &Path,
+    sides: [Option<WalkEntry>; 3],
+    context: &mut TreeMergeContext<'_>,
+    out: &mut IncrementalMergeResult,
+) -> Result<(), PullMergeError> {
+    let [base, ours, theirs] = sides.map(|entry| entry.map(WalkEntry::leaf));
+    if base.is_none() && ours.is_none() && theirs.is_none() {
+        return Ok(());
+    }
+    let resolution = resolve_three_way(base.as_ref(), ours.as_ref(), theirs.as_ref(), context)?;
+    match resolution {
+        MergeResolution::Use(entry) => {
+            if ours != Some(entry) {
+                out.changed_paths += 1;
+            }
+            out.merged.insert(path.to_path_buf(), entry);
+        }
+        MergeResolution::Delete => {
+            if ours.is_some() {
+                out.changed_paths += 1;
+            }
+        }
+        MergeResolution::Conflict(kind) => {
+            // A conflicted path is absent from the merged map, so the flattening
+            // path's count (`count_item_map_changes` of ours vs merged) sees it
+            // as changed whenever ours had an entry there. Same rule here.
+            if ours.is_some() {
+                out.changed_paths += 1;
+            }
+            out.conflicts.push((path.to_path_buf(), kind));
+        }
+    }
+    Ok(())
+}
+
+/// What one pruned pass over two differing subtrees reports.
+#[derive(Default)]
+struct SubtreeDiff {
+    /// Leaf paths that differ (a path present on one side only counts once, a
+    /// path differing on both sides counts once) — `files_changed`'s share for
+    /// an adopted subtree.
+    changed_leaves: usize,
+}
+
+/// Count differing leaves between two subtrees opening ONLY the directories
+/// whose ids differ — never a subtree the two sides share — so an adopted
+/// subtree costs each differing directory one read per side and nothing more.
+/// (Gitlink arbitration is NOT this function's job: `incremental_gitlink_gate`
+/// runs before the walk and has already refused every disagreeing pointer.)
+fn pruned_subtree_diff(
+    source: &mut dyn TreeSource,
+    path: &Path,
+    left: Option<WalkEntry>,
+    right: Option<WalkEntry>,
+    out: &mut SubtreeDiff,
+) -> Result<(), PullMergeError> {
+    match (left, right) {
+        (Some(l), Some(r)) if l == r => return Ok(()),
+        (None, None) => return Ok(()),
+        _ => {}
+    }
+    let tree = |entry: Option<WalkEntry>| entry.is_none_or(|entry| entry.is_tree());
+    if !(tree(left) && tree(right)) {
+        // A file on at least one side: the file is one changed path; a tree on
+        // the other side contributes every leaf beneath it.
+        let mut leaves = 0;
+        for side in [left, right] {
+            match side {
+                Some(entry) if entry.is_tree() => {
+                    let mut sub = SubtreeDiff::default();
+                    pruned_subtree_diff(source, path, None, Some(entry), &mut sub)?;
+                    leaves += sub.changed_leaves;
+                }
+                Some(_) => leaves += 1,
+                None => {}
+            }
+        }
+        if left.is_some_and(|e| !e.is_tree()) && right.is_some_and(|e| !e.is_tree()) {
+            leaves -= 1; // the same path differing on both sides is ONE change
+        }
+        out.changed_leaves += leaves;
+        return Ok(());
+    }
+    let levels = read_walk_level(source, [left, right, None])?;
+    let mut names: BTreeSet<&String> = BTreeSet::new();
+    names.extend(levels[0].keys());
+    names.extend(levels[1].keys());
+    for name in names {
+        pruned_subtree_diff(
+            source,
+            &path.join(name),
+            levels[0].get(name).copied(),
+            levels[1].get(name).copied(),
+            out,
+        )?;
+    }
+    Ok(())
+}
+
+/// Replace EVERY subtree entry in `items` — adopted from theirs, kept from ours,
+/// or agreed by all three — with its leaves. Used by consumers that need
+/// per-file entries: the conflict path's index lists every file, so this reads
+/// every carried subtree there (the conflict path is O(tree) in reads, like the
+/// checkout on the clean path). The untracked-collision check passes only the
+/// colliding subtrees, so it reads just those.
+fn expand_adopted_subtrees(
+    source: &mut dyn TreeSource,
+    items: &mut HashMap<PathBuf, MergeTreeEntry>,
+) -> Result<(), PullMergeError> {
+    let subtrees: Vec<(PathBuf, ObjectHash)> = items
+        .iter()
+        .filter(|(_, entry)| entry.mode == TreeItemMode::Tree)
+        .map(|(path, entry)| (path.clone(), entry.hash))
+        .collect();
+    for (dir, id) in subtrees {
+        items.remove(&dir);
+        let mut stack = vec![(dir, id)];
+        while let Some((prefix, tree_id)) = stack.pop() {
+            let tree = source.tree(&tree_id)?;
+            for item in &tree.tree_items {
+                let path = prefix.join(&item.name);
+                if item.mode == TreeItemMode::Tree {
+                    stack.push((path, item.id));
+                } else {
+                    items.insert(
+                        path,
+                        MergeTreeEntry {
+                            hash: item.id,
+                            mode: item.mode,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether the incremental walk is in effect. Production: always. Tests may
+/// force the flattening path with `LIBRA_TEST=1` plus
+/// `LIBRA_TEST_MERGE_TREE_WALK=flat` — the same sentinel-gated failpoint shape
+/// `am` and `stash` use — which is how the two paths are compared (G3/G4).
+fn incremental_tree_walk_enabled() -> bool {
+    incremental_tree_walk_enabled_for(
+        std::env::var_os("LIBRA_TEST").as_deref(),
+        std::env::var_os("LIBRA_TEST_MERGE_TREE_WALK").as_deref(),
+    )
+}
+
+/// The pure half of [`incremental_tree_walk_enabled`]: only the exact pair
+/// `LIBRA_TEST=<set>` + `LIBRA_TEST_MERGE_TREE_WALK=flat` selects the flattening
+/// path; anything else — including `flat` WITHOUT the test sentinel — keeps the
+/// incremental walk, so a stray variable can never change a production merge.
+fn incremental_tree_walk_enabled_for(
+    test_sentinel: Option<&std::ffi::OsStr>,
+    walk_mode: Option<&std::ffi::OsStr>,
+) -> bool {
+    !(test_sentinel.is_some() && walk_mode.is_some_and(|mode| mode == "flat"))
+}
+
+/// Test seam (`LIBRA_TEST=1` + `LIBRA_TEST_MERGE_TREE_STATS=<file>`, the same
+/// sentinel shape as the failpoints): record which tree walk the PRODUCTION
+/// merge took and how many tree objects the whole merge read from the object
+/// store — the preflight gate's pass AND the engine's pass (each has its own
+/// per-pass cache, so the changed-path set is read once per pass) — so the
+/// pruning guarantees can be asserted through the CLI rather than only on an
+/// in-memory graph. Written at each EXIT of the incremental engine, after its
+/// last source-backed consumer (the untracked-collision rechecks, the
+/// conflict-path expansion, the preview's availability probe). Inert without
+/// both variables; a failure to write the file is ignored (it is evidence,
+/// never behaviour).
+fn report_incremental_walk_stats() {
+    report_tree_walk_stats(
+        "incremental",
+        Some(MERGE_TREE_STORE_READS.load(std::sync::atomic::Ordering::Relaxed)),
+    );
+}
+
+fn report_tree_walk_stats(walk: &str, tree_reads: Option<usize>) {
+    if std::env::var_os("LIBRA_TEST").is_none() {
+        return;
+    }
+    let Some(path) = std::env::var_os("LIBRA_TEST_MERGE_TREE_STATS") else {
+        return;
+    };
+    let stats = serde_json::json!({ "walk": walk, "tree_reads": tree_reads });
+    let _ = fs::write(path, stats.to_string());
+}
+
+/// Run the incremental walk over three root trees, gate first.
+///
+/// **Unopened-tree invariant.** Every tree object the result references but
+/// this function never opened is already referenced by `ours` (HEAD). Proof:
+/// the gate recurses into every directory the three sides do not all agree
+/// on, so a directory it leaves unopened has the same id on all present sides
+/// — in particular on ours; inside an adopted-from-theirs subtree the same
+/// holds one level down (the gate stopped only where theirs' nested tree equals
+/// base's, and base's equals ours' there). Newly added directories have no
+/// counterpart and are enumerated in full. Consequently the merge can never
+/// introduce an unreadable tree the flattening path would have caught: a
+/// missing tree the walk did not open is pre-existing corruption of the
+/// checked-out commit, failing identically on both paths at checkout. This is
+/// what lets the result carry subtrees by id without a validation pass whose
+/// cost would be the size of the repository (`unopened_trees_are_heads_own`
+/// pins it). Availability — as opposed to ownership — is settled by the
+/// clean path's write ORDER: the checkout, which reads every carried tree,
+/// runs before the commit and HEAD are written. `None` for `base` is the virtual empty tree of
+/// an unrelated-history merge.
+fn incremental_merge_trees(
+    source: &mut dyn TreeSource,
+    base: Option<ObjectHash>,
+    ours: ObjectHash,
+    theirs: ObjectHash,
+    context: &mut TreeMergeContext<'_>,
+) -> Result<(IncrementalMergeResult, GitlinkEntries), PullMergeError> {
+    let root = |id: ObjectHash| WalkEntry {
+        id,
+        mode: TreeItemMode::Tree,
+    };
+    let sides = [base.map(root), Some(root(ours)), Some(root(theirs))];
+    // ADR-MG-01 FIRST, read-only: refuse before the merge walk can persist a
+    // single auto-merged blob. The gate opens exactly the directories the walk
+    // would (those the sides disagree about), so with a caching source the walk
+    // re-reads none of them from the object store.
+    let passthrough = incremental_gitlink_gate(source, &sides)?;
+    let mut out = IncrementalMergeResult {
+        merged: HashMap::new(),
+        conflicts: Vec::new(),
+        changed_paths: 0,
+        adopted_from_theirs: Vec::new(),
+    };
+    incremental_merge_walk(source, Path::new(""), sides, context, &mut out)?;
+    // `files_changed` for adopted subtrees: one pruned diff each, against what
+    // ours had there.
+    let adopted = std::mem::take(&mut out.adopted_from_theirs);
+    for (dir, replaced, adopted_entry) in &adopted {
+        let mut scan = SubtreeDiff::default();
+        pruned_subtree_diff(source, dir, *replaced, Some(*adopted_entry), &mut scan)?;
+        out.changed_paths += scan.changed_leaves;
+    }
+    out.adopted_from_theirs = adopted;
+    Ok((out, passthrough))
+}
+
+/// ADR-MG-01 over three trees WITHOUT flattening them: the read-only gate the
+/// preflight and the engine both run.
+///
+/// Rule (identical to `ensure_gitlinks_not_arbitrated` over the flattened
+/// maps): a gitlink path is arbitrated unless all THREE sides carry the same
+/// pointer there. Reads: a directory the three sides agree on is never opened
+/// (nothing inside can differ); any other directory is opened on every side
+/// that has it — an added or deleted subtree is therefore enumerated in full,
+/// which is exactly the change being merged. Every arbitrated path is
+/// collected and the smallest is reported, as the flattening path does.
+/// Returns the pass-through pointers the gate SAW (a pointer inside an unopened
+/// subtree travels with that subtree and needs no entry).
+fn incremental_gitlink_gate(
+    source: &mut dyn TreeSource,
+    sides: &[Option<WalkEntry>; 3],
+) -> Result<GitlinkEntries, PullMergeError> {
+    let mut arbitrated: Vec<PathBuf> = Vec::new();
+    let mut passthrough = GitlinkEntries::new();
+    gitlink_gate_walk(
+        source,
+        Path::new(""),
+        *sides,
+        &mut arbitrated,
+        &mut passthrough,
+    )?;
+    arbitrated.sort();
+    if let Some(path) = arbitrated.into_iter().next() {
+        return Err(PullMergeError::GitlinkUnsupported(GitlinkNotSupported {
+            operation: "merge",
+            path,
+        }));
+    }
+    Ok(passthrough)
+}
+
+fn gitlink_gate_walk(
+    source: &mut dyn TreeSource,
+    dir: &Path,
+    sides: [Option<WalkEntry>; 3],
+    arbitrated: &mut Vec<PathBuf>,
+    passthrough: &mut GitlinkEntries,
+) -> Result<(), PullMergeError> {
+    if let [Some(b), Some(o), Some(t)] = sides
+        && b == o
+        && o == t
+    {
+        return Ok(());
+    }
+    let levels = read_walk_level(source, sides)?;
+    let mut names: BTreeSet<&String> = BTreeSet::new();
+    for level in &levels {
+        names.extend(level.keys());
+    }
+    for name in names {
+        let path = dir.join(name);
+        let entries = [
+            levels[0].get(name).copied(),
+            levels[1].get(name).copied(),
+            levels[2].get(name).copied(),
+        ];
+        let gitlink = |entry: Option<WalkEntry>| {
+            entry.is_some_and(|entry| entry.mode == TreeItemMode::Commit)
+        };
+        if entries.iter().any(|entry| gitlink(*entry)) {
+            match entries {
+                [Some(b), Some(o), Some(t)] if b == o && o == t => {
+                    passthrough.insert(path, b.id);
+                }
+                _ => arbitrated.push(path),
+            }
+            continue;
+        }
+        let trees = entries.map(|entry| entry.filter(|entry| entry.is_tree()));
+        if trees.iter().any(Option::is_some) {
+            gitlink_gate_walk(source, &path, trees, arbitrated, passthrough)?;
+        }
+    }
+    Ok(())
+}
+
+/// The incremental counterpart of the flattening half of
+/// `perform_three_way_merge`: same gates, same outputs, same writes — only the
+/// tree reads differ.
+async fn perform_incremental_three_way_merge(
+    current_commit: Commit,
+    target_commit: Commit,
+    base_commit: Option<&Commit>,
+    head_name: String,
+    upstream: &str,
+    options: ThreeWayMergeOptions<'_>,
+) -> Result<PullMergeSummary, PullMergeError> {
+    // ROOT trees go through `refs/replace` exactly as the flattening path's
+    // `load_object(&commit.tree_id)` does; nested trees are read raw on both
+    // paths (`Tree::load` there, `load_object_raw` here). Same view, same ids.
+    let base_tree = base_commit.map(|base| super::replace::resolve(base.tree_id));
+    // The single real base is recorded in the merge state exactly as the
+    // flattening path records it (`recorded_merge_base`); `None` is the
+    // unrelated-history virtual empty base.
+    let recorded_base = base_commit.map(|base| base.id);
+    let ours_tree = super::replace::resolve(current_commit.tree_id);
+    let theirs_tree = super::replace::resolve(target_commit.tree_id);
+    let mut source = ObjectStoreTrees::new();
+    let mut virtual_blobs = VirtualBlobs::new();
+    let (walk, passthrough_gitlinks) = incremental_merge_trees(
+        &mut source,
+        base_tree,
+        ours_tree,
+        theirs_tree,
+        &mut TreeMergeContext::top_level(!options.dry_run, options.favor, &mut virtual_blobs),
+    )?;
+    let files_changed = walk.changed_paths;
+    let introduced: HashSet<PathBuf> = walk
+        .adopted_from_theirs
+        .iter()
+        .map(|(dir, _, _)| dir.clone())
+        .collect();
+    let mut merged_items = walk.merged;
+    let conflicts = walk.conflicts;
+
+    if options.dry_run {
+        // A real merge's checkout reads every tree the result carries and
+        // fails on a missing one before it writes anything; a preview has no
+        // checkout, so it probes those trees itself (read-only, through the
+        // caching source — the trees the walk opened cost nothing more). This
+        // is what keeps the preview's verdict equal to the real merge's, at the
+        // read cost the flattening preview always paid.
+        // Seen the way the REAL merge would see them. A clean merge checks out
+        // the result, and the checkout resolves `refs/replace` on nested trees
+        // (`reset::rebuild_index_from_tree` uses `load_object`) — so a clean
+        // preview probes through a fresh replacement-aware source. A
+        // CONFLICTED merge never checks out: it expands the carried subtrees
+        // through the walk's own raw source to write the conflict state — so a
+        // conflicted preview probes through that same raw source. Either way
+        // the preview fails exactly where the real merge would, and passes
+        // where it would.
+        if conflicts.is_empty() {
+            let mut checkout_view = ObjectStoreTrees::as_checkout_sees_them();
+            probe_carried_trees_readable(&mut checkout_view, &merged_items)?;
+        } else {
+            probe_carried_trees_readable(&mut source, &merged_items)?;
+        }
+        report_incremental_walk_stats();
+        let conflicted_paths: Vec<String> = conflicts
+            .iter()
+            .map(|(path, _)| path.display().to_string())
+            .collect();
+        let would_conflict = !conflicted_paths.is_empty();
+        return Ok(PullMergeSummary {
+            strategy: "three-way".to_string(),
+            old_commit: Some(current_commit.id.to_string()),
+            commit: None,
+            files_changed,
+            up_to_date: false,
+            parents: Vec::new(),
+            conflicted_paths,
+            aborted: false,
+            continued: false,
+            dry_run: true,
+            would_conflict,
+            autostash: None,
+        });
+    }
+
+    let resolved_message = resolve_merge_message(
+        current_commit.id,
+        target_commit.id,
+        upstream,
+        &head_name,
+        options.message_override.as_ref(),
+        options.merge_log,
+    )?;
+
+    if !conflicts.is_empty() {
+        // The conflict path writes per-file index entries and worktree files,
+        // so EVERY carried subtree is expanded here — the conflicted index
+        // lists every file. Reads here are O(tree), as the flattening path's
+        // were; the pruning pays off on the decision and on the clean path.
+        expand_adopted_subtrees(&mut source, &mut merged_items)?;
+        let conflict_style = conflict_style_from_config().await.map_err(|e| match e {
+            ConflictStyleError::Invalid(value) => PullMergeError::InvalidConflictStyle(value),
+            ConflictStyleError::Read(detail) => PullMergeError::ConflictStyleRead(detail),
+        })?;
+        let (base_items, _) = match base_tree {
+            Some(id) => split_gitlink_entries(tree_leaves(&mut source, id)?),
+            None => (HashMap::new(), GitlinkEntries::new()),
+        };
+        // The SAME resolved roots the walk merged, so the stage-2/stage-3
+        // entries name what was actually merged (a replaced root included).
+        let (our_items, _) = split_gitlink_entries(tree_leaves(&mut source, ours_tree)?);
+        let (their_items, _) = split_gitlink_entries(tree_leaves(&mut source, theirs_tree)?);
+        report_incremental_walk_stats();
+        write_conflicted_merge_state(MergeConflictInput {
+            head_name,
+            message: resolved_message,
+            upstream: upstream.to_string(),
+            base: recorded_base,
+            allow_unrelated_histories: options.allow_unrelated_histories,
+            skip_hooks: options.skip_hooks,
+            ours: current_commit.id,
+            theirs: target_commit.id,
+            merged_items,
+            conflicts,
+            base_items,
+            our_items,
+            their_items,
+            conflict_style,
+        })?;
+        if let Err(error) = crate::command::rerere::auto_update(false).await {
+            tracing::warn!("rerere auto-update after merge conflict failed: {error}");
+        }
+        let paths = MergeState::load_required()?.conflicted_paths.join(", ");
+        return Err(PullMergeError::Conflicts { paths });
+    }
+
+    let current_index =
+        Index::load(path::index()).map_err(|error| PullMergeError::IndexLoad(error.to_string()))?;
+    let gitlink_paths: Vec<PathBuf> = passthrough_gitlinks.keys().cloned().collect();
+    // Untracked-collision check. The flattening path hands
+    // `ensure_no_untracked_conflicts` every leaf; here an adopted subtree is
+    // expanded only when an untracked path collides with it (Git's
+    // `paths_conflict`, both directions), so the common case reads nothing
+    // more. Recomputed from the CURRENT untracked set at every check point — a
+    // hook below may create files after this first pass.
+    ensure_no_untracked_conflicts(
+        &current_index,
+        &adopted_aware_write_paths(&mut source, &merged_items, &introduced, &current_index)?,
+        &gitlink_paths,
+    )?;
+
+    // No readability pass over adopted subtrees here — see the invariant on
+    // `incremental_merge_trees`: every tree the walk left unopened is one HEAD
+    // already references, so the result cannot introduce an unreadable tree
+    // the flattening path would have caught; the gate has already opened (and
+    // therefore validated) every tree the merge newly brings in.
+    let tree_id = create_tree_from_items_map(&merged_items).map_err(PullMergeError::TreeCreate)?;
+
+    if options.squash {
+        report_incremental_walk_stats();
+        reset_index_and_workdir_to_tree(&tree_id)?;
+        return Ok(PullMergeSummary {
+            strategy: "squash".to_string(),
+            old_commit: Some(current_commit.id.to_string()),
+            commit: None,
+            files_changed,
+            up_to_date: false,
+            parents: Vec::new(),
+            conflicted_paths: Vec::new(),
+            aborted: false,
+            continued: false,
+            dry_run: false,
+            would_conflict: false,
+            autostash: None,
+        });
+    }
+
+    if options.no_commit {
+        report_incremental_walk_stats();
+        reset_index_and_workdir_to_tree(&tree_id)?;
+        MergeState {
+            head_name: head_name.clone(),
+            orig_head: current_commit.id.to_string(),
+            target: target_commit.id.to_string(),
+            target_ref: upstream.to_string(),
+            base: recorded_base.map(|base| base.to_string()),
+            strategy: None,
+            allow_unrelated_histories: options.allow_unrelated_histories,
+            skip_hooks: options.skip_hooks,
+            conflicted_paths: Vec::new(),
+            message: Some(resolved_message.clone()),
+        }
+        .save()?;
+        return Ok(PullMergeSummary {
+            strategy: "no-commit".to_string(),
+            old_commit: Some(current_commit.id.to_string()),
+            commit: None,
+            files_changed,
+            up_to_date: false,
+            parents: vec![current_commit.id.to_string(), target_commit.id.to_string()],
+            conflicted_paths: Vec::new(),
+            aborted: false,
+            continued: false,
+            dry_run: false,
+            would_conflict: false,
+            autostash: None,
+        });
+    }
+
+    let message = if !options.skip_hooks {
+        run_pre_merge_commit_hook(options.output).await?;
+        switch::ensure_clean_status(options.output)
+            .await
+            .map_err(|_| PullMergeError::DirtyWorktree)?;
+        // The hook may have created an untracked path — under an adopted
+        // subtree included — after the first check: recompute, do not reuse.
+        ensure_no_untracked_conflicts(
+            &current_index,
+            &adopted_aware_write_paths(&mut source, &merged_items, &introduced, &current_index)?,
+            &gitlink_paths,
+        )?;
+        let message = run_merge_message_hooks(&resolved_message, options.output).await?;
+        switch::ensure_clean_status(options.output)
+            .await
+            .map_err(|_| PullMergeError::DirtyWorktree)?;
+        ensure_no_untracked_conflicts(
+            &current_index,
+            &adopted_aware_write_paths(&mut source, &merged_items, &introduced, &current_index)?,
+            &gitlink_paths,
+        )?;
+        message
+    } else {
+        resolved_message
+    };
+    let merge_commit = build_merge_commit(
+        tree_id,
+        vec![current_commit.id, target_commit.id],
+        &format_commit_msg(&message, None),
+    )
+    .await?;
+    report_incremental_walk_stats();
+    // Check out the result BEFORE the commit and HEAD are written. The
+    // checkout rebuilds the index from the result tree and so reads every tree
+    // and blob it carries — it is the one full read the merge cannot avoid, and
+    // doing it first makes it the validation the flattening path got for free
+    // from flattening: a tree or blob the result names but the store lacks
+    // fails here, with HEAD, the index and the working tree untouched
+    // (`rebuild_index_from_tree` loads everything before the index is saved).
+    // The flattening path writes the commit and HEAD first; its crash window
+    // leaves HEAD moved and the tree not checked out. This order's window
+    // leaves the merge result checked out and staged under the OLD HEAD, with
+    // no merge state — visible as staged changes, recoverable by committing or
+    // resetting. Git writes index/worktree first as well.
+    reset_index_and_workdir_to_tree(&tree_id)?;
+    save_object(&merge_commit, &merge_commit.id)
+        .map_err(|error| PullMergeError::CommitSave(error.to_string()))?;
+    update_head_with_reflog(&head_name, merge_commit.id, upstream, "three-way").await?;
+    if !options.skip_hooks {
+        run_advisory_repo_hook(RepoHook::PostCommit, &[], None, options.output).await;
+    }
+
+    Ok(PullMergeSummary {
+        strategy: "three-way".to_string(),
+        old_commit: Some(current_commit.id.to_string()),
+        commit: Some(merge_commit.id.to_string()),
+        files_changed,
+        up_to_date: false,
+        parents: vec![current_commit.id.to_string(), target_commit.id.to_string()],
+        conflicted_paths: Vec::new(),
+        aborted: false,
+        continued: false,
+        dry_run: false,
+        would_conflict: false,
+        autostash: None,
+    })
+}
+
+/// Read-only availability probe for `--dry-run`: load every tree the result
+/// carries by id, the way the checkout will (replacement-aware source), failing
+/// with [`PullMergeError::TreeLoad`] where the checkout would fail. Trees only
+/// — the checkout is what reads blobs. Costs the carried trees once, which is
+/// what the flattening preview read anyway.
+fn probe_carried_trees_readable(
+    source: &mut dyn TreeSource,
+    merged: &HashMap<PathBuf, MergeTreeEntry>,
+) -> Result<(), PullMergeError> {
+    let mut stack: Vec<ObjectHash> = merged
+        .values()
+        .filter(|entry| entry.mode == TreeItemMode::Tree)
+        .map(|entry| entry.hash)
+        .collect();
+    while let Some(id) = stack.pop() {
+        let tree = source.tree(&id)?;
+        stack.extend(
+            tree.tree_items
+                .iter()
+                .filter(|item| item.mode == TreeItemMode::Tree)
+                .map(|item| item.id),
+        );
+    }
+    Ok(())
+}
+
+/// The leaf paths the merge result will write, for the untracked-collision
+/// check: every leaf in `merged`, plus the leaves of any result-INTRODUCING
+/// subtree (`introduced`: adopted from theirs or added by theirs) that an
+/// untracked path currently collides with (`paths_conflict`, both directions).
+/// A subtree nothing collides with — or one ours already had — is not
+/// expanded: nothing under it can be overwritten, and expanding it would read
+/// for no reason. Recomputed at every check point, so a file a hook created in
+/// between is seen.
+fn adopted_aware_write_paths(
+    source: &mut dyn TreeSource,
+    merged: &HashMap<PathBuf, MergeTreeEntry>,
+    introduced: &HashSet<PathBuf>,
+    current_index: &Index,
+) -> Result<Vec<PathBuf>, PullMergeError> {
+    let untracked =
+        worktree::untracked_workdir_paths(current_index).map_err(PullMergeError::IndexLoad)?;
+    let mut check_items = merged.clone();
+    // Only subtrees the RESULT introduces (adopted from theirs, or added by
+    // theirs) can write anything the working tree does not already track; a
+    // subtree ours already had (agreed by all three, or ours' own) changes no
+    // file, so an untracked path beneath it is not overwritten and there is
+    // nothing to expand — which keeps a huge unchanged subtree unopened even
+    // when the working tree has untracked files under it.
+    let colliding: Vec<PathBuf> = check_items
+        .iter()
+        .filter(|(dir, entry)| {
+            entry.mode == TreeItemMode::Tree
+                && introduced.contains(*dir)
+                && untracked
+                    .iter()
+                    .any(|path| worktree::paths_conflict(path, dir))
+        })
+        .map(|(dir, _)| dir.clone())
+        .collect();
+    if !colliding.is_empty() {
+        let mut only: HashMap<PathBuf, MergeTreeEntry> = colliding
+            .iter()
+            .filter_map(|dir| check_items.remove(dir).map(|entry| (dir.clone(), entry)))
+            .collect();
+        expand_adopted_subtrees(source, &mut only)?;
+        check_items.extend(only);
+    }
+    check_items.retain(|_, entry| entry.mode != TreeItemMode::Tree);
+    Ok(worktree_paths_to_write(&check_items))
+}
+
+/// Every leaf of `root` as `(path, id, mode)`, through the walk's source.
+fn tree_leaves(
+    source: &mut dyn TreeSource,
+    root: ObjectHash,
+) -> Result<Vec<(PathBuf, ObjectHash, TreeItemMode)>, PullMergeError> {
+    let mut leaves = Vec::new();
+    let mut stack = vec![(PathBuf::new(), root)];
+    while let Some((prefix, id)) = stack.pop() {
+        let tree = source.tree(&id)?;
+        for item in &tree.tree_items {
+            let path = prefix.join(&item.name);
+            if item.mode == TreeItemMode::Tree {
+                stack.push((path, item.id));
+            } else {
+                leaves.push((path, item.id, item.mode));
+            }
+        }
+    }
+    Ok(leaves)
+}
+
 fn merge_tree_items(
     base_items: &HashMap<PathBuf, MergeTreeEntry>,
     our_items: &HashMap<PathBuf, MergeTreeEntry>,
@@ -5785,6 +6791,754 @@ mod recursive {
             recorded_merge_base(&[one, two]),
             None,
             "a criss-cross merge's base is virtual and must not be rooted"
+        );
+    }
+}
+
+/// MG-03: the incremental (directory-pruning) tree merge.
+///
+/// Every test runs against an in-memory [`TreeSource`] that COUNTS reads, so the
+/// pruning guarantees are measured rather than assumed, and against the
+/// flattening path on the same trees, so the two paths are proven to decide the
+/// same thing.
+#[cfg(test)]
+mod tree {
+    use std::{
+        collections::{HashMap, HashSet},
+        path::{Path, PathBuf},
+    };
+
+    use git_internal::{
+        hash::ObjectHash,
+        internal::object::{
+            ObjectTrait,
+            tree::{Tree, TreeItem, TreeItemMode},
+        },
+    };
+
+    use super::{
+        GitlinkEntries, IncrementalMergeResult, MergeTreeEntry, PullMergeError, TreeMergeContext,
+        TreeSource, VirtualBlobs, incremental_merge_trees, incremental_tree_walk_enabled_for,
+        merge_tree_items, split_gitlink_entries,
+    };
+
+    /// An in-memory object graph of trees that counts OBJECT-STORE reads the
+    /// way the production `ObjectStoreTrees` incurs them: the first read of an
+    /// id is a read, later ones come from the per-merge cache. (The gate walk
+    /// and the merge walk open the same directories; counting cache hits would
+    /// measure the fixture, not the store.)
+    #[derive(Default)]
+    struct CountingTrees {
+        trees: HashMap<ObjectHash, Tree>,
+        reads: usize,
+        read_ids: Vec<ObjectHash>,
+        seen: HashSet<ObjectHash>,
+    }
+
+    impl TreeSource for CountingTrees {
+        fn tree(&mut self, id: &ObjectHash) -> Result<Tree, PullMergeError> {
+            if self.seen.insert(*id) {
+                self.reads += 1;
+                self.read_ids.push(*id);
+            }
+            self.trees
+                .get(id)
+                .cloned()
+                .ok_or_else(|| PullMergeError::TreeLoad {
+                    tree_id: id.to_string(),
+                    detail: "not in the synthetic graph".to_string(),
+                })
+        }
+    }
+
+    /// A directory described as nested leaves; `Dir` builds the tree objects
+    /// bottom-up into a [`CountingTrees`] and returns the root id.
+    #[derive(Clone)]
+    enum Node {
+        Blob(u8),
+        /// A blob with an arbitrary id (content never loaded).
+        Id(ObjectHash),
+        Exec(u8),
+        Link(u8),
+        Gitlink(u8),
+        Dir(Vec<(String, Node)>),
+    }
+
+    fn blob_id(byte: u8) -> ObjectHash {
+        ObjectHash::new(&[byte; 20])
+    }
+
+    fn build(graph: &mut CountingTrees, node: &Node) -> (ObjectHash, TreeItemMode) {
+        match node {
+            Node::Blob(byte) => (blob_id(*byte), TreeItemMode::Blob),
+            Node::Id(id) => (*id, TreeItemMode::Blob),
+            Node::Exec(byte) => (blob_id(*byte), TreeItemMode::BlobExecutable),
+            Node::Link(byte) => (blob_id(*byte), TreeItemMode::Link),
+            Node::Gitlink(byte) => (blob_id(*byte), TreeItemMode::Commit),
+            Node::Dir(children) => {
+                let items: Vec<TreeItem> = children
+                    .iter()
+                    .map(|(name, child)| {
+                        let (id, mode) = build(graph, child);
+                        TreeItem::new(mode, id, name.clone())
+                    })
+                    .collect();
+                let tree = if items.is_empty() {
+                    let id = ObjectHash::from_type_and_data(
+                        git_internal::internal::object::types::ObjectType::Tree,
+                        &[],
+                    );
+                    Tree::from_bytes(&[], id).expect("empty tree")
+                } else {
+                    Tree::from_tree_items(items).expect("tree")
+                };
+                let id = tree.id;
+                graph.trees.entry(id).or_insert(tree);
+                (id, TreeItemMode::Tree)
+            }
+        }
+    }
+
+    fn dir(children: &[(&str, Node)]) -> Node {
+        Node::Dir(
+            children
+                .iter()
+                .map(|(name, node)| (name.to_string(), node.clone()))
+                .collect(),
+        )
+    }
+
+    /// The flattening path on the same synthetic graph: every leaf of every
+    /// side, through `merge_tree_items`.
+    fn leaves(
+        graph: &mut CountingTrees,
+        root: ObjectHash,
+    ) -> Vec<(PathBuf, ObjectHash, TreeItemMode)> {
+        let mut out = Vec::new();
+        let mut stack = vec![(PathBuf::new(), root)];
+        while let Some((prefix, id)) = stack.pop() {
+            let tree = graph.tree(&id).expect("tree");
+            for item in &tree.tree_items {
+                let path = prefix.join(&item.name);
+                if item.mode == TreeItemMode::Tree {
+                    stack.push((path, item.id));
+                } else {
+                    out.push((path, item.id, item.mode));
+                }
+            }
+        }
+        out
+    }
+
+    /// In-memory content for every fake blob id the fixtures use, so both paths
+    /// run their line-level content merges without an object store.
+    fn fixture_blobs() -> VirtualBlobs {
+        (1..=255u8)
+            .map(|byte| (blob_id(byte), format!("content {byte}\n").into_bytes()))
+            .collect()
+    }
+
+    /// What the flattening path produced: merged leaves, sorted conflict paths,
+    /// pass-through gitlinks.
+    type FlatOutcome = (
+        HashMap<PathBuf, MergeTreeEntry>,
+        Vec<PathBuf>,
+        GitlinkEntries,
+    );
+
+    fn flat_merge(
+        graph: &mut CountingTrees,
+        base: Option<ObjectHash>,
+        ours: ObjectHash,
+        theirs: ObjectHash,
+    ) -> Result<FlatOutcome, PullMergeError> {
+        let (base_items, base_gl) = match base {
+            Some(id) => split_gitlink_entries(leaves(graph, id)),
+            None => (HashMap::new(), GitlinkEntries::new()),
+        };
+        let (our_items, our_gl) = split_gitlink_entries(leaves(graph, ours));
+        let (their_items, their_gl) = split_gitlink_entries(leaves(graph, theirs));
+        let passthrough =
+            super::ensure_gitlinks_not_arbitrated("merge", &base_gl, &our_gl, &their_gl)
+                .map_err(PullMergeError::GitlinkUnsupported)?;
+        let mut blobs = fixture_blobs();
+        let result = merge_tree_items(
+            &base_items,
+            &our_items,
+            &their_items,
+            &mut TreeMergeContext::top_level(false, None, &mut blobs),
+        )?;
+        let mut conflicts: Vec<PathBuf> = result.conflicts.into_iter().map(|(p, _)| p).collect();
+        conflicts.sort();
+        Ok((result.merged_items, conflicts, passthrough))
+    }
+
+    fn incremental(
+        graph: &mut CountingTrees,
+        base: Option<ObjectHash>,
+        ours: ObjectHash,
+        theirs: ObjectHash,
+    ) -> Result<(IncrementalMergeResult, GitlinkEntries), PullMergeError> {
+        let mut blobs = fixture_blobs();
+        incremental_merge_trees(
+            graph,
+            base,
+            ours,
+            theirs,
+            &mut TreeMergeContext::top_level(false, None, &mut blobs),
+        )
+    }
+
+    /// Expand adopted subtrees so the two paths' results can be compared leaf
+    /// for leaf.
+    fn expanded(
+        graph: &mut CountingTrees,
+        mut merged: HashMap<PathBuf, MergeTreeEntry>,
+    ) -> HashMap<PathBuf, MergeTreeEntry> {
+        super::expand_adopted_subtrees(graph, &mut merged).expect("expand");
+        merged
+    }
+
+    /// A deep subtree shared by base, ours and theirs, plus one file each side
+    /// touches somewhere else.
+    fn deep(byte: u8) -> Node {
+        dir(&[(
+            "level1",
+            dir(&[(
+                "level2",
+                dir(&[("level3", dir(&[("leaf.txt", Node::Blob(byte))]))]),
+            )]),
+        )])
+    }
+
+    /// G1 + G2: a subtree that equals the base on one side is adopted from the
+    /// other side WITHOUT opening it — no tree object inside it is read, hence
+    /// no blob inside it can be. Here `shared/` is identical on all three sides
+    /// and `moved/` equals the base on ours while theirs rewrote a leaf deep
+    /// inside: the walk must open neither `shared/` nor ours' `moved/`.
+    #[test]
+    fn pruned_subtrees_are_not_read() {
+        let mut graph = CountingTrees::default();
+        let shared = deep(1);
+        let (base, _) = build(
+            &mut graph,
+            &dir(&[
+                ("shared", shared.clone()),
+                ("moved", deep(2)),
+                ("top.txt", Node::Blob(3)),
+            ]),
+        );
+        let (ours, _) = build(
+            &mut graph,
+            &dir(&[
+                ("shared", shared.clone()),
+                ("moved", deep(2)),
+                ("top.txt", Node::Blob(4)),
+            ]),
+        );
+        let (theirs, _) = build(
+            &mut graph,
+            &dir(&[
+                ("shared", shared),
+                ("moved", deep(5)),
+                ("top.txt", Node::Blob(3)),
+            ]),
+        );
+        let shared_trees: HashSet<ObjectHash> = {
+            let mut g = CountingTrees::default();
+            build(&mut g, &deep(1));
+            g.trees.keys().copied().collect()
+        };
+        let ours_moved_trees: HashSet<ObjectHash> = {
+            let mut g = CountingTrees::default();
+            build(&mut g, &deep(2));
+            g.trees.keys().copied().collect()
+        };
+
+        graph.reads = 0;
+        graph.read_ids.clear();
+        graph.seen.clear();
+        let (result, _) = incremental(&mut graph, Some(base), ours, theirs).expect("merge");
+
+        assert!(
+            !graph.read_ids.iter().any(|id| shared_trees.contains(id)),
+            "a subtree all three sides agree on is never opened: {:?}",
+            graph.read_ids
+        );
+        // The adopted subtree costs the gate (and the pruned files_changed diff,
+        // which hits the cache) one read per side per differing level — `moved/
+        // level1/level2/level3` differs at every level here, so four levels on
+        // two distinct sides — and never the shared `shared/` subtree.
+        assert_eq!(
+            result.merged.get(Path::new("top.txt")),
+            Some(&MergeTreeEntry {
+                hash: blob_id(4),
+                mode: TreeItemMode::Blob
+            }),
+            "ours changed top.txt, theirs did not"
+        );
+        assert_eq!(
+            result.changed_paths, 1,
+            "exactly moved/…/leaf.txt changed relative to ours"
+        );
+        // Three roots + moved on both differing sides down four levels = 3 + 8.
+        assert!(
+            graph.reads <= 3 + 8,
+            "reads are confined to the roots and the differing path: {} reads of {:?}",
+            graph.reads,
+            graph.read_ids
+        );
+        assert!(
+            graph
+                .read_ids
+                .iter()
+                .filter(|id| ours_moved_trees.contains(id))
+                .count()
+                <= 4,
+            "ours' copy of moved/ is opened at most once per differing level (the pruned diff), \
+             never re-read: {:?}",
+            graph.read_ids
+        );
+    }
+
+    /// When theirs equals the base and ours changed a deep leaf, ours' subtree is
+    /// the result — adopted verbatim, so the MERGE walk opens nothing under
+    /// `moved/` (there is nothing to count: the result IS ours). What does open
+    /// it is the ADR-MG-01 gate, which must look along the changed chain on both
+    /// sides for a pointer ours could have added or moved: one read per
+    /// differing level per distinct tree, never more (the walk hits the cache).
+    /// No blob is read anywhere.
+    #[test]
+    fn a_subtree_only_we_changed_is_adopted_with_only_the_gates_reads() {
+        let mut graph = CountingTrees::default();
+        let (base, _) = build(
+            &mut graph,
+            &dir(&[("moved", deep(2)), ("top.txt", Node::Blob(3))]),
+        );
+        let (ours, _) = build(
+            &mut graph,
+            &dir(&[("moved", deep(5)), ("top.txt", Node::Blob(3))]),
+        );
+        let (theirs, _) = build(
+            &mut graph,
+            &dir(&[("moved", deep(2)), ("top.txt", Node::Blob(9))]),
+        );
+        graph.reads = 0;
+        graph.read_ids.clear();
+        graph.seen.clear();
+        let (result, _) = incremental(&mut graph, Some(base), ours, theirs).expect("merge");
+        // Roots: 3 distinct. `moved/` chain: base's copy (== theirs') and ours'
+        // copy, four levels each, opened once by the gate = 8.
+        assert_eq!(
+            graph.reads,
+            3 + 8,
+            "roots plus one read per side per differing level, nothing else: {:?}",
+            graph.read_ids
+        );
+        assert!(
+            matches!(result.merged.get(Path::new("moved")), Some(entry) if entry.mode == TreeItemMode::Tree),
+            "moved/ is adopted as a whole subtree"
+        );
+        assert_eq!(
+            result.changed_paths, 1,
+            "top.txt is the only path that differs from ours"
+        );
+    }
+
+    /// G3: the two paths decide every leaf identically — merged entries and the
+    /// conflict set — across the shapes that matter: unchanged, one-sided,
+    /// same-change, add/add, modify/delete, mode-only, symlink, and a
+    /// directory replaced by a file.
+    #[test]
+    fn incremental_and_flattening_paths_agree() {
+        let mut graph = CountingTrees::default();
+        let (base, _) = build(
+            &mut graph,
+            &dir(&[
+                ("same", deep(1)),
+                (
+                    "ours_only",
+                    dir(&[("a.txt", Node::Blob(2)), ("b.txt", Node::Blob(3))]),
+                ),
+                ("theirs_only", dir(&[("c.txt", Node::Blob(4))])),
+                ("both_same", dir(&[("d.txt", Node::Blob(5))])),
+                ("conflict.txt", Node::Blob(6)),
+                ("mode.txt", Node::Blob(7)),
+                ("link", Node::Link(8)),
+                ("gone_dir", dir(&[("x.txt", Node::Blob(9))])),
+                ("del_mod.txt", Node::Blob(10)),
+            ]),
+        );
+        let (ours, _) = build(
+            &mut graph,
+            &dir(&[
+                ("same", deep(1)),
+                (
+                    "ours_only",
+                    dir(&[("a.txt", Node::Blob(20)), ("b.txt", Node::Blob(3))]),
+                ),
+                ("theirs_only", dir(&[("c.txt", Node::Blob(4))])),
+                ("both_same", dir(&[("d.txt", Node::Blob(50))])),
+                ("conflict.txt", Node::Blob(60)),
+                ("mode.txt", Node::Exec(7)),
+                ("link", Node::Link(80)),
+                ("gone_dir", Node::Blob(90)),
+                ("added.txt", Node::Blob(11)),
+            ]),
+        );
+        let (theirs, _) = build(
+            &mut graph,
+            &dir(&[
+                ("same", deep(1)),
+                (
+                    "ours_only",
+                    dir(&[("a.txt", Node::Blob(2)), ("b.txt", Node::Blob(3))]),
+                ),
+                (
+                    "theirs_only",
+                    dir(&[("c.txt", Node::Blob(40)), ("new.txt", Node::Blob(41))]),
+                ),
+                ("both_same", dir(&[("d.txt", Node::Blob(50))])),
+                ("conflict.txt", Node::Blob(61)),
+                ("mode.txt", Node::Blob(7)),
+                ("link", Node::Link(8)),
+                ("gone_dir", dir(&[("x.txt", Node::Blob(9))])),
+                ("del_mod.txt", Node::Blob(100)),
+                ("added.txt", Node::Blob(12)),
+                // An EMPTY directory inside a subtree theirs added: the flattening
+                // path has no leaf to emit for it; the incremental path adopts the
+                // subtree verbatim (empty tree and all). Leaves agree; the written
+                // tree ids may not — Git's own "adopt as-is" semantics, documented
+                // as the one known difference (G3 is leaf-level).
+                (
+                    "theirs_added",
+                    dir(&[("empty", dir(&[])), ("z.txt", Node::Blob(13))]),
+                ),
+            ]),
+        );
+
+        let (flat_merged, flat_conflicts, _) =
+            flat_merge(&mut graph, Some(base), ours, theirs).expect("flat");
+        let (walk, _) = incremental(&mut graph, Some(base), ours, theirs).expect("incremental");
+        let mut walk_conflicts: Vec<PathBuf> =
+            walk.conflicts.iter().map(|(p, _)| p.clone()).collect();
+        walk_conflicts.sort();
+        assert_eq!(walk_conflicts, flat_conflicts, "same conflict set");
+        let walk_merged = expanded(&mut graph, walk.merged);
+        assert_eq!(walk_merged, flat_merged, "same resolution for every leaf");
+        assert_eq!(
+            walk.changed_paths,
+            super::count_item_map_changes(
+                &split_gitlink_entries(leaves(&mut graph, ours)).0,
+                &flat_merged
+            ),
+            "same files_changed"
+        );
+        assert!(flat_conflicts.contains(&PathBuf::from("conflict.txt")));
+        assert!(flat_conflicts.contains(&PathBuf::from("del_mod.txt")));
+    }
+
+    /// No base (unrelated histories): the empty virtual base gives the same
+    /// answers on both paths, including the add/add conflict.
+    #[test]
+    fn incremental_and_flattening_paths_agree_without_a_base() {
+        let mut graph = CountingTrees::default();
+        let (ours, _) = build(
+            &mut graph,
+            &dir(&[
+                ("a.txt", Node::Blob(1)),
+                ("both.txt", Node::Blob(2)),
+                ("d", deep(3)),
+            ]),
+        );
+        let (theirs, _) = build(
+            &mut graph,
+            &dir(&[
+                ("b.txt", Node::Blob(4)),
+                ("both.txt", Node::Blob(5)),
+                ("d", deep(3)),
+            ]),
+        );
+        let (flat_merged, flat_conflicts, _) =
+            flat_merge(&mut graph, None, ours, theirs).expect("flat");
+        let (walk, _) = incremental(&mut graph, None, ours, theirs).expect("incremental");
+        let mut walk_conflicts: Vec<PathBuf> =
+            walk.conflicts.iter().map(|(p, _)| p.clone()).collect();
+        walk_conflicts.sort();
+        assert_eq!(walk_conflicts, flat_conflicts);
+        assert_eq!(expanded(&mut graph, walk.merged), flat_merged);
+        assert_eq!(flat_conflicts, vec![PathBuf::from("both.txt")]);
+    }
+
+    /// The unopened-tree invariant `incremental_merge_trees` relies on instead
+    /// of a validation pass: every `Tree` entry the result carries by id that
+    /// the walk never opened is a tree `ours` already references. Checked on
+    /// the shape with the most unopened trees — a large shared subtree, an
+    /// adopted-from-theirs subtree with unchanged nested parts, and a
+    /// theirs-added subtree (which the gate enumerates in full).
+    #[test]
+    fn unopened_trees_are_heads_own() {
+        let mut graph = CountingTrees::default();
+        let shared = deep(1);
+        let nested_unchanged = deep(7);
+        let (base, _) = build(
+            &mut graph,
+            &dir(&[
+                ("shared", shared.clone()),
+                (
+                    "moved",
+                    dir(&[("keep", nested_unchanged.clone()), ("x.txt", Node::Blob(2))]),
+                ),
+            ]),
+        );
+        let ours = base;
+        let (theirs, _) = build(
+            &mut graph,
+            &dir(&[
+                ("shared", shared),
+                (
+                    "moved",
+                    dir(&[("keep", nested_unchanged), ("x.txt", Node::Blob(3))]),
+                ),
+                ("added", deep(9)),
+            ]),
+        );
+        let ours_trees: HashSet<ObjectHash> = {
+            let mut g = CountingTrees::default();
+            let (root, _) = build(
+                &mut g,
+                &dir(&[
+                    ("shared", deep(1)),
+                    ("moved", dir(&[("keep", deep(7)), ("x.txt", Node::Blob(2))])),
+                ]),
+            );
+            assert_eq!(root, ours);
+            g.trees.keys().copied().collect()
+        };
+        graph.reads = 0;
+        graph.read_ids.clear();
+        graph.seen.clear();
+        let (walk, _) = incremental(&mut graph, Some(base), ours, theirs).expect("merge");
+        let opened: HashSet<ObjectHash> = graph.read_ids.iter().copied().collect();
+        // Every subtree carried by id: expand ITS tree closure from the fixture
+        // graph and check each tree the walk did not open is one of ours'.
+        let mut stack: Vec<ObjectHash> = walk
+            .merged
+            .values()
+            .filter(|e| e.mode == TreeItemMode::Tree)
+            .map(|e| e.hash)
+            .collect();
+        assert!(!stack.is_empty(), "the fixture carries subtrees by id");
+        let mut unopened = 0;
+        while let Some(id) = stack.pop() {
+            if !opened.contains(&id) {
+                unopened += 1;
+                assert!(
+                    ours_trees.contains(&id),
+                    "an unopened carried tree must already be referenced by ours: {id}"
+                );
+            }
+            let tree = graph.trees.get(&id).expect("fixture tree");
+            stack.extend(
+                tree.tree_items
+                    .iter()
+                    .filter(|i| i.mode == TreeItemMode::Tree)
+                    .map(|i| i.id),
+            );
+        }
+        assert!(
+            unopened > 0,
+            "the shape really leaves trees unopened (shared/, moved/keep/)"
+        );
+        assert_eq!(
+            walk.changed_paths,
+            1 + 1,
+            "moved/x.txt and added/…/leaf.txt"
+        );
+    }
+
+    /// G4: the flattening path is selectable only by the exact test-sentinel pair.
+    #[test]
+    fn flat_walk_switch_requires_the_test_sentinel() {
+        use std::ffi::OsStr;
+        assert!(incremental_tree_walk_enabled_for(None, None));
+        assert!(
+            incremental_tree_walk_enabled_for(None, Some(OsStr::new("flat"))),
+            "no sentinel: production walk"
+        );
+        assert!(incremental_tree_walk_enabled_for(
+            Some(OsStr::new("1")),
+            Some(OsStr::new("tree"))
+        ));
+        assert!(!incremental_tree_walk_enabled_for(
+            Some(OsStr::new("1")),
+            Some(OsStr::new("flat"))
+        ));
+    }
+
+    /// G9 + G10 on the pruning path: a gitlink hidden inside an adopted subtree
+    /// that theirs CHANGED is arbitration and fails closed even though the walk
+    /// never visited it; one inside a subtree all three sides share passes
+    /// through untouched, unvisited.
+    #[test]
+    fn gitlinks_inside_pruned_subtrees_follow_adr_mg_01() {
+        // Pass-through: identical everywhere, buried, never opened.
+        let mut graph = CountingTrees::default();
+        let sub = dir(&[("vendor", dir(&[("lib", Node::Gitlink(1))]))]);
+        let (base, _) = build(
+            &mut graph,
+            &dir(&[("deps", sub.clone()), ("f.txt", Node::Blob(2))]),
+        );
+        let (ours, _) = build(
+            &mut graph,
+            &dir(&[("deps", sub.clone()), ("f.txt", Node::Blob(3))]),
+        );
+        let (theirs, _) = build(&mut graph, &dir(&[("deps", sub), ("f.txt", Node::Blob(2))]));
+        graph.reads = 0;
+        let (walk, passthrough) = incremental(&mut graph, Some(base), ours, theirs).expect("merge");
+        assert_eq!(
+            graph.reads, 2,
+            "only the two distinct root trees are opened (base and theirs are the same \
+             tree), never deps/: {:?}",
+            graph.read_ids
+        );
+        assert!(
+            passthrough.is_empty(),
+            "nothing visited, nothing to pass through explicitly"
+        );
+        assert!(
+            matches!(walk.merged.get(Path::new("deps")), Some(e) if e.mode == TreeItemMode::Tree)
+        );
+
+        // Arbitrated but hidden: ours == base under deps/, theirs moved the pointer.
+        let mut graph = CountingTrees::default();
+        let (base, _) = build(
+            &mut graph,
+            &dir(&[
+                (
+                    "deps",
+                    dir(&[("vendor", dir(&[("lib", Node::Gitlink(1))]))]),
+                ),
+                ("f.txt", Node::Blob(2)),
+            ]),
+        );
+        let (ours, _) = build(
+            &mut graph,
+            &dir(&[
+                (
+                    "deps",
+                    dir(&[("vendor", dir(&[("lib", Node::Gitlink(1))]))]),
+                ),
+                ("f.txt", Node::Blob(2)),
+            ]),
+        );
+        let (theirs, _) = build(
+            &mut graph,
+            &dir(&[
+                (
+                    "deps",
+                    dir(&[("vendor", dir(&[("lib", Node::Gitlink(9))]))]),
+                ),
+                ("f.txt", Node::Blob(2)),
+            ]),
+        );
+        let refused =
+            incremental(&mut graph, Some(base), ours, theirs).expect_err("hidden arbitration");
+        assert!(
+            matches!(&refused, PullMergeError::GitlinkUnsupported(g) if g.path.as_path() == Path::new("deps/vendor/lib")),
+            "{refused}"
+        );
+
+        // Visited arbitration (theirs added a gitlink next to a changed file) is
+        // still refused, exactly as on the flattening path.
+        let mut graph = CountingTrees::default();
+        let (base, _) = build(&mut graph, &dir(&[("f.txt", Node::Blob(2))]));
+        let (ours, _) = build(&mut graph, &dir(&[("f.txt", Node::Blob(3))]));
+        let (theirs, _) = build(
+            &mut graph,
+            &dir(&[("f.txt", Node::Blob(2)), ("sub", Node::Gitlink(1))]),
+        );
+        let refused =
+            incremental(&mut graph, Some(base), ours, theirs).expect_err("visited arbitration");
+        assert!(
+            matches!(&refused, PullMergeError::GitlinkUnsupported(g) if g.path.as_path() == Path::new("sub"))
+        );
+    }
+
+    /// G5 performance budget: a synthetic tree of ~10^5 files with 1% of them
+    /// changed on one side. Reads must scale with the changed paths (their
+    /// depth and their directories' siblings), not with the tree.
+    #[test]
+    fn synthetic_large_tree_reads_scale_with_changes_not_size() {
+        const DIRS: usize = 100;
+        const SUBDIRS: usize = 40;
+        const FILES: usize = 25; // 100 × 40 × 25 = 100_000 files
+        fn tree(changed: &dyn Fn(usize, usize, usize) -> bool) -> Node {
+            let dirs: Vec<(String, Node)> = (0..DIRS)
+                .map(|d| {
+                    let subs: Vec<(String, Node)> = (0..SUBDIRS)
+                        .map(|s| {
+                            let files: Vec<(String, Node)> = (0..FILES)
+                                .map(|f| {
+                                    let mut bytes = [0u8; 20];
+                                    bytes[0] = d as u8;
+                                    bytes[1] = s as u8;
+                                    bytes[2] = f as u8;
+                                    bytes[3] = if changed(d, s, f) { 1 } else { 0 };
+                                    let node = Node::Id(ObjectHash::new(&bytes));
+                                    (format!("f{f}.txt"), node)
+                                })
+                                .collect();
+                            (format!("s{s}"), Node::Dir(files))
+                        })
+                        .collect();
+                    (format!("d{d}"), Node::Dir(subs))
+                })
+                .collect();
+            Node::Dir(dirs)
+        }
+        let mut graph = CountingTrees::default();
+        let (base, _) = build(&mut graph, &tree(&|_, _, _| false));
+        // Ours: untouched. Theirs: 1% of files (every 100th) rewritten — they
+        // fall in 1000 distinct subdirectories across all 100 directories.
+        let (theirs, _) = build(
+            &mut graph,
+            &tree(&|d, s, f| (d * SUBDIRS * FILES + s * FILES + f).is_multiple_of(100)),
+        );
+        let total_trees = graph.trees.len();
+        assert!(
+            total_trees > 4_000,
+            "the fixture really is large: {total_trees} trees"
+        );
+
+        graph.reads = 0;
+        graph.seen.clear();
+        let (walk, _) = incremental(&mut graph, Some(base), base, theirs).expect("merge");
+        let changed_files = DIRS * SUBDIRS * FILES / 100;
+        assert_eq!(walk.changed_paths, changed_files);
+        // Every changed subdirectory is opened on both sides (the pruned diff
+        // that counts changed files) plus its parent directory and the roots;
+        // nothing else. Bound: roots + 100 changed dirs × 2 sides + 1000 changed
+        // subdirs × 2 sides.
+        let changed_subdirs = 1_000;
+        let bound = 3 + DIRS * 2 + changed_subdirs * 2;
+        assert!(
+            walk.merged
+                .values()
+                .filter(|e| e.mode == TreeItemMode::Tree)
+                .count()
+                >= 1,
+            "adopted subtrees exist"
+        );
+        assert!(
+            graph.reads <= bound,
+            "reads {} exceed the changed-path bound {bound} (tree has {total_trees} trees)",
+            graph.reads
+        );
+        assert!(
+            graph.reads * 2 < total_trees,
+            "reads {} are not a fraction of the {total_trees} trees the flattening path opens",
+            graph.reads
         );
     }
 }

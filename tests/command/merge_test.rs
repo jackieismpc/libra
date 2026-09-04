@@ -14,7 +14,7 @@ use serial_test::serial;
 
 use super::{
     assert_cli_success, create_committed_repo_via_cli, parse_cli_error_stderr, parse_json_stdout,
-    run_libra_command, run_libra_command_with_stdin,
+    run_libra_command, run_libra_command_with_stdin, run_libra_command_with_stdin_and_env,
 };
 
 fn commit_file(repo: &Path, file: &str, content: &str, message: &str) {
@@ -4284,4 +4284,1120 @@ fn merge_crisscross_more_bases_than_the_width_ceiling_is_refused_before_loading(
     let ours = run_libra_command(&["--json", "merge", "-s", "ours", "y"], p);
     assert_cli_success(&ours, "-s ours ignores the width ceiling");
     assert_eq!(parse_json_stdout(&ours)["data"]["strategy"], "ours");
+}
+
+/// MG-03 G4 end to end: the flattening path is still selectable under the test
+/// sentinel and produces the same merge — same tree, same files_changed — as
+/// the default incremental walk.
+#[test]
+fn merge_tree_walk_flat_switch_matches_the_incremental_default() {
+    let run = |flat: bool| -> (String, serde_json::Value) {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        std::fs::create_dir_all(p.join("deep/er/dir")).expect("dirs");
+        std::fs::write(p.join("deep/er/dir/leaf.txt"), "0\n").expect("leaf");
+        std::fs::write(p.join("top.txt"), "0\n").expect("top");
+        assert_cli_success(&run_libra_command(&["add", "."], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "root", "--no-verify"], p),
+            "root",
+        );
+        assert_cli_success(&run_libra_command(&["branch", "feature"], p), "branch");
+        commit_file(p, "top.txt", "ours\n", "ours edit");
+        assert_cli_success(
+            &run_libra_command(&["checkout", "feature"], p),
+            "co feature",
+        );
+        commit_file(p, "deep/er/dir/leaf.txt", "theirs\n", "theirs deep edit");
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "co main");
+        let mut env: Vec<(&str, &str)> = vec![("LIBRA_TEST", "1")];
+        if flat {
+            env.push(("LIBRA_TEST_MERGE_TREE_WALK", "flat"));
+        }
+        let output =
+            run_libra_command_with_stdin_and_env(&["--json", "merge", "feature"], p, "", &env);
+        assert_cli_success(&output, "merge under the selected tree walk");
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json summary");
+        let tree = run_libra_command(&["rev-parse", "HEAD^{tree}"], p);
+        assert_cli_success(&tree, "tree id");
+        (
+            String::from_utf8_lossy(&tree.stdout).trim().to_string(),
+            json["data"].clone(),
+        )
+    };
+    let (incremental_tree, incremental) = run(false);
+    let (flat_tree, flat) = run(true);
+    assert_eq!(
+        incremental_tree, flat_tree,
+        "both paths write the same merged tree"
+    );
+    assert_eq!(incremental["files_changed"], flat["files_changed"]);
+    assert_eq!(
+        incremental["files_changed"], 1,
+        "only the deep leaf changed relative to ours"
+    );
+    assert_eq!(incremental["strategy"], "three-way");
+}
+
+/// MG-03 G1/G2/G5 at the PRODUCTION entry: the default `libra merge` takes the
+/// incremental walk and reads only the trees along the changed paths — proven
+/// through the `LIBRA_TEST_MERGE_TREE_STATS` seam rather than an in-memory
+/// graph. A deep subtree all three sides share is never opened; the subtree
+/// theirs changed is opened once per side per differing level.
+#[test]
+fn merge_tree_walk_default_is_incremental_and_reads_only_changed_paths() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    for dir in ["shared/a/b/c", "moved/x/y"] {
+        std::fs::create_dir_all(p.join(dir)).expect("dirs");
+    }
+    std::fs::write(p.join("shared/a/b/c/leaf.txt"), "0\n").expect("shared leaf");
+    std::fs::write(p.join("moved/x/y/leaf.txt"), "0\n").expect("moved leaf");
+    std::fs::write(p.join("top.txt"), "0\n").expect("top");
+    assert_cli_success(&run_libra_command(&["add", "."], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "root", "--no-verify"], p),
+        "root",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "branch");
+    commit_file(p, "top.txt", "ours\n", "ours edit");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], p),
+        "co feature",
+    );
+    commit_file(p, "moved/x/y/leaf.txt", "theirs\n", "theirs deep edit");
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "co main");
+    // An untracked file under the SHARED subtree: the untracked-collision check
+    // must not expand `shared/` for it (ours already has that subtree; nothing
+    // under it is written), so the read bound below still holds.
+    std::fs::write(p.join("shared/a/b/untracked.txt"), "stray\n").expect("untracked");
+
+    let stats_dir = tempfile::tempdir().expect("stats dir");
+    let stats = stats_dir.path().join("stats.json");
+    let stats_path = stats.to_string_lossy().to_string();
+    let output = run_libra_command_with_stdin_and_env(
+        &["--json", "merge", "feature"],
+        p,
+        "",
+        &[
+            ("LIBRA_TEST", "1"),
+            ("LIBRA_TEST_MERGE_TREE_STATS", &stats_path),
+        ],
+    );
+    assert_cli_success(&output, "default merge");
+    let recorded: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&stats).expect("stats written")).expect("stats json");
+    assert_eq!(
+        recorded["walk"], "incremental",
+        "the default merge takes the pruning walk"
+    );
+    let reads = recorded["tree_reads"].as_u64().expect("tree_reads") as usize;
+    // Per pass: 3 distinct roots + `moved/x/y` (three levels, two distinct
+    // sides: base == ours, theirs) = 9; `shared/…` is identical everywhere: 0.
+    // Two passes read from the store — the preflight gate's and the engine's,
+    // each with its own cache — so the whole merge is bounded by 2 × 9.
+    assert!(
+        reads <= 2 * (3 + 6),
+        "tree reads are bounded by the changed path, not the tree: {reads} ({recorded})"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("moved/x/y/leaf.txt")).expect("merged leaf"),
+        "theirs\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("top.txt")).expect("top"),
+        "ours\n"
+    );
+
+    // The same repository shape under the flat switch records the flat walk.
+    let repo2 = create_committed_repo_via_cli();
+    let q = repo2.path();
+    std::fs::write(q.join("a.txt"), "0\n").expect("a");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], q), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "root", "--no-verify"], q),
+        "root",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "feature"], q), "branch");
+    commit_file(q, "b.txt", "ours\n", "ours");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], q),
+        "co feature",
+    );
+    commit_file(q, "a.txt", "theirs\n", "theirs");
+    assert_cli_success(&run_libra_command(&["checkout", "main"], q), "co main");
+    let output = run_libra_command_with_stdin_and_env(
+        &["merge", "feature"],
+        q,
+        "",
+        &[
+            ("LIBRA_TEST", "1"),
+            ("LIBRA_TEST_MERGE_TREE_WALK", "flat"),
+            ("LIBRA_TEST_MERGE_TREE_STATS", &stats_path),
+        ],
+    );
+    assert_cli_success(&output, "flat merge");
+    let recorded: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&stats).expect("stats written")).expect("stats json");
+    assert_eq!(recorded["walk"], "flat");
+}
+
+/// MG-03: an untracked FILE whose path is an ancestor of a subtree the merge
+/// would adopt verbatim collides exactly as the flattening path's per-leaf
+/// check says it does — refused before HEAD, index or worktree change.
+#[test]
+fn merge_tree_walk_refuses_untracked_ancestor_of_an_adopted_subtree() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("top.txt"), "0\n").expect("top");
+    assert_cli_success(&run_libra_command(&["add", "top.txt"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "root", "--no-verify"], p),
+        "root",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "branch");
+    commit_file(p, "top.txt", "ours\n", "ours edit");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], p),
+        "co feature",
+    );
+    commit_file(
+        p,
+        "newdir/sub/leaf.txt",
+        "theirs\n",
+        "theirs adds a subtree",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "co main");
+    // An untracked FILE at `newdir` blocks the adopted `newdir/…` subtree.
+    std::fs::write(p.join("newdir"), "untracked file, not a directory\n").expect("untracked");
+    let head_before = head_commit(p);
+    let objects_before = count_loose_objects(p);
+
+    let output = run_libra_command(&["merge", "feature"], p);
+    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+    assert_eq!(output.status.code(), Some(128), "refused: {stderr}");
+    assert_eq!(report.error_code, "LBR-CONFLICT-002");
+    assert!(
+        stderr.contains("newdir"),
+        "the colliding untracked path is named: {stderr}"
+    );
+    assert_eq!(head_commit(p), head_before, "HEAD untouched");
+    assert_eq!(
+        std::fs::read_to_string(p.join("newdir")).expect("untracked survives"),
+        "untracked file, not a directory\n"
+    );
+    assert!(
+        !p.join(".libra").join("merge-state.json").exists(),
+        "no merge state"
+    );
+    assert!(
+        count_loose_objects(p) <= objects_before + 1,
+        "no tree or commit written (at most the auto-merge's blob-free walk): before \
+         {objects_before}, after {}",
+        count_loose_objects(p)
+    );
+}
+
+/// MG-03: a `pre-merge-commit` hook that drops an untracked file UNDER a
+/// subtree the merge adopts verbatim is caught by the post-hook recheck — the
+/// collision set is recomputed after every hook, never reused — so the merge
+/// is refused before HEAD moves, exactly as the flattening path refuses it.
+#[cfg(unix)]
+#[test]
+fn merge_tree_walk_rechecks_hook_created_files_under_adopted_subtrees() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("top.txt"), "0\n").expect("top");
+    assert_cli_success(&run_libra_command(&["add", "top.txt"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "root", "--no-verify"], p),
+        "root",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "branch");
+    commit_file(p, "top.txt", "ours\n", "ours edit");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], p),
+        "co feature",
+    );
+    commit_file(
+        p,
+        "newdir/sub/leaf.txt",
+        "theirs\n",
+        "theirs adds a subtree",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "co main");
+    // The hook creates a file at a path the adopted subtree will write.
+    let hooks = p.join(".libra").join("hooks");
+    std::fs::create_dir_all(&hooks).expect("hooks dir");
+    let hook = hooks.join("pre-merge-commit");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\nmkdir -p \"$LIBRA_WORK_TREE/newdir/sub\"\nprintf 'hook\\n' > \"$LIBRA_WORK_TREE/newdir/sub/leaf.txt\"\n",
+    )
+    .expect("write hook");
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let head_before = head_commit(p);
+
+    let output = run_libra_command(&["merge", "feature"], p);
+    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+    assert_eq!(output.status.code(), Some(128), "refused: {stderr}");
+    assert_eq!(report.error_code, "LBR-CONFLICT-002");
+    assert!(
+        stderr.contains("newdir/sub/leaf.txt"),
+        "the hook-created colliding path is named: {stderr}"
+    );
+    assert_eq!(head_commit(p), head_before, "HEAD untouched");
+    assert_eq!(
+        std::fs::read_to_string(p.join("newdir/sub/leaf.txt")).expect("hook file survives"),
+        "hook\n",
+        "the untracked file the hook wrote is not overwritten"
+    );
+    assert!(
+        !p.join(".libra").join("merge-state.json").exists(),
+        "no merge state"
+    );
+}
+
+/// MG-03: a subtree theirs ADDED is enumerated in full by the read-only gate
+/// before anything is written (an added directory has no counterpart on the
+/// other sides, so nothing about it can be skipped). With one of its nested
+/// tree objects missing from the store the merge fails the way the flattening
+/// path failed — while reading the trees — and HEAD, the index and the working
+/// tree are untouched. (Trees the walk leaves unopened are HEAD's own; see the
+/// unopened-tree invariant on `incremental_merge_trees`.)
+#[test]
+fn merge_tree_walk_refuses_an_added_subtree_with_a_missing_nested_tree() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("top.txt"), "0\n").expect("top");
+    assert_cli_success(&run_libra_command(&["add", "top.txt"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "root", "--no-verify"], p),
+        "root",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "branch");
+    commit_file(p, "top.txt", "ours\n", "ours edit");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], p),
+        "co feature",
+    );
+    commit_file(
+        p,
+        "newdir/sub/leaf.txt",
+        "theirs\n",
+        "theirs adds a nested subtree",
+    );
+    // Only the leaf's tree differs from the base at the top level; the adopted
+    // `newdir/` subtree's nested `sub/` tree is what goes missing.
+    let nested = run_libra_command(&["rev-parse", "feature:newdir/sub"], p);
+    assert_cli_success(&nested, "resolve the nested tree");
+    let nested_id = String::from_utf8_lossy(&nested.stdout).trim().to_string();
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "co main");
+    let object = p
+        .join(".libra")
+        .join("objects")
+        .join(&nested_id[..2])
+        .join(&nested_id[2..]);
+    assert!(
+        object.exists(),
+        "the nested tree is a loose object: {}",
+        object.display()
+    );
+    std::fs::remove_file(&object).expect("simulate a missing nested tree");
+    let head_before = head_commit(p);
+
+    let output = run_libra_command(&["merge", "feature"], p);
+    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+    assert_eq!(output.status.code(), Some(128), "refused: {stderr}");
+    assert_eq!(
+        report.error_code, "LBR-REPO-002",
+        "a missing tree is repository corruption"
+    );
+    assert!(
+        stderr.contains(&nested_id),
+        "the unreadable tree is named: {stderr}"
+    );
+    assert_eq!(head_commit(p), head_before, "HEAD never moved");
+    assert!(
+        !p.join("newdir").exists(),
+        "nothing of the adopted subtree was written"
+    );
+    assert!(
+        !p.join(".libra").join("merge-state.json").exists(),
+        "no merge state"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("top.txt")).expect("top"),
+        "ours\n"
+    );
+}
+
+/// MG-03: a `refs/replace` substitution on a ROOT tree is honoured identically
+/// by both walks — the flattening path loads roots through the
+/// replacement-aware loader and nested trees raw, and the incremental path
+/// mirrors exactly that (roots via `replace::resolve`, nested via the raw
+/// loader) — so default and flat merges agree, and both see the replacement.
+#[test]
+fn merge_tree_walk_root_tree_replacement_is_honoured_identically_by_both_walks() {
+    let run = |flat: bool| -> (String, serde_json::Value, String) {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        std::fs::write(p.join("a.txt"), "0\n").expect("a");
+        std::fs::write(p.join("b.txt"), "0\n").expect("b");
+        assert_cli_success(&run_libra_command(&["add", "a.txt", "b.txt"], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "root", "--no-verify"], p),
+            "root",
+        );
+        assert_cli_success(
+            &run_libra_command(&["branch", "feature"], p),
+            "branch feature",
+        );
+        assert_cli_success(&run_libra_command(&["branch", "alt"], p), "branch alt");
+        commit_file(p, "b.txt", "ours\n", "ours edit");
+        assert_cli_success(
+            &run_libra_command(&["checkout", "feature"], p),
+            "co feature",
+        );
+        commit_file(p, "a.txt", "theirs\n", "theirs edit");
+        let feature_tree = run_libra_command(&["rev-parse", "feature^{tree}"], p);
+        assert_cli_success(&feature_tree, "feature tree");
+        // The replacement: a root tree where a.txt says something else.
+        assert_cli_success(&run_libra_command(&["checkout", "alt"], p), "co alt");
+        commit_file(p, "a.txt", "replaced\n", "alt edit");
+        let alt_tree = run_libra_command(&["rev-parse", "alt^{tree}"], p);
+        assert_cli_success(&alt_tree, "alt tree");
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "replace",
+                    String::from_utf8_lossy(&feature_tree.stdout).trim(),
+                    String::from_utf8_lossy(&alt_tree.stdout).trim(),
+                ],
+                p,
+            ),
+            "replace feature's root tree",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "co main");
+        let mut env: Vec<(&str, &str)> = vec![("LIBRA_TEST", "1")];
+        if flat {
+            env.push(("LIBRA_TEST_MERGE_TREE_WALK", "flat"));
+        }
+        let output =
+            run_libra_command_with_stdin_and_env(&["--json", "merge", "feature"], p, "", &env);
+        assert_cli_success(&output, "merge with a replaced root tree");
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json summary");
+        let tree = run_libra_command(&["rev-parse", "HEAD^{tree}"], p);
+        assert_cli_success(&tree, "merged tree");
+        (
+            String::from_utf8_lossy(&tree.stdout).trim().to_string(),
+            json["data"].clone(),
+            std::fs::read_to_string(p.join("a.txt")).expect("a"),
+        )
+    };
+    let (incremental_tree, incremental, incremental_a) = run(false);
+    let (flat_tree, flat, flat_a) = run(true);
+    assert_eq!(
+        incremental_a, "replaced\n",
+        "the replacement root tree is what gets merged"
+    );
+    assert_eq!(
+        flat_a, incremental_a,
+        "both walks see the same replaced root"
+    );
+    assert_eq!(
+        incremental_tree, flat_tree,
+        "both walks write the same merged tree"
+    );
+    assert_eq!(incremental["files_changed"], flat["files_changed"]);
+}
+
+/// MG-03: a nested tree that all three sides SHARE and the walk therefore never
+/// opens is still read by the checkout — which now runs before the commit and
+/// HEAD are written — so a missing shared tree fails with HEAD, index and
+/// working tree untouched, exactly as the flattening path's up-front read did.
+#[test]
+fn merge_tree_walk_missing_shared_tree_fails_before_head_moves() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::create_dir_all(p.join("shared/a/b")).expect("dirs");
+    std::fs::write(p.join("shared/a/b/leaf.txt"), "0\n").expect("shared leaf");
+    std::fs::write(p.join("top.txt"), "0\n").expect("top");
+    assert_cli_success(&run_libra_command(&["add", "."], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "root", "--no-verify"], p),
+        "root",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "branch");
+    commit_file(p, "top.txt", "ours\n", "ours edit");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], p),
+        "co feature",
+    );
+    commit_file(p, "other.txt", "theirs\n", "theirs edit");
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "co main");
+    let shared = run_libra_command(&["rev-parse", "HEAD:shared/a"], p);
+    assert_cli_success(&shared, "resolve the shared nested tree");
+    let shared_id = String::from_utf8_lossy(&shared.stdout).trim().to_string();
+    let object = p
+        .join(".libra")
+        .join("objects")
+        .join(&shared_id[..2])
+        .join(&shared_id[2..]);
+    assert!(object.exists(), "loose object: {}", object.display());
+    std::fs::remove_file(&object).expect("simulate a missing shared tree");
+    let head_before = head_commit(p);
+    let index_before = std::fs::read(p.join(".libra/index")).expect("index bytes");
+
+    let output = run_libra_command(&["merge", "feature"], p);
+    // Both walks reach the missing tree through the same reader (`Tree::load`
+    // inside the index rebuild here; inside flattening on the flat walk), which
+    // aborts rather than returning a structured report — a pre-existing,
+    // path-independent shape. What this test pins is WHEN: before HEAD, the
+    // index or the working tree changed.
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "the merge cannot complete: {stderr}"
+    );
+    assert!(
+        stderr.contains(&shared_id),
+        "the unreadable tree is named: {stderr}"
+    );
+    assert_eq!(head_commit(p), head_before, "HEAD never moved");
+    assert_eq!(
+        std::fs::read(p.join(".libra/index")).expect("index bytes"),
+        index_before,
+        "the index is untouched"
+    );
+    assert!(
+        !p.join("other.txt").exists(),
+        "nothing of the merge result was written"
+    );
+    assert!(
+        !p.join(".libra").join("merge-state.json").exists(),
+        "no merge state"
+    );
+}
+
+/// MG-03: with a replaced root tree that CONFLICTS, the conflict state names
+/// the replaced content on stage 3 — identically on both walks — so
+/// `restore --theirs` and `--continue` operate on what was actually merged.
+#[test]
+fn merge_tree_walk_conflict_stages_follow_the_replaced_root_on_both_walks() {
+    let run = |flat: bool| -> String {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        std::fs::write(p.join("a.txt"), "0\n").expect("a");
+        assert_cli_success(&run_libra_command(&["add", "a.txt"], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "root", "--no-verify"], p),
+            "root",
+        );
+        assert_cli_success(
+            &run_libra_command(&["branch", "feature"], p),
+            "branch feature",
+        );
+        assert_cli_success(&run_libra_command(&["branch", "alt"], p), "branch alt");
+        commit_file(p, "a.txt", "ours\n", "ours edit");
+        assert_cli_success(
+            &run_libra_command(&["checkout", "feature"], p),
+            "co feature",
+        );
+        commit_file(p, "a.txt", "theirs\n", "theirs edit");
+        let feature_tree = run_libra_command(&["rev-parse", "feature^{tree}"], p);
+        assert_cli_success(&feature_tree, "feature tree");
+        assert_cli_success(&run_libra_command(&["checkout", "alt"], p), "co alt");
+        commit_file(p, "a.txt", "replaced\n", "alt edit");
+        let alt_tree = run_libra_command(&["rev-parse", "alt^{tree}"], p);
+        assert_cli_success(&alt_tree, "alt tree");
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "replace",
+                    String::from_utf8_lossy(&feature_tree.stdout).trim(),
+                    String::from_utf8_lossy(&alt_tree.stdout).trim(),
+                ],
+                p,
+            ),
+            "replace feature's root tree",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "co main");
+        let mut env: Vec<(&str, &str)> = vec![("LIBRA_TEST", "1")];
+        if flat {
+            env.push(("LIBRA_TEST_MERGE_TREE_WALK", "flat"));
+        }
+        let output = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", &env);
+        assert_eq!(
+            output.status.code(),
+            Some(128),
+            "the replaced root conflicts with ours"
+        );
+        assert_cli_success(
+            &run_libra_command(&["restore", "--theirs", "a.txt"], p),
+            "restore theirs from stage 3",
+        );
+        std::fs::read_to_string(p.join("a.txt")).expect("a")
+    };
+    let incremental = run(false);
+    let flat = run(true);
+    assert_eq!(
+        incremental, "replaced\n",
+        "stage 3 is the REPLACED root's content"
+    );
+    assert_eq!(
+        flat, incremental,
+        "both walks record the same stage-3 entry"
+    );
+}
+
+/// Build the nested-gitlink fixture shared by the two MG-03 G9/G10 CLI tests:
+/// `main` (ours) carries `deps/vendor/lib` = [`GITLINK_BASE`] plus `deps/keep.txt`,
+/// then edits only `top.txt`, so the whole `deps/` subtree still equals the base
+/// on ours — the shape the incremental walk prunes past. `feature` (theirs) is
+/// the base tree plus `side.txt`, with the gitlink set to `feature_gitlink`.
+fn create_nested_gitlink_repo(feature_gitlink: &str) -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("top.txt"), "0\n").expect("top");
+    std::fs::create_dir_all(p.join("deps")).expect("deps");
+    std::fs::write(p.join("deps/keep.txt"), "keep\n").expect("keep");
+    assert_cli_success(
+        &run_libra_command(&["add", "top.txt", "deps/keep.txt"], p),
+        "add files",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "update-index",
+                "--cacheinfo",
+                &format!("160000,{GITLINK_BASE},deps/vendor/lib"),
+            ],
+            p,
+        ),
+        "stage the nested base gitlink",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "base with nested submodule", "--no-verify"],
+            p,
+        ),
+        "commit the base",
+    );
+    let base = head_commit(p);
+
+    let side_blob = {
+        let out = run_libra_command(&["hash-object", "-w", "--stdin"], p);
+        assert!(out.status.success(), "hash-object must succeed");
+        stdout_trimmed(&out)
+    };
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "update-index",
+                "--cacheinfo",
+                &format!("100644,{side_blob},side.txt"),
+                "--cacheinfo",
+                &format!("160000,{feature_gitlink},deps/vendor/lib"),
+            ],
+            p,
+        ),
+        "stage the feature tree",
+    );
+    let tree = {
+        let out = run_libra_command(&["write-tree"], p);
+        assert_cli_success(&out, "write-tree");
+        stdout_trimmed(&out)
+    };
+    let feature = {
+        let out = run_libra_command(&["commit-tree", &tree, "-p", &base, "-m", "feature"], p);
+        assert_cli_success(&out, "commit-tree");
+        stdout_trimmed(&out)
+    };
+    assert_cli_success(
+        &run_libra_command(&["update-ref", "refs/heads/feature", &feature], p),
+        "create refs/heads/feature",
+    );
+    // Put main's index back to the base tree, then make ours' own change at
+    // the ROOT only, leaving `deps/` byte-identical to the base.
+    assert_cli_success(
+        &run_libra_command(&["update-index", "--remove", "side.txt"], p),
+        "unstage side.txt",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "update-index",
+                "--cacheinfo",
+                &format!("160000,{GITLINK_BASE},deps/vendor/lib"),
+            ],
+            p,
+        ),
+        "restore the base gitlink in main's index",
+    );
+    commit_file(p, "top.txt", "ours\n", "ours edits top only");
+    repo
+}
+
+/// MG-03 G9 at the CLI: a gitlink buried two directories deep inside a subtree
+/// that equals the base on OUR side — the walk would adopt `deps/` from theirs
+/// without opening it — is still arbitration when theirs moved the pointer, and
+/// is refused before anything is written, naming the nested path.
+#[test]
+fn merge_gitlink_nested_changed_pointer_inside_a_pruned_subtree_is_refused() {
+    let repo = create_nested_gitlink_repo(GITLINK_MOVED);
+    let p = repo.path();
+    let head_before = head_commit(p);
+    let index_before = std::fs::read(p.join(".libra/index")).expect("index bytes");
+    let objects_before = count_loose_objects(p);
+
+    let output = run_libra_command(&["merge", "feature"], p);
+    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+    assert_eq!(output.status.code(), Some(128), "refused: {stderr}");
+    assert_eq!(report.error_code, "LBR-UNSUPPORTED-001");
+    assert!(
+        stderr.contains("deps/vendor/lib"),
+        "the nested gitlink path is named: {stderr}"
+    );
+    assert_eq!(head_commit(p), head_before, "HEAD untouched");
+    assert_eq!(
+        std::fs::read(p.join(".libra/index")).expect("index bytes"),
+        index_before,
+        "index untouched"
+    );
+    assert_eq!(count_loose_objects(p), objects_before, "no objects written");
+    assert!(!p.join("side.txt").exists(), "worktree untouched");
+    assert!(
+        !p.join(".libra").join("merge-state.json").exists(),
+        "no merge state"
+    );
+}
+
+/// MG-03 G10 at the CLI: the same nested gitlink, identical on all three sides,
+/// passes through inside the pruned `deps/` subtree — the merge succeeds, the
+/// result still carries the pointer, and the production read counter shows the
+/// subtree was never opened (only the three distinct root trees, per pass).
+#[test]
+fn merge_gitlink_nested_identical_pointer_inside_a_pruned_subtree_passes_through() {
+    let repo = create_nested_gitlink_repo(GITLINK_BASE);
+    let p = repo.path();
+    let stats_dir = tempfile::tempdir().expect("stats dir");
+    let stats = stats_dir.path().join("stats.json");
+    let stats_path = stats.to_string_lossy().to_string();
+
+    let output = run_libra_command_with_stdin_and_env(
+        &["--json", "merge", "feature"],
+        p,
+        "",
+        &[
+            ("LIBRA_TEST", "1"),
+            ("LIBRA_TEST_MERGE_TREE_STATS", &stats_path),
+        ],
+    );
+    assert_cli_success(&output, "merge passes the nested gitlink through");
+    // `ls-tree` prints the Git mode; (`cat-file -p` renders a gitlink item's
+    // mode through the enum's display, which is not the octal form.)
+    let vendor = run_libra_command(&["ls-tree", "HEAD", "deps/vendor/"], p);
+    assert_cli_success(&vendor, "list the merged deps/vendor tree");
+    let listing = String::from_utf8_lossy(&vendor.stdout).to_string();
+    assert!(
+        listing.contains("160000") && listing.contains(GITLINK_BASE) && listing.contains("lib"),
+        "the pointer survives inside the pruned subtree verbatim: {listing}"
+    );
+    assert!(p.join("side.txt").exists(), "theirs' file merged");
+    assert_eq!(
+        std::fs::read_to_string(p.join("top.txt")).expect("top"),
+        "ours\n"
+    );
+
+    let recorded: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&stats).expect("stats written")).expect("stats json");
+    assert_eq!(recorded["walk"], "incremental");
+    let reads = recorded["tree_reads"].as_u64().expect("tree_reads") as usize;
+    // Three distinct roots per pass (base / ours / theirs all differ at the
+    // root), two passes; `deps/` is identical everywhere and never opened.
+    assert!(
+        reads <= 2 * 3,
+        "the subtree holding the gitlink is pruned, not opened: {reads} ({recorded})"
+    );
+}
+
+/// MG-03: `--dry-run` reaches the same verdict as the real merge when a tree
+/// the walk never opens is missing — the preview probes the carried trees
+/// (read-only), so it fails exactly where the real merge's checkout would,
+/// instead of reporting a clean preview for a merge that cannot complete.
+#[test]
+fn merge_tree_walk_dry_run_matches_the_real_verdict_on_a_missing_shared_tree() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::create_dir_all(p.join("shared/a/b")).expect("dirs");
+    std::fs::write(p.join("shared/a/b/leaf.txt"), "0\n").expect("shared leaf");
+    std::fs::write(p.join("top.txt"), "0\n").expect("top");
+    assert_cli_success(&run_libra_command(&["add", "."], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "root", "--no-verify"], p),
+        "root",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "branch");
+    commit_file(p, "top.txt", "ours\n", "ours edit");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], p),
+        "co feature",
+    );
+    commit_file(p, "other.txt", "theirs\n", "theirs edit");
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "co main");
+    let shared = run_libra_command(&["rev-parse", "HEAD:shared/a"], p);
+    assert_cli_success(&shared, "resolve the shared nested tree");
+    let shared_id = String::from_utf8_lossy(&shared.stdout).trim().to_string();
+    let object = p
+        .join(".libra")
+        .join("objects")
+        .join(&shared_id[..2])
+        .join(&shared_id[2..]);
+    std::fs::remove_file(&object).expect("simulate a missing shared tree");
+    let head_before = head_commit(p);
+
+    let preview = run_libra_command(&["merge", "--dry-run", "feature"], p);
+    let stderr = String::from_utf8_lossy(&preview.stderr).to_string();
+    assert!(
+        !preview.status.success(),
+        "the preview must not promise a merge that cannot complete: {stderr}"
+    );
+    assert!(
+        stderr.contains(&shared_id),
+        "the unreadable tree is named: {stderr}"
+    );
+    assert_eq!(head_commit(p), head_before, "a preview never moves HEAD");
+    assert!(
+        !p.join(".libra").join("merge-state.json").exists(),
+        "no merge state"
+    );
+}
+
+/// Shared shape for the MG-03 G6–G8 CLI carriers. The base carries a plain
+/// `tool.sh`, a `target.txt` and a symlink `link -> target.txt`; `ours` edits
+/// `top.txt`; `theirs` is built by PLUMBING (`update-index --cacheinfo` +
+/// `write-tree` + `commit-tree`) so that a mode-only change can be expressed —
+/// Libra's porcelain `add` does not detect a bare `chmod`. Runs the merge under
+/// the requested walk and returns `(repo, ls-tree -r HEAD, ls-files -s)`.
+#[cfg(unix)]
+fn merge_mode_scenario(
+    flat: bool,
+    theirs_entries: &[(&str, &str)],
+) -> (tempfile::TempDir, String, String) {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("top.txt"), "0\n").expect("top");
+    std::fs::write(p.join("tool.sh"), "#!/bin/sh\necho hi\n").expect("tool");
+    std::fs::write(p.join("target.txt"), "t\n").expect("target");
+    std::os::unix::fs::symlink("target.txt", p.join("link")).expect("symlink");
+    assert_cli_success(
+        &run_libra_command(&["add", "top.txt", "tool.sh", "target.txt", "link"], p),
+        "add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "root", "--no-verify"], p),
+        "root",
+    );
+    let base = head_commit(p);
+    // theirs = base tree with the requested entries overridden.
+    let mut stage: Vec<String> = vec!["update-index".to_string()];
+    for (mode_and_path, content) in theirs_entries {
+        let (mode, path) = mode_and_path.split_once(' ').expect("'<mode> <path>'");
+        let blob = run_libra_command_with_stdin(&["hash-object", "-w", "--stdin"], p, content);
+        assert!(blob.status.success(), "hash-object");
+        stage.push("--cacheinfo".to_string());
+        stage.push(format!("{mode},{},{path}", stdout_trimmed(&blob)));
+    }
+    let stage: Vec<&str> = stage.iter().map(String::as_str).collect();
+    assert_cli_success(&run_libra_command(&stage, p), "stage theirs' entries");
+    let tree = {
+        let out = run_libra_command(&["write-tree"], p);
+        assert_cli_success(&out, "write-tree");
+        stdout_trimmed(&out)
+    };
+    let feature = {
+        let out = run_libra_command(&["commit-tree", &tree, "-p", &base, "-m", "theirs"], p);
+        assert_cli_success(&out, "commit-tree");
+        stdout_trimmed(&out)
+    };
+    assert_cli_success(
+        &run_libra_command(&["update-ref", "refs/heads/feature", &feature], p),
+        "refs/heads/feature",
+    );
+    // Put main's index back to the base tree, then make ours' change.
+    assert_cli_success(
+        &run_libra_command(&["reset", "--hard", "HEAD"], p),
+        "reset main's index to the base",
+    );
+    commit_file(p, "top.txt", "ours\n", "ours edit");
+    let mut env: Vec<(&str, &str)> = vec![("LIBRA_TEST", "1")];
+    if flat {
+        env.push(("LIBRA_TEST_MERGE_TREE_WALK", "flat"));
+    }
+    let output = run_libra_command_with_stdin_and_env(&["merge", "feature"], p, "", &env);
+    assert_cli_success(&output, "merge");
+    let tree_listing = run_libra_command(&["ls-tree", "-r", "HEAD"], p);
+    assert_cli_success(&tree_listing, "ls-tree");
+    let index_listing = run_libra_command(&["ls-files", "-s"], p);
+    assert_cli_success(&index_listing, "ls-files -s");
+    (
+        repo,
+        String::from_utf8_lossy(&tree_listing.stdout).to_string(),
+        String::from_utf8_lossy(&index_listing.stdout).to_string(),
+    )
+}
+
+/// What the merge checkout left in the working tree for a path: the file's
+/// mode bits, or the symlink target — compared between the two walks.
+#[cfg(unix)]
+fn worktree_shape(p: &Path, path: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let full = p.join(path);
+    match std::fs::read_link(&full) {
+        Ok(target) => format!("link->{}", target.to_string_lossy()),
+        Err(_) => format!(
+            "mode={:o}",
+            std::fs::metadata(&full).expect("meta").permissions().mode() & 0o777
+        ),
+    }
+}
+
+/// MG-03 G6 at the CLI: a mode-only change on theirs (`tool.sh` becomes
+/// executable, content untouched) merges to a `100755` tree entry and index
+/// entry on both walks, and the two walks leave the working tree in the same
+/// state. (The merge checkout's working-tree materialization of mode bits and
+/// symlink retargets is a pre-existing, walk-independent residual — see the
+/// dev doc; `libra checkout` applies them, `merge`'s writer does not yet.)
+#[cfg(unix)]
+#[test]
+fn merge_tree_walk_preserves_a_mode_only_change_on_both_walks() {
+    let mut shapes = Vec::new();
+    for flat in [false, true] {
+        let (repo, tree, index) =
+            merge_mode_scenario(flat, &[("100755 tool.sh", "#!/bin/sh\necho hi\n")]);
+        assert!(
+            tree.lines()
+                .any(|l| l.starts_with("100755") && l.ends_with("\ttool.sh")),
+            "flat={flat}: the executable bit is in the merged tree: {tree}"
+        );
+        assert!(
+            index
+                .lines()
+                .any(|l| l.starts_with("100755") && l.ends_with("tool.sh")),
+            "flat={flat}: the executable bit is in the merged index: {index}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("top.txt")).expect("top"),
+            "ours\n"
+        );
+        shapes.push(worktree_shape(repo.path(), "tool.sh"));
+    }
+    assert_eq!(
+        shapes[0], shapes[1],
+        "both walks leave the same working tree"
+    );
+}
+
+/// MG-03 G7 at the CLI: theirs re-points `link`; the merged tree and index keep
+/// a `120000` entry with the new target's blob on both walks, and both walks
+/// leave the same working tree.
+#[cfg(unix)]
+#[test]
+fn merge_tree_walk_preserves_a_symlink_change_on_both_walks() {
+    let mut shapes = Vec::new();
+    for flat in [false, true] {
+        let (repo, tree, index) = merge_mode_scenario(flat, &[("120000 link", "top.txt")]);
+        let new_target_blob = {
+            let out =
+                run_libra_command_with_stdin(&["hash-object", "--stdin"], repo.path(), "top.txt");
+            assert!(out.status.success(), "hash-object");
+            stdout_trimmed(&out)
+        };
+        assert!(
+            tree.lines().any(|l| l.starts_with("120000")
+                && l.contains(&new_target_blob)
+                && l.ends_with("\tlink")),
+            "flat={flat}: the re-pointed symlink is in the merged tree: {tree}"
+        );
+        assert!(
+            index
+                .lines()
+                .any(|l| l.starts_with("120000") && l.ends_with("link")),
+            "flat={flat}: the symlink entry is in the merged index: {index}"
+        );
+        shapes.push(worktree_shape(repo.path(), "link"));
+    }
+    assert_eq!(
+        shapes[0], shapes[1],
+        "both walks leave the same working tree"
+    );
+}
+
+/// MG-03 G8 at the CLI: an executable file ADDED by theirs arrives as `100755`
+/// in the merged tree and index on both walks, with the same working tree.
+#[cfg(unix)]
+#[test]
+fn merge_tree_walk_preserves_an_added_executable_on_both_walks() {
+    let mut shapes = Vec::new();
+    for flat in [false, true] {
+        let (repo, tree, index) =
+            merge_mode_scenario(flat, &[("100755 run.sh", "#!/bin/sh\nexit 0\n")]);
+        assert!(
+            tree.lines()
+                .any(|l| l.starts_with("100755") && l.ends_with("\trun.sh")),
+            "flat={flat}: the added executable keeps its mode in the tree: {tree}"
+        );
+        assert!(
+            index
+                .lines()
+                .any(|l| l.starts_with("100755") && l.ends_with("run.sh")),
+            "flat={flat}: …and in the index: {index}"
+        );
+        assert!(
+            repo.path().join("run.sh").exists(),
+            "flat={flat}: the file is checked out"
+        );
+        shapes.push(worktree_shape(repo.path(), "run.sh"));
+    }
+    assert_eq!(
+        shapes[0], shapes[1],
+        "both walks leave the same working tree"
+    );
+}
+
+/// MG-03: a nested `refs/replace` whose replacement is MISSING makes the
+/// checkout fail (it resolves replacements); the preview probe sees the trees
+/// the way the checkout does, so `--dry-run` fails too — same verdict — and
+/// the real merge fails before HEAD moves.
+#[test]
+fn merge_tree_walk_dry_run_follows_nested_replacements_like_the_checkout() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::create_dir_all(p.join("shared/a")).expect("dirs");
+    std::fs::write(p.join("shared/a/leaf.txt"), "0\n").expect("leaf");
+    std::fs::write(p.join("top.txt"), "0\n").expect("top");
+    assert_cli_success(&run_libra_command(&["add", "."], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "root", "--no-verify"], p),
+        "root",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "branch");
+    assert_cli_success(&run_libra_command(&["branch", "alt"], p), "branch alt");
+    commit_file(p, "top.txt", "ours\n", "ours edit");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], p),
+        "co feature",
+    );
+    commit_file(p, "other.txt", "theirs\n", "theirs edit");
+    // A replacement tree for `shared/a`, then its object goes missing.
+    assert_cli_success(&run_libra_command(&["checkout", "alt"], p), "co alt");
+    commit_file(p, "shared/a/leaf.txt", "alt\n", "alt edit");
+    let alt_sub = run_libra_command(&["rev-parse", "alt:shared/a"], p);
+    assert_cli_success(&alt_sub, "alt nested tree");
+    let alt_id = String::from_utf8_lossy(&alt_sub.stdout).trim().to_string();
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "co main");
+    let shared = run_libra_command(&["rev-parse", "HEAD:shared/a"], p);
+    assert_cli_success(&shared, "shared nested tree");
+    let shared_id = String::from_utf8_lossy(&shared.stdout).trim().to_string();
+    assert_cli_success(
+        &run_libra_command(&["replace", &shared_id, &alt_id], p),
+        "replace the nested tree",
+    );
+    let object = p
+        .join(".libra")
+        .join("objects")
+        .join(&alt_id[..2])
+        .join(&alt_id[2..]);
+    std::fs::remove_file(&object).expect("make the replacement dangle");
+    let head_before = head_commit(p);
+
+    let preview = run_libra_command(&["merge", "--dry-run", "feature"], p);
+    assert!(
+        !preview.status.success(),
+        "the preview follows the replacement like the checkout and fails: {}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let real = run_libra_command(&["merge", "feature"], p);
+    assert!(!real.status.success(), "the real merge fails at checkout");
+    assert_eq!(head_commit(p), head_before, "HEAD never moved");
+    assert!(
+        !p.join(".libra").join("merge-state.json").exists(),
+        "no merge state"
+    );
+}
+
+/// MG-03: with a CONFLICT elsewhere, the real merge never checks out — it
+/// writes conflict state through the raw tree view — so a dangling nested
+/// `refs/replace` does not stop it. The preview mirrors that: it reports the
+/// conflict (exit 1) instead of failing on the replacement the real merge
+/// would never follow.
+#[test]
+fn merge_tree_walk_conflicted_dry_run_matches_the_real_conflict_path_under_a_dangling_replace() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::create_dir_all(p.join("shared/a")).expect("dirs");
+    std::fs::write(p.join("shared/a/leaf.txt"), "0\n").expect("leaf");
+    std::fs::write(p.join("top.txt"), "0\n").expect("top");
+    assert_cli_success(&run_libra_command(&["add", "."], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "root", "--no-verify"], p),
+        "root",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "branch");
+    assert_cli_success(&run_libra_command(&["branch", "alt"], p), "branch alt");
+    commit_file(p, "top.txt", "ours\n", "ours edit");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], p),
+        "co feature",
+    );
+    commit_file(p, "top.txt", "theirs\n", "theirs conflicting edit");
+    assert_cli_success(&run_libra_command(&["checkout", "alt"], p), "co alt");
+    commit_file(p, "shared/a/leaf.txt", "alt\n", "alt edit");
+    let alt_sub = run_libra_command(&["rev-parse", "alt:shared/a"], p);
+    assert_cli_success(&alt_sub, "alt nested tree");
+    let alt_id = String::from_utf8_lossy(&alt_sub.stdout).trim().to_string();
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "co main");
+    let shared = run_libra_command(&["rev-parse", "HEAD:shared/a"], p);
+    assert_cli_success(&shared, "shared nested tree");
+    let shared_id = String::from_utf8_lossy(&shared.stdout).trim().to_string();
+    assert_cli_success(
+        &run_libra_command(&["replace", &shared_id, &alt_id], p),
+        "replace the nested tree",
+    );
+    let object = p
+        .join(".libra")
+        .join("objects")
+        .join(&alt_id[..2])
+        .join(&alt_id[2..]);
+    std::fs::remove_file(&object).expect("make the replacement dangle");
+
+    let preview = run_libra_command(&["--json", "merge", "--dry-run", "feature"], p);
+    assert_eq!(
+        preview.status.code(),
+        Some(1),
+        "the preview reports the conflict, not the replacement: {}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let json = parse_json_stdout(&preview);
+    assert_eq!(json["data"]["would_conflict"], true);
+
+    let real = run_libra_command(&["merge", "feature"], p);
+    assert_eq!(
+        real.status.code(),
+        Some(128),
+        "the real merge writes conflict state: {}",
+        String::from_utf8_lossy(&real.stderr)
+    );
+    assert!(
+        p.join(".libra").join("merge-state.json").exists(),
+        "conflict state written"
+    );
+    assert!(
+        std::fs::read_to_string(p.join("top.txt"))
+            .expect("top")
+            .contains("<<<<<<<"),
+        "the conflict is in the working tree"
+    );
 }
