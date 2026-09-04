@@ -270,6 +270,7 @@ Every `PullError` variant maps to an explicit `StableErrorCode`. Fetch, merge, a
 | Fetch: protocol error | `LBR-NET-002` | 128 | "the remote did not respond correctly" |
 | Merge: conflicts, dirty worktree, or untracked overwrite | `LBR-CONFLICT-002` | 128 | "resolve conflicts, then run 'libra merge --continue'" |
 | Merge: non-fast-forward rejected by `--ff-only` | `LBR-CONFLICT-002` | 128 | "run 'libra pull' without --ff-only to allow a merge commit" |
+| Merge or rebase would have to arbitrate a `160000` gitlink (submodule) | `LBR-UNSUPPORTED-001` | 128 | Resolve the submodule pointer outside Libra, or drop the gitlink entry — refused before the autostash and before any index/worktree write (see `docs/commands/merge.md`) |
 | Rebase: conflict during replay | `LBR-CONFLICT-001` | 128 | "resolve conflicts, stage them, then run 'libra rebase --continue'" |
 | Rebase: dirty worktree | `LBR-REPO-003` | 128 | "commit or stash your changes before rebasing" |
 | Merge: invalid target | `LBR-CLI-003` | 129 | "verify the upstream ref and try again" |

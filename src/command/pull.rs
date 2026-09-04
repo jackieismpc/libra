@@ -432,6 +432,16 @@ pub(crate) async fn run_pull(
     // has no autostash machinery of its own — see COMPATIBILITY.md rebase
     // row). The MERGE path uses the Git-faithful merge-owned autostash below
     // (held on conflict rather than popped back into a conflicted tree).
+    // ADR-MG-01: the rebase path's gitlink gate lives inside
+    // `rebase::run_rebase_for_pull`, which runs AFTER this push — so the
+    // refusal has to be raised here, before the stash commit and the worktree
+    // reset it performs. (The merge path's own gate is already ahead of the
+    // merge-owned autostash.)
+    if effective.rebase {
+        rebase::preflight_gitlinks_for_pull(&target.upstream)
+            .await
+            .map_err(PullError::Rebase)?;
+    }
     let autostash_entry = if args.autostash && effective.rebase {
         stash::autostash_push()
             .await
@@ -1040,6 +1050,14 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
         merge::PullMergeError::UnrelatedHistories => {
             CliError::failure(error.to_string()).with_stable_code(StableErrorCode::RepoStateInvalid)
         }
+        merge::PullMergeError::GitlinkUnsupported(..) => CliError::failure(error.to_string())
+            .with_stable_code(StableErrorCode::Unsupported)
+            .with_hint(
+                "submodule merging is a permanent non-goal; resolve the submodule pointer outside Libra",
+            )
+            .with_hint(
+                "or drop the gitlink entry from the branches being merged so no submodule decision is needed",
+            ),
         merge::PullMergeError::NonFastForward { .. } => CliError::failure(error.to_string())
             .with_stable_code(StableErrorCode::ConflictOperationBlocked)
             .with_hint("run 'libra pull' without --ff-only to allow a merge commit")

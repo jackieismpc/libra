@@ -246,6 +246,7 @@ Rebase 输出省略 `merge` 并包含 `rebase`：
 | Fetch：协议错误 | `LBR-NET-002` | 128 | "the remote did not respond correctly" |
 | Merge：冲突、脏工作树或未跟踪覆盖 | `LBR-CONFLICT-002` | 128 | "resolve conflicts, then run 'libra merge --continue'" |
 | Merge：`--ff-only` 拒绝非快进 | `LBR-CONFLICT-002` | 128 | "run 'libra pull' without --ff-only to allow a merge commit" |
+| Merge 或 rebase 需要裁决 `160000` gitlink（submodule） | `LBR-UNSUPPORTED-001` | 128 | 在 Libra 之外解决 submodule 指针，或移除该 gitlink 条目——拒绝发生在 autostash 与任何索引/工作树写入之前（见 `docs/commands/zh-CN/merge.md`） |
 | Rebase：重放期间冲突 | `LBR-CONFLICT-001` | 128 | "resolve conflicts, stage them, then run 'libra rebase --continue'" |
 | Rebase：脏工作树 | `LBR-REPO-003` | 128 | "commit or stash your changes before rebasing" |
 | Merge：无效目标 | `LBR-CLI-003` | 129 | "verify the upstream ref and try again" |

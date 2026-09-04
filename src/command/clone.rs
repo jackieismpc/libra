@@ -1116,6 +1116,11 @@ fn map_checkout_error(source: RestoreError) -> CliError {
         ))
         .with_stable_code(StableErrorCode::ConflictOperationBlocked)
         .with_hint("move or remove nested files before retrying the checkout"),
+        RestoreError::SubmodulePathNotOwned(path) => CliError::fatal(format!(
+            "working tree checkout refused to replace '{path}': Libra does not manage submodule content there"
+        ))
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+        .with_hint("move that path aside before retrying the checkout"),
         RestoreError::LfsDownload => {
             CliError::fatal("checkout required downloading LFS content, but the transfer failed")
                 .with_stable_code(StableErrorCode::NetworkUnavailable)

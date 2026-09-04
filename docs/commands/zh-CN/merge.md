@@ -27,6 +27,22 @@ libra merge --restart
 
 标记格式遵循 Git 兼容的 `merge.conflictStyle` 配置键（仅配置——与 Git 一致，`merge` 无 CLI 风格参数）：`libra config merge.conflictStyle diff3`。`merge`（默认/未设置）为上述双标记风格；`diff3` 额外在 `||||||| base` 标记与 `=======` 分隔符之间输出共同祖先内容；其它值（含未实现的 `zdiff3`）在需要渲染冲突时直接报错（退出 128），绝不静默回落默认风格。该配置同时被 `libra merge` 与 `libra cherry-pick` 的行级文本冲突尊重；二进制与 modify/delete 冲突保持两段式整文件呈现（Git 亦不为其输出 base 块），`libra rebase` 目前始终渲染无 base 块的整文件标记、不受此配置影响。
 
+### 子模块（`160000` gitlink 条目）
+
+Libra 定位 monorepo 客户端，永不合并 submodule 内容。三路合并对 gitlink 分两档处理：
+
+- **合并需要对该 gitlink 做裁决**——任一侧记录的 commit id 与 merge base 不同（包括某一侧新增或删除该条目）。合并在**写入任何内容之前**被拒绝（不写 merge state、不动索引与工作树、HEAD 不移动），错误码 `LBR-UNSUPPORTED-001`，消息包含路径：
+
+  ```
+  error: merge would have to merge the submodule (gitlink) entry 'vendor': Libra does not support submodules
+  ```
+
+  请在 Libra 之外解决 submodule 指针，或从参与合并的分支中移除该 gitlink 条目。
+
+- **三侧记录的 commit id 完全一致**——没有任何决策要做，指针原样写入合并结果。（此前这类条目会被静默丢弃，等于把 submodule 从合并结果树里删掉。）
+
+`libra rebase` 与 `libra cherry-pick` 共用同一道校验与同一措辞，仅把 `merge` 换成 `rebase` / `cherry-pick`。
+
 Libra 仍未实现 octopus merge、`ours` 以外的 merge strategy、`ours`/`theirs` 以外的 strategy option，或交互式消息编辑（`--edit`/启动编辑器）。签名验证（`--verify-signatures`）已支持，但仅限本仓库 vault PGP key（无外部 GPG keyring）。
 
 ### 会改变历史的 merge 默认值
@@ -214,6 +230,7 @@ Merge aborted.
 | 无法解析目标引用 | `LBR-CLI-003` | 129 |
 | 无法加载合并目标/当前提交/树 | `LBR-REPO-002` | 128 |
 | 未传 `--allow-unrelated-histories` 的无关历史 | `LBR-REPO-003` | 128 |
+| 三路合并需要裁决 `160000` gitlink（submodule） | `LBR-UNSUPPORTED-001` | 128 |
 | 不支持的 `-s` / `-X` 值或不兼容的 strategy 组合 | `LBR-CLI-002` | 129 |
 | `--verify-signatures`：tip 未签名、签名无效或 vault 不可用 | `LBR-REPO-003` | 128 |
 | 合并冲突 | `LBR-CONFLICT-002` | 128 |

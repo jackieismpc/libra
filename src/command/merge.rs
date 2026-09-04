@@ -2,7 +2,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     str::FromStr,
@@ -655,6 +655,11 @@ pub(crate) enum PullMergeError {
     History(String),
     #[error("refusing to merge unrelated histories")]
     UnrelatedHistories,
+    /// A three-way merge input carries a gitlink the merge would have to
+    /// arbitrate. Refused before any index/worktree write (ADR-MG-01) rather
+    /// than silently dropped from the merge result the way it used to be.
+    #[error("{0}")]
+    GitlinkUnsupported(GitlinkNotSupported),
     #[error("merge has conflicts in {paths}")]
     Conflicts { paths: String },
     #[error("no merge in progress")]
@@ -739,6 +744,14 @@ impl From<PullMergeError> for CliError {
             }
             PullMergeError::UnrelatedHistories => CliError::failure(error.to_string())
                 .with_stable_code(StableErrorCode::RepoStateInvalid),
+            PullMergeError::GitlinkUnsupported(..) => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::Unsupported)
+                .with_hint(
+                    "submodule merging is a permanent non-goal; resolve the submodule pointer outside Libra",
+                )
+                .with_hint(
+                    "or drop the gitlink entry from the branches being merged so no submodule decision is needed",
+                ),
             PullMergeError::UnsignedMergeCommit { .. }
             | PullMergeError::BadMergeSignature { .. } => CliError::failure(error.to_string())
                 .with_stable_code(StableErrorCode::RepoStateInvalid)
@@ -1433,6 +1446,10 @@ pub(crate) async fn run_merge_for_pull_with_options(
     if options.verify_signatures {
         verify_merge_commit_signature(&target_commit).await?;
     }
+    // ADR-MG-01: refuse a submodule-arbitrating merge here, ahead of the
+    // autostash below — its stash commit, sidecar and worktree reset are
+    // writes, and the card requires a refused merge to make none.
+    preflight_merge_gitlinks(&target_commit, &options).await?;
 
     // ── autostash (lore.md §1.8) ──
     // Stale-sidecar recovery: a leftover sidecar with NO merge in progress
@@ -1548,6 +1565,89 @@ pub(crate) async fn run_merge_for_pull_with_options(
     }
 }
 
+/// Whether the target is already reachable from HEAD — nothing to merge.
+/// Shared by the merge itself and by [`preflight_merge_gitlinks`] so the two can
+/// never disagree about which merges arbitrate anything (GC-02).
+fn merge_is_up_to_date(lca: Option<&Commit>, target_commit: &Commit) -> bool {
+    lca.is_some_and(|base| base.id == target_commit.id)
+}
+
+/// Whether the merge will fast-forward: HEAD is the merge base and no option
+/// forces a merge commit. A fast-forward adopts the target tree wholesale, so
+/// it decides nothing — gitlinks included. Shared with
+/// [`preflight_merge_gitlinks`] (GC-02).
+fn merge_is_fast_forward(
+    lca: Option<&Commit>,
+    current_commit: &Commit,
+    options: &PullMergeOptions,
+) -> bool {
+    lca.is_some_and(|base| base.id == current_commit.id)
+        && options.strategy.is_none()
+        && !options.no_ff
+        && !options.squash
+        && !options.no_commit
+}
+
+/// ADR-MG-01 gate for the merge WRAPPER, ahead of every mutation it performs.
+///
+/// `perform_three_way_merge` has its own gate, but by the time it runs the
+/// autostash has already written a stash commit, an fsynced sidecar, and reset
+/// the working tree — writes the card requires a refused merge not to make.
+/// This mirrors the placement `--verify-signatures` already uses for the same
+/// reason. Only a merge that will actually ARBITRATE is checked: an
+/// up-to-date, fast-forward, unborn-HEAD or `-s ours` merge adopts a tree
+/// wholesale and never decides anything about a submodule.
+async fn preflight_merge_gitlinks(
+    target_commit: &Commit,
+    options: &PullMergeOptions,
+) -> Result<(), PullMergeError> {
+    if options.strategy.is_some() {
+        return Ok(());
+    }
+    let Some(current_commit_id) = Head::current_commit().await else {
+        return Ok(());
+    };
+    let current_commit: Commit =
+        load_object(&current_commit_id).map_err(|error| PullMergeError::CurrentLoad {
+            commit_id: current_commit_id.to_string(),
+            detail: error.to_string(),
+        })?;
+    let lca = lca_commit(&current_commit, target_commit)
+        .map_err(|error| PullMergeError::History(error.to_string()))?;
+    // Every shape the engine settles WITHOUT arbitrating is skipped here, so a
+    // gitlink refusal can never pre-empt the engine's own verdict:
+    //   * unrelated histories the user did not opt into are rejected outright;
+    //   * `--ff-only` on a genuinely diverged history is rejected outright;
+    //   * an up-to-date or fast-forward merge adopts a tree wholesale.
+    if lca.is_none() && !options.allow_unrelated_histories {
+        return Ok(());
+    }
+    if options.ff_only
+        && !lca
+            .as_ref()
+            .is_some_and(|base| base.id == current_commit.id)
+    {
+        return Ok(());
+    }
+    if merge_is_up_to_date(lca.as_ref(), target_commit)
+        || merge_is_fast_forward(lca.as_ref(), &current_commit, options)
+    {
+        return Ok(());
+    }
+    let base_gitlinks = match lca.as_ref() {
+        Some(base) => commit_gitlink_entries(base)?,
+        None => GitlinkEntries::new(),
+    };
+    ensure_gitlinks_not_arbitrated(
+        "merge",
+        &base_gitlinks,
+        &commit_gitlink_entries(&current_commit)?,
+        &commit_gitlink_entries(target_commit)?,
+    )
+    .map(|_| ())
+    .map_err(PullMergeError::GitlinkUnsupported)
+}
+
 fn merge_completed_for_post_hook(summary: &PullMergeSummary) -> bool {
     !summary.dry_run
         && !summary.aborted
@@ -1600,7 +1700,7 @@ async fn run_merge_for_pull_inner(
         return Err(PullMergeError::UnrelatedHistories);
     }
 
-    if lca.as_ref().is_some_and(|base| base.id == target_commit.id) {
+    if merge_is_up_to_date(lca.as_ref(), &target_commit) {
         return Ok(PullMergeSummary {
             strategy: "already-up-to-date".to_string(),
             old_commit: Some(current_commit_id.to_string()),
@@ -1617,14 +1717,7 @@ async fn run_merge_for_pull_inner(
         });
     }
 
-    if lca
-        .as_ref()
-        .is_some_and(|base| base.id == current_commit.id)
-        && options.strategy.is_none()
-        && !options.no_ff
-        && !options.squash
-        && !options.no_commit
-    {
+    if merge_is_fast_forward(lca.as_ref(), &current_commit, &options) {
         let files_changed = count_changed_files(Some(&current_commit), &target_commit)?;
         // `--dry-run`: report the fast-forward preview without applying it.
         if !options.dry_run {
@@ -1890,12 +1983,19 @@ async fn perform_three_way_merge(
     }
 
     let head_name = current_head_name().await?;
-    let base_items = match base_commit.as_ref() {
-        Some(base) => commit_tree_items(base)?,
-        None => HashMap::new(),
+    let (base_items, base_gitlinks) = match base_commit.as_ref() {
+        Some(base) => commit_tree_split(base)?,
+        None => (HashMap::new(), GitlinkEntries::new()),
     };
-    let our_items = commit_tree_items(&current_commit)?;
-    let their_items = commit_tree_items(&target_commit)?;
+    let (our_items, our_gitlinks) = commit_tree_split(&current_commit)?;
+    let (their_items, their_gitlinks) = commit_tree_split(&target_commit)?;
+    // ADR-MG-01 fail-closed gate: refuse before the first write (this runs
+    // ahead of the `--dry-run` report as well, so the preview is honest) if any
+    // submodule pointer diverged. Gitlinks the three sides agree on are carried
+    // into the result tree untouched instead of vanishing from it.
+    let passthrough_gitlinks =
+        ensure_gitlinks_not_arbitrated("merge", &base_gitlinks, &our_gitlinks, &their_gitlinks)
+            .map_err(PullMergeError::GitlinkUnsupported)?;
     // Under `--dry-run`, auto-merged blobs are computed in memory only
     // (persist=false) so the preview writes nothing to the object store —
     // under tiered storage a `save_object` would even upload to the remote.
@@ -1907,6 +2007,21 @@ async fn perform_three_way_merge(
         options.favor,
     )?;
     let files_changed = count_item_map_changes(&our_items, &merge_result.merged_items);
+
+    // Carry the agreed-on gitlinks into the merge result. Injected AFTER
+    // `files_changed` so an untouched submodule is never reported as a changed
+    // file, and never routed through `resolve_three_way` — the merge only
+    // copies the object id all three sides already had.
+    let mut merge_result = merge_result;
+    for (path, gitlink) in &passthrough_gitlinks {
+        merge_result.merged_items.insert(
+            path.clone(),
+            MergeTreeEntry {
+                hash: *gitlink,
+                mode: TreeItemMode::Commit,
+            },
+        );
+    }
 
     // `--dry-run`: the outcome is fully known here — report it and stop before
     // the FIRST write (no merge state, index, worktree, HEAD, or reflog
@@ -1984,8 +2099,9 @@ async fn perform_three_way_merge(
 
     let current_index =
         Index::load(path::index()).map_err(|error| PullMergeError::IndexLoad(error.to_string()))?;
-    let paths_to_write: Vec<PathBuf> = merge_result.merged_items.keys().cloned().collect();
-    ensure_no_untracked_conflicts(&current_index, &paths_to_write)?;
+    let paths_to_write = worktree_paths_to_write(&merge_result.merged_items);
+    let gitlink_paths: Vec<PathBuf> = passthrough_gitlinks.keys().cloned().collect();
+    ensure_no_untracked_conflicts(&current_index, &paths_to_write, &gitlink_paths)?;
 
     let tree_id = create_tree_from_items_map(&merge_result.merged_items)
         .map_err(PullMergeError::TreeCreate)?;
@@ -2056,12 +2172,12 @@ async fn perform_three_way_merge(
         // computed. Recheck before saving the commit or moving HEAD; relying
         // on the reset-time guard would detect the collision too late and
         // leave a partially completed merge.
-        ensure_no_untracked_conflicts(&current_index, &paths_to_write)?;
+        ensure_no_untracked_conflicts(&current_index, &paths_to_write, &gitlink_paths)?;
         let message = run_merge_message_hooks(&resolved_message, options.output).await?;
         switch::ensure_clean_status(options.output)
             .await
             .map_err(|_| PullMergeError::DirtyWorktree)?;
-        ensure_no_untracked_conflicts(&current_index, &paths_to_write)?;
+        ensure_no_untracked_conflicts(&current_index, &paths_to_write, &gitlink_paths)?;
         message
     } else {
         resolved_message
@@ -2162,13 +2278,17 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
         .iter()
         .map(|(path, _)| path.clone())
         .collect();
-    let paths_to_write: Vec<PathBuf> = input
-        .merged_items
-        .keys()
-        .cloned()
+    let paths_to_write: Vec<PathBuf> = worktree_paths_to_write(&input.merged_items)
+        .into_iter()
         .chain(conflict_paths.iter().cloned())
         .collect();
-    ensure_no_untracked_conflicts(&current_index, &paths_to_write)?;
+    let gitlink_paths: Vec<PathBuf> = input
+        .merged_items
+        .iter()
+        .filter(|(_, entry)| entry.mode == TreeItemMode::Commit)
+        .map(|(path, _)| path.clone())
+        .collect();
+    ensure_no_untracked_conflicts(&current_index, &paths_to_write, &gitlink_paths)?;
 
     let conflict_set: HashSet<PathBuf> = conflict_paths.iter().cloned().collect();
     let workdir = util::working_dir();
@@ -2214,6 +2334,11 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
     }
 
     for (path, entry) in &input.merged_items {
+        // Submodule working trees are not materialized by Libra: a pass-through
+        // gitlink is an index/tree fact only (ADR-MG-01).
+        if entry.mode == TreeItemMode::Commit {
+            continue;
+        }
         let blob: Blob = load_object(&entry.hash).map_err(|error| {
             PullMergeError::WorkdirReset(format!(
                 "failed to load merged blob {} for '{}': {error}",
@@ -2312,7 +2437,20 @@ async fn run_merge_continue(
             commit_id: orig_head.to_string(),
             detail: error.to_string(),
         })?;
-    let original_items = commit_tree_items(&original_commit)?;
+    // Pass-through gitlinks were staged at stage 0 when the conflict was
+    // written (ADR-MG-01), so the index already carries them into the result
+    // tree; the pre-merge snapshot has to include them too, or an untouched
+    // submodule would be counted as a changed file.
+    let (mut original_items, original_gitlinks) = commit_tree_split(&original_commit)?;
+    for (path, gitlink) in original_gitlinks {
+        original_items.insert(
+            path,
+            MergeTreeEntry {
+                hash: gitlink,
+                mode: TreeItemMode::Commit,
+            },
+        );
+    }
     let index_items = index_tree_items(&index)?;
     let files_changed = count_item_map_changes(&original_items, &index_items);
     let tree_id = create_tree_from_items_map(&index_items).map_err(MergeError::TreeCreate)?;
@@ -2558,11 +2696,15 @@ async fn apply_fast_forward_merge(
     switch::ensure_clean_status(output)
         .await
         .map_err(|_| PullMergeError::DirtyWorktree)?;
-    let target_items = commit_tree_items(&target_commit)?;
+    let (target_items, target_gitlinks) = commit_tree_split(&target_commit)?;
     let current_index =
         Index::load(path::index()).map_err(|error| PullMergeError::IndexLoad(error.to_string()))?;
     let paths_to_write: Vec<PathBuf> = target_items.keys().cloned().collect();
-    ensure_no_untracked_conflicts(&current_index, &paths_to_write)?;
+    // A fast-forward materializes the target tree, gitlinks included: a plain
+    // file sitting exactly at a submodule path would be replaced by `restore`'s
+    // directory placeholder, so it has to be refused here, before HEAD moves.
+    let gitlink_paths: Vec<PathBuf> = target_gitlinks.keys().cloned().collect();
+    ensure_no_untracked_conflicts(&current_index, &paths_to_write, &gitlink_paths)?;
 
     let db = get_db_conn_instance().await;
 
@@ -2586,6 +2728,14 @@ async fn apply_fast_forward_merge(
         new_oid: target_commit.id.to_string(),
         action,
     };
+
+    // The restore below deliberately runs AFTER the pointers move, so anything
+    // it would refuse has to be caught here — otherwise the branch ends up
+    // ahead of the index and working tree. Most visibly: a materialized
+    // submodule directory the target tree no longer declares (ADR-MG-01).
+    restore::preflight_worktree_restore_to_commit(&target_commit.id)
+        .await
+        .map_err(|error| PullMergeError::Restore(error.to_string()))?;
 
     // Use `with_reflog`. A merge operation should log for the branch.
     if let Err(e) = with_reflog(
@@ -2663,22 +2813,185 @@ fn count_changed_files(
         .count())
 }
 
-fn commit_tree_items(commit: &Commit) -> Result<HashMap<PathBuf, MergeTreeEntry>, PullMergeError> {
+/// The gitlink (`160000`) entries of one three-way merge input, keyed by
+/// worktree-relative path.
+///
+/// Submodule content is never merged (ADR-MG-01), so gitlinks are held here
+/// instead of in the mergeable entry maps. Keeping them addressable — rather
+/// than dropping them during tree flattening, as `merge` and `rebase` used to —
+/// is what lets [`ensure_gitlinks_not_arbitrated`] tell "the merge has to make
+/// a decision about this submodule" (refused) from "all three sides already
+/// agree" (carried through untouched).
+pub(crate) type GitlinkEntries = BTreeMap<PathBuf, ObjectHash>;
+
+/// A three-way merge was refused because it would have had to arbitrate a
+/// gitlink. Produced by [`ensure_gitlinks_not_arbitrated`] and rendered into
+/// each consumer's own error type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitlinkNotSupported {
+    /// The operation the user asked for: `merge`, `rebase`, `cherry-pick`.
+    pub(crate) operation: &'static str,
+    /// The gitlink path that would need a merge decision.
+    pub(crate) path: PathBuf,
+}
+
+impl std::fmt::Display for GitlinkNotSupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} would have to merge the submodule (gitlink) entry '{}': Libra does not support submodules",
+            self.operation,
+            self.path.display()
+        )
+    }
+}
+
+/// Split a flattened tree listing into its mergeable entries and its gitlinks.
+///
+/// The mergeable half keeps exactly the entries the three-way engine used to
+/// see (blobs, executables, symlinks); the gitlink half replaces the silent
+/// `filter_map` drop that made a submodule vanish from the merge result.
+pub(crate) fn split_gitlink_entries(
+    items: Vec<(PathBuf, ObjectHash, TreeItemMode)>,
+) -> (HashMap<PathBuf, MergeTreeEntry>, GitlinkEntries) {
+    let mut mergeable = HashMap::new();
+    let mut gitlinks = GitlinkEntries::new();
+    for (path, hash, mode) in items {
+        if mode == TreeItemMode::Commit {
+            gitlinks.insert(path, hash);
+        } else {
+            mergeable.insert(path, MergeTreeEntry { hash, mode });
+        }
+    }
+    (mergeable, gitlinks)
+}
+
+/// Fail-closed gitlink guard shared by every three-way consumer — `merge`,
+/// `rebase` and `cherry-pick` (ADR-MG-01, single source of truth per GC-02).
+///
+/// Libra is a monorepo client and never merges submodule content. The two
+/// tiers are:
+///
+/// 1. a gitlink the merge would have to *arbitrate* — any side whose object id
+///    differs from the base, including a side that added or removed it — is
+///    refused, and the caller must surface the refusal before touching the
+///    index or the working tree; and
+/// 2. a gitlink all three sides already agree on is returned as pass-through,
+///    so the caller can carry the entry into the merge result byte-for-byte
+///    without ever making a decision about it.
+///
+/// Returns the pass-through set on success, or the first arbitrated path
+/// (scanned in sorted order, so the reported path is deterministic).
+pub(crate) fn ensure_gitlinks_not_arbitrated(
+    operation: &'static str,
+    base: &GitlinkEntries,
+    ours: &GitlinkEntries,
+    theirs: &GitlinkEntries,
+) -> Result<GitlinkEntries, GitlinkNotSupported> {
+    let mut paths: BTreeSet<&PathBuf> = base.keys().collect();
+    paths.extend(ours.keys());
+    paths.extend(theirs.keys());
+
+    let mut passthrough = GitlinkEntries::new();
+    for path in paths {
+        match (base.get(path), ours.get(path), theirs.get(path)) {
+            (Some(base_oid), Some(our_oid), Some(their_oid))
+                if base_oid == our_oid && base_oid == their_oid =>
+            {
+                passthrough.insert(path.clone(), *base_oid);
+            }
+            _ => {
+                return Err(GitlinkNotSupported {
+                    operation,
+                    path: path.clone(),
+                });
+            }
+        }
+    }
+    Ok(passthrough)
+}
+
+/// Conservative pre-mutation gitlink gate for MULTI-STEP replays (`rebase`,
+/// `cherry-pick`).
+///
+/// A per-step [`ensure_gitlinks_not_arbitrated`] cannot run before the sequence
+/// starts: each step's "ours" side only exists once the previous step has been
+/// applied, so by the time step N would be refused the sequence has already
+/// moved HEAD, written its state sidecar, and possibly created commits. This
+/// gate asks a stronger question up front instead — every input tree of the
+/// WHOLE sequence must record the same object id for a given gitlink path —
+/// which is the only shape in which no individual step can end up arbitrating
+/// one (ADR-MG-01).
+///
+/// Deliberately conservative: a sequence whose inputs disagree is refused
+/// before the first write even in the rare shape where every individual step
+/// would have turned out fine. Refusing up front beats stopping half-applied.
+pub(crate) fn ensure_gitlinks_uniform_across_inputs(
+    operation: &'static str,
+    inputs: &[GitlinkEntries],
+) -> Result<(), GitlinkNotSupported> {
+    let mut paths: BTreeSet<&PathBuf> = BTreeSet::new();
+    for input in inputs {
+        paths.extend(input.keys());
+    }
+    for path in paths {
+        let mut pointers = inputs.iter().map(|input| input.get(path));
+        let first = pointers.next().unwrap_or(None);
+        if first.is_none() || !pointers.all(|pointer| pointer == first) {
+            return Err(GitlinkNotSupported {
+                operation,
+                path: path.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The gitlink entries of `commit`'s tree.
+pub(crate) fn commit_gitlink_entries(commit: &Commit) -> Result<GitlinkEntries, PullMergeError> {
+    commit_tree_split(commit).map(|(_, gitlinks)| gitlinks)
+}
+
+/// Collect the gitlink entries of a commit's tree without flattening the
+/// mergeable half — used by consumers that take one side from the index rather
+/// than from a tree (`cherry-pick`).
+pub(crate) fn tree_gitlink_entries(tree: &Tree) -> GitlinkEntries {
+    tree.get_plain_items_with_mode()
+        .into_iter()
+        .filter(|(_, _, mode)| *mode == TreeItemMode::Commit)
+        .map(|(path, hash, _)| (path, hash))
+        .collect()
+}
+
+/// Gitlink entries recorded at stage 0 of an index — the "ours" side for
+/// consumers that apply onto the index (`cherry-pick`).
+pub(crate) fn index_gitlink_entries(index: &Index) -> GitlinkEntries {
+    let mut gitlinks = GitlinkEntries::new();
+    for path in index.tracked_files() {
+        let Some(key) = path.to_str() else { continue };
+        if let Some(entry) = index.get(key, 0)
+            && entry.mode & 0o170000 == 0o160000
+        {
+            gitlinks.insert(path.clone(), entry.hash);
+        }
+    }
+    gitlinks
+}
+
+/// Flatten a commit tree into the mergeable entries plus the gitlinks it
+/// carries (see [`split_gitlink_entries`]).
+fn commit_tree_split(
+    commit: &Commit,
+) -> Result<(HashMap<PathBuf, MergeTreeEntry>, GitlinkEntries), PullMergeError> {
     let tree: Tree = load_object(&commit.tree_id).map_err(|error| PullMergeError::TreeLoad {
         tree_id: commit.tree_id.to_string(),
         detail: error.to_string(),
     })?;
-    Ok(tree
-        .get_plain_items_with_mode()
-        .into_iter()
-        .filter_map(|(path, hash, mode)| {
-            if mode == TreeItemMode::Commit {
-                None
-            } else {
-                Some((path, MergeTreeEntry { hash, mode }))
-            }
-        })
-        .collect())
+    Ok(split_gitlink_entries(tree.get_plain_items_with_mode()))
+}
+
+fn commit_tree_items(commit: &Commit) -> Result<HashMap<PathBuf, MergeTreeEntry>, PullMergeError> {
+    commit_tree_split(commit).map(|(items, _)| items)
 }
 
 async fn current_head_name() -> Result<String, PullMergeError> {
@@ -3095,33 +3408,65 @@ fn add_blob_index_entry(
     item: MergeTreeEntry,
     stage: u8,
 ) -> Result<(), PullMergeError> {
-    let blob: Blob = load_object(&item.hash).map_err(|error| {
-        PullMergeError::IndexSave(format!(
-            "failed to load blob {} for index entry '{}': {error}",
-            item.hash,
-            path.display()
-        ))
-    })?;
-    let mut entry = IndexEntry::new_from_blob(
-        path_to_index_key(path)?.to_string(),
-        item.hash,
-        blob.data.len() as u32,
-    );
+    // A gitlink records a SUBMODULE's commit id, which is not an object of this
+    // repository — asking for it as a blob would fail. Only a pass-through
+    // gitlink (identical on all three sides, ADR-MG-01) ever reaches here, so
+    // the pointer is registered verbatim with a zero size.
+    let size = if item.mode == TreeItemMode::Commit {
+        0
+    } else {
+        let blob: Blob = load_object(&item.hash).map_err(|error| {
+            PullMergeError::IndexSave(format!(
+                "failed to load blob {} for index entry '{}': {error}",
+                item.hash,
+                path.display()
+            ))
+        })?;
+        blob.data.len() as u32
+    };
+    let mut entry =
+        IndexEntry::new_from_blob(path_to_index_key(path)?.to_string(), item.hash, size);
     entry.mode = tree_item_mode_to_index_mode(item.mode)?;
     entry.flags.stage = stage;
     index.add(entry);
     Ok(())
 }
 
+/// The merged paths that will actually be materialized in the working tree.
+///
+/// Pass-through gitlinks are excluded: Libra never writes a submodule working
+/// tree, so an already-present submodule directory must not be mistaken for an
+/// untracked path the merge is about to overwrite.
+fn worktree_paths_to_write(merged_items: &HashMap<PathBuf, MergeTreeEntry>) -> Vec<PathBuf> {
+    merged_items
+        .iter()
+        .filter(|(_, entry)| entry.mode != TreeItemMode::Commit)
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
 fn ensure_no_untracked_conflicts(
     current_index: &Index,
     paths: &[PathBuf],
+    gitlink_paths: &[PathBuf],
 ) -> Result<(), PullMergeError> {
     let untracked_paths =
         worktree::untracked_workdir_paths(current_index).map_err(PullMergeError::IndexLoad)?;
     for untracked in &untracked_paths {
         for path in paths {
             if worktree::paths_conflict(untracked, path) {
+                return Err(PullMergeError::UntrackedOverwrite {
+                    path: untracked.display().to_string(),
+                });
+            }
+        }
+        // A gitlink is matched on the EXACT path only. Libra writes no content
+        // inside a submodule, so untracked files UNDER it are the submodule's
+        // own checkout and are not overwritten — but a plain file or symlink
+        // sitting exactly there WOULD be replaced by the directory placeholder
+        // `restore` creates for a `160000` entry (ADR-MG-01).
+        for path in gitlink_paths {
+            if untracked == path {
                 return Err(PullMergeError::UntrackedOverwrite {
                     path: untracked.display().to_string(),
                 });
@@ -3418,6 +3763,12 @@ fn reset_workdir_tracked_only(
     let new_tracked_paths: HashSet<_> = new_index.tracked_files().into_iter().collect();
     for path_buf in current_index.tracked_files() {
         if !new_tracked_paths.contains(&path_buf) {
+            // A submodule directory is not Libra's to delete, and a gitlink can
+            // only leave the index through a decision the ADR-MG-01 guard
+            // already refused — so never unlink one here.
+            if is_gitlink_index_path(current_index, &path_buf)? {
+                continue;
+            }
             let full_path = workdir.join(path_buf);
             if full_path.exists() {
                 fs::remove_file(&full_path).map_err(|error| {
@@ -3429,6 +3780,10 @@ fn reset_workdir_tracked_only(
 
     for path_buf in new_index.tracked_files() {
         if let Some(entry) = new_index.get(path_to_index_key(&path_buf)?, 0) {
+            // Pass-through gitlink: nothing to materialize in the working tree.
+            if entry.mode & 0o170000 == 0o160000 {
+                continue;
+            }
             let blob: Blob = load_object(&entry.hash).map_err(|error| {
                 PullMergeError::WorkdirReset(format!(
                     "failed to load blob {} for '{}': {error}",
@@ -3441,6 +3796,13 @@ fn reset_workdir_tracked_only(
         }
     }
     Ok(())
+}
+
+/// Whether `path` is recorded in `index` as a gitlink (`160000`) at stage 0.
+fn is_gitlink_index_path(index: &Index, path: &Path) -> Result<bool, PullMergeError> {
+    Ok(index
+        .get(path_to_index_key(path)?, 0)
+        .is_some_and(|entry| entry.mode & 0o170000 == 0o160000))
 }
 
 fn has_unmerged_entries(index: &Index) -> bool {
@@ -3492,9 +3854,11 @@ fn tree_item_mode_to_index_mode(mode: TreeItemMode) -> Result<u32, PullMergeErro
         TreeItemMode::Tree => Err(PullMergeError::IndexSave(
             "tree entry cannot be represented as a file index entry".to_string(),
         )),
-        TreeItemMode::Commit => Err(PullMergeError::IndexSave(
-            "gitlink entries are not supported by merge".to_string(),
-        )),
+        // Reachable only for a pass-through gitlink (ADR-MG-01): an arbitrated
+        // one is refused by `ensure_gitlinks_not_arbitrated` long before the
+        // index is built, so recording the unchanged pointer keeps the index
+        // consistent with the merged tree instead of dropping the submodule.
+        TreeItemMode::Commit => Ok(0o160000),
     }
 }
 
@@ -3503,6 +3867,7 @@ fn index_mode_to_tree_item_mode(mode: u32) -> Result<TreeItemMode, PullMergeErro
         0o100644 => Ok(TreeItemMode::Blob),
         0o100755 => Ok(TreeItemMode::BlobExecutable),
         0o120000 => Ok(TreeItemMode::Link),
+        0o160000 => Ok(TreeItemMode::Commit),
         other => Err(PullMergeError::TreeCreate(format!(
             "unsupported index mode {other:o} while creating merge tree"
         ))),
@@ -3964,6 +4329,14 @@ mod tests {
             PullMergeError::Restore("checkout failed".to_string()).to_string(),
             "failed to restore working tree after merge: checkout failed",
         );
+        assert_eq!(
+            PullMergeError::GitlinkUnsupported(GitlinkNotSupported {
+                operation: "merge",
+                path: PathBuf::from("vendor/sub"),
+            })
+            .to_string(),
+            "merge would have to merge the submodule (gitlink) entry 'vendor/sub': Libra does not support submodules",
+        );
     }
 
     #[test]
@@ -3983,5 +4356,93 @@ mod tests {
 
         assert!(result.conflicts.is_empty());
         assert_eq!(result.merged_items.get(&path), Some(&theirs));
+    }
+
+    fn gitlink_side(entries: &[(&str, u8)]) -> GitlinkEntries {
+        entries
+            .iter()
+            .map(|(path, byte)| (PathBuf::from(path), ObjectHash::new(&[*byte; 20])))
+            .collect()
+    }
+
+    #[test]
+    fn split_gitlink_entries_separates_pointers_from_mergeable_entries() {
+        let blob = ObjectHash::new(&[1; 20]);
+        let gitlink = ObjectHash::new(&[2; 20]);
+        let (mergeable, gitlinks) = split_gitlink_entries(vec![
+            (PathBuf::from("a.txt"), blob, TreeItemMode::Blob),
+            (PathBuf::from("vendor"), gitlink, TreeItemMode::Commit),
+        ]);
+
+        assert_eq!(
+            mergeable.get(Path::new("a.txt")),
+            Some(&MergeTreeEntry {
+                hash: blob,
+                mode: TreeItemMode::Blob,
+            })
+        );
+        assert!(
+            !mergeable.contains_key(Path::new("vendor")),
+            "a gitlink must never reach the three-way decision"
+        );
+        assert_eq!(gitlinks.get(Path::new("vendor")), Some(&gitlink));
+    }
+
+    #[test]
+    fn ensure_gitlinks_not_arbitrated_passes_pointers_all_sides_agree_on() {
+        let side = gitlink_side(&[("vendor", 7)]);
+
+        let passthrough = ensure_gitlinks_not_arbitrated("merge", &side, &side, &side)
+            .expect("an unchanged submodule pointer needs no merge decision");
+
+        assert_eq!(passthrough, side, "the pointer is carried through verbatim");
+    }
+
+    #[test]
+    fn ensure_gitlinks_not_arbitrated_refuses_a_diverged_pointer() {
+        let base = gitlink_side(&[("vendor", 7)]);
+        let theirs = gitlink_side(&[("vendor", 8)]);
+
+        let refusal = ensure_gitlinks_not_arbitrated("merge", &base, &base, &theirs)
+            .expect_err("a moved submodule pointer needs a decision Libra cannot make");
+
+        assert_eq!(refusal.path, PathBuf::from("vendor"));
+        assert_eq!(refusal.operation, "merge");
+        assert_eq!(
+            refusal.to_string(),
+            "merge would have to merge the submodule (gitlink) entry 'vendor': Libra does not support submodules"
+        );
+    }
+
+    #[test]
+    fn ensure_gitlinks_not_arbitrated_refuses_a_one_sided_pointer() {
+        // Added on one side only, or deleted on one side only: both are
+        // "any side differs from the base" (ADR-MG-01) and both are refused,
+        // because resolving either would mean deciding about submodule content.
+        let none = GitlinkEntries::new();
+        let side = gitlink_side(&[("vendor", 7)]);
+
+        let added = ensure_gitlinks_not_arbitrated("rebase", &none, &side, &none)
+            .expect_err("an added submodule is still a decision");
+        assert_eq!(added.operation, "rebase");
+        assert_eq!(added.path, PathBuf::from("vendor"));
+
+        let deleted = ensure_gitlinks_not_arbitrated("cherry-pick", &side, &side, &none)
+            .expect_err("a removed submodule is still a decision");
+        assert_eq!(deleted.operation, "cherry-pick");
+        assert_eq!(deleted.path, PathBuf::from("vendor"));
+    }
+
+    #[test]
+    fn ensure_gitlinks_not_arbitrated_reports_the_first_path_in_sorted_order() {
+        // Deterministic reporting: with several diverged submodules the user
+        // must see the same path on every run, not a hash-order pick.
+        let base = gitlink_side(&[("b/sub", 1), ("a/sub", 1)]);
+        let theirs = gitlink_side(&[("b/sub", 2), ("a/sub", 2)]);
+
+        let refusal = ensure_gitlinks_not_arbitrated("merge", &base, &base, &theirs)
+            .expect_err("both submodules diverged");
+
+        assert_eq!(refusal.path, PathBuf::from("a/sub"));
     }
 }

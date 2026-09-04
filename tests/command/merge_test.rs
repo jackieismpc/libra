@@ -14,7 +14,7 @@ use serial_test::serial;
 
 use super::{
     assert_cli_success, create_committed_repo_via_cli, parse_cli_error_stderr, parse_json_stdout,
-    run_libra_command,
+    run_libra_command, run_libra_command_with_stdin,
 };
 
 fn commit_file(repo: &Path, file: &str, content: &str, message: &str) {
@@ -2280,5 +2280,1202 @@ async fn test_merge_continue_accepts_message_override_and_configured_identity() 
         (commit.author.name.as_str(), commit.author.email.as_str()),
         ("Test User", "test@example.com"),
         "continued merge commit must use the configured identity"
+    );
+}
+
+// ── ADR-MG-01 gitlink (submodule) fail-closed ────────────────────────────────
+//
+// Libra is a monorepo client and never merges submodule content. A three-way
+// merge that would have to ARBITRATE a `160000` gitlink is refused before
+// anything is written; a gitlink all three sides already agree on is carried
+// through untouched. `merge`, `rebase` and `cherry-pick` share one guard, so
+// the refusal text is identical apart from the operation name.
+
+/// The submodule pointer the fixtures start from. A gitlink names a commit of
+/// ANOTHER repository, so nothing requires it to exist here — which is exactly
+/// why merging one cannot be resolved locally.
+const GITLINK_BASE: &str = "0123456789abcdef0123456789abcdef01234567";
+/// A different pointer, used to make one side of the merge move the submodule.
+const GITLINK_MOVED: &str = "89abcdef0123456789abcdef0123456789abcdef";
+
+fn stdout_trimmed(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Build a repository whose base commit tracks a `vendor` gitlink, with a
+/// `feature` branch that adds `side.txt` and sets the gitlink to
+/// `feature_gitlink`, and a `main` tip that adds `ours.txt`.
+///
+/// Everything is composed with plumbing (`update-index --cacheinfo` /
+/// `write-tree` / `commit-tree` / `update-ref`) so no checkout ever has to
+/// materialize the submodule, and `main`'s index is restored to the base tree
+/// before the final commit — the fixture therefore starts from a clean status.
+fn create_gitlink_repo(feature_gitlink: &str) -> tempfile::TempDir {
+    create_gitlink_repo_with(feature_gitlink, false)
+}
+
+/// [`create_gitlink_repo`], optionally making both sides edit `tracked.txt` so
+/// the merge stops on a real content conflict while the submodule pointer stays
+/// untouched.
+fn create_gitlink_repo_with(feature_gitlink: &str, conflicting: bool) -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "update-index",
+                "--cacheinfo",
+                &format!("160000,{GITLINK_BASE},vendor"),
+            ],
+            p,
+        ),
+        "stage the base gitlink",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "add submodule", "--no-verify"], p),
+        "commit the base gitlink",
+    );
+    let base = head_commit(p);
+
+    let side_blob = {
+        let out = run_libra_command(&["hash-object", "-w", "--stdin"], p);
+        assert!(out.status.success(), "hash-object must succeed");
+        stdout_trimmed(&out)
+    };
+    // `hash-object --stdin` with no stdin body hashes the empty blob, which is
+    // all this fixture needs: the point is that `feature` touches a file.
+    let mut stage_feature = vec![
+        "update-index".to_string(),
+        "--cacheinfo".to_string(),
+        format!("100644,{side_blob},side.txt"),
+        "--cacheinfo".to_string(),
+        format!("160000,{feature_gitlink},vendor"),
+    ];
+    if conflicting {
+        let their_tracked = {
+            let out =
+                run_libra_command_with_stdin(&["hash-object", "-w", "--stdin"], p, "theirs edit\n");
+            assert!(out.status.success(), "hash-object must succeed");
+            stdout_trimmed(&out)
+        };
+        stage_feature.push("--cacheinfo".to_string());
+        stage_feature.push(format!("100644,{their_tracked},tracked.txt"));
+    }
+    let stage_feature: Vec<&str> = stage_feature.iter().map(String::as_str).collect();
+    assert_cli_success(
+        &run_libra_command(&stage_feature, p),
+        "stage the feature tree",
+    );
+    let tree = {
+        let out = run_libra_command(&["write-tree"], p);
+        assert_cli_success(&out, "write-tree");
+        stdout_trimmed(&out)
+    };
+    let feature = {
+        let out = run_libra_command(&["commit-tree", &tree, "-p", &base, "-m", "feature"], p);
+        assert_cli_success(&out, "commit-tree");
+        stdout_trimmed(&out)
+    };
+    assert_cli_success(
+        &run_libra_command(&["update-ref", "refs/heads/feature", &feature], p),
+        "create refs/heads/feature",
+    );
+
+    // Put main's index back to the base tree: `side.txt` was only ever an index
+    // entry, and the gitlink goes back to the pointer the base commit records.
+    assert_cli_success(
+        &run_libra_command(&["update-index", "--remove", "side.txt"], p),
+        "unstage side.txt",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "update-index",
+                "--cacheinfo",
+                &format!("160000,{GITLINK_BASE},vendor"),
+            ],
+            p,
+        ),
+        "restore the base gitlink",
+    );
+
+    std::fs::write(p.join("ours.txt"), "ours\n").expect("write ours.txt");
+    assert_cli_success(&run_libra_command(&["add", "ours.txt"], p), "add ours.txt");
+    if conflicting {
+        std::fs::write(p.join("tracked.txt"), "ours edit\n").expect("write tracked.txt");
+        assert_cli_success(
+            &run_libra_command(&["add", "tracked.txt"], p),
+            "add tracked.txt",
+        );
+    }
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "ours", "--no-verify"], p),
+        "commit ours",
+    );
+
+    repo
+}
+
+/// The `vendor` line of `libra ls-tree <rev>`, or `None` when the tree has no
+/// such entry (which is what the silent-drop bug used to produce).
+fn gitlink_tree_line(p: &Path, rev: &str) -> Option<String> {
+    let out = run_libra_command(&["ls-tree", rev], p);
+    assert_cli_success(&out, "ls-tree");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find(|line| line.ends_with("\tvendor"))
+        .map(|line| line.to_string())
+}
+
+#[test]
+fn merge_gitlink_divergent_pointer_is_refused_before_any_write() {
+    let repo = create_gitlink_repo(GITLINK_MOVED);
+    let p = repo.path();
+    let head_before = head_commit(p);
+
+    let output = run_libra_command(&["merge", "feature"], p);
+    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+
+    assert_eq!(report.error_code, "LBR-UNSUPPORTED-001");
+    assert!(
+        stderr.contains("'vendor'"),
+        "the refusal must name the gitlink path, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("Libra does not support submodules"),
+        "the refusal must say why it cannot be resolved, got: {stderr}"
+    );
+    // Fail-closed means fail BEFORE writing: no merge state, no moved HEAD, and
+    // nothing from the other side staged or materialized.
+    assert_eq!(head_commit(p), head_before, "HEAD must not move");
+    assert!(
+        !p.join(".libra").join("merge-state.json").exists(),
+        "a refused merge must not record merge state"
+    );
+    assert!(
+        !p.join("side.txt").exists(),
+        "a refused merge must not write the other side's files"
+    );
+}
+
+#[test]
+fn merge_gitlink_agreed_pointer_passes_through_untouched() {
+    let repo = create_gitlink_repo(GITLINK_BASE);
+    let p = repo.path();
+
+    let output = run_libra_command(&["merge", "feature"], p);
+    assert_cli_success(&output, "a submodule no side moved needs no decision");
+
+    assert_eq!(
+        gitlink_tree_line(p, "HEAD").as_deref(),
+        Some(format!("160000 commit {GITLINK_BASE}\tvendor").as_str()),
+        "the merge result must keep the submodule pointer verbatim"
+    );
+    // Regression guard for the silent-drop this card removed: the merge must
+    // also leave the repository clean, i.e. the index still records the gitlink.
+    let status = run_libra_command(&["status", "--short"], p);
+    assert_cli_success(&status, "status after merge");
+    assert!(
+        !String::from_utf8_lossy(&status.stdout).contains("vendor"),
+        "the carried-through submodule must not show up as a change"
+    );
+}
+
+#[test]
+fn merge_gitlink_rebase_consumer_refuses_divergent_pointer() {
+    let repo = create_gitlink_repo(GITLINK_MOVED);
+    let p = repo.path();
+
+    let head_before = head_commit(p);
+    let output = run_libra_command(&["rebase", "feature"], p);
+    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+
+    assert_eq!(report.error_code, "LBR-UNSUPPORTED-001");
+    // Same shared guard as merge: identical wording apart from the operation.
+    assert!(
+        stderr.contains(
+            "rebase would have to merge the submodule (gitlink) entry 'vendor': Libra does not support submodules"
+        ),
+        "rebase must refuse through the shared gitlink guard, got: {stderr}"
+    );
+    // The refusal must land before the start path's writes: the aux sidecar,
+    // the HEAD detach, and the rebase state row.
+    assert_eq!(head_commit(p), head_before, "HEAD must not move");
+    assert!(
+        !p.join(".libra").join("rebase-aux.json").exists(),
+        "a refused rebase must not write the aux sidecar"
+    );
+    assert!(
+        !p.join("side.txt").exists(),
+        "a refused rebase must not materialize the replayed side"
+    );
+    let status = run_libra_command(&["status", "--short", "--branch"], p);
+    assert_cli_success(&status, "status after a refused rebase");
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("## main"),
+        "a refused rebase must leave the branch checked out, not a detached HEAD"
+    );
+}
+
+#[test]
+fn merge_gitlink_rebase_consumer_passes_through_agreed_pointer() {
+    let repo = create_gitlink_repo(GITLINK_BASE);
+    let p = repo.path();
+
+    let output = run_libra_command(&["rebase", "feature"], p);
+    assert_cli_success(&output, "rebase over an unchanged submodule");
+
+    assert_eq!(
+        gitlink_tree_line(p, "HEAD").as_deref(),
+        Some(format!("160000 commit {GITLINK_BASE}\tvendor").as_str()),
+        "the replayed commit must keep the submodule pointer verbatim"
+    );
+}
+
+#[test]
+fn merge_gitlink_cherry_pick_consumer_refuses_divergent_pointer() {
+    let repo = create_gitlink_repo(GITLINK_MOVED);
+    let p = repo.path();
+    let feature = {
+        let out = run_libra_command(&["rev-parse", "feature"], p);
+        assert_cli_success(&out, "rev-parse feature");
+        stdout_trimmed(&out)
+    };
+
+    let head_before = head_commit(p);
+    let output = run_libra_command(&["cherry-pick", &feature], p);
+    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+
+    assert_eq!(report.error_code, "LBR-UNSUPPORTED-001");
+    assert!(
+        stderr.contains(
+            "cherry-pick would have to merge the submodule (gitlink) entry 'vendor': Libra does not support submodules"
+        ),
+        "cherry-pick must refuse through the shared gitlink guard, got: {stderr}"
+    );
+    // Refused before the first index/worktree/state write.
+    assert_eq!(head_commit(p), head_before, "HEAD must not move");
+    assert!(
+        !p.join("side.txt").exists(),
+        "a refused pick must not materialize the picked side"
+    );
+    let status = run_libra_command(&["status", "--short"], p);
+    assert_cli_success(&status, "status after a refused cherry-pick");
+    assert!(
+        !String::from_utf8_lossy(&status.stdout).contains("side.txt"),
+        "a refused pick must not stage the picked side"
+    );
+}
+
+#[test]
+fn merge_gitlink_cherry_pick_consumer_passes_through_agreed_pointer() {
+    let repo = create_gitlink_repo(GITLINK_BASE);
+    let p = repo.path();
+    let feature = {
+        let out = run_libra_command(&["rev-parse", "feature"], p);
+        assert_cli_success(&out, "rev-parse feature");
+        stdout_trimmed(&out)
+    };
+
+    let output = run_libra_command(&["cherry-pick", &feature], p);
+    assert_cli_success(&output, "cherry-pick over an unchanged submodule");
+
+    assert_eq!(
+        gitlink_tree_line(p, "HEAD").as_deref(),
+        Some(format!("160000 commit {GITLINK_BASE}\tvendor").as_str()),
+        "the picked commit must keep the submodule pointer verbatim"
+    );
+}
+
+#[test]
+fn merge_gitlink_agreed_pointer_survives_conflict_and_continue() {
+    let repo = create_gitlink_repo_with(GITLINK_BASE, true);
+    let p = repo.path();
+
+    let conflicted = run_libra_command(&["merge", "feature"], p);
+    let (_, report) = parse_cli_error_stderr(&conflicted.stderr);
+    assert_eq!(
+        report.error_code, "LBR-CONFLICT-002",
+        "the fixture must stop on a real content conflict, not on the submodule"
+    );
+
+    std::fs::write(p.join("tracked.txt"), "resolved\n").expect("resolve the conflict");
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], p),
+        "stage the resolution",
+    );
+    assert_cli_success(
+        &run_libra_command(&["merge", "--continue", "--no-verify"], p),
+        "finish the conflicted merge",
+    );
+
+    assert_eq!(
+        gitlink_tree_line(p, "HEAD").as_deref(),
+        Some(format!("160000 commit {GITLINK_BASE}\tvendor").as_str()),
+        "a submodule carried across a CONFLICTED merge must survive --continue"
+    );
+}
+
+#[test]
+fn merge_gitlink_divergent_pointer_refused_before_autostash_writes() {
+    // The three-way engine's own gate runs after `--autostash` has created a
+    // stash commit, fsynced its sidecar, and reset the working tree — so the
+    // refusal has to happen in the wrapper, ahead of all three (ADR-MG-01 G1).
+    let repo = create_gitlink_repo(GITLINK_MOVED);
+    let p = repo.path();
+    std::fs::write(p.join("tracked.txt"), "dirty\n").expect("dirty the worktree");
+
+    let output = run_libra_command(&["merge", "--autostash", "feature"], p);
+    let (_, report) = parse_cli_error_stderr(&output.stderr);
+
+    assert_eq!(report.error_code, "LBR-UNSUPPORTED-001");
+    assert_eq!(
+        std::fs::read_to_string(p.join("tracked.txt")).expect("read tracked.txt"),
+        "dirty\n",
+        "the refused merge must not have stashed and reset the working tree"
+    );
+    assert!(
+        !p.join(".libra").join("merge-autostash.json").exists(),
+        "a refused merge must not leave an autostash sidecar"
+    );
+    let stash = run_libra_command(&["stash", "list"], p);
+    assert_cli_success(&stash, "stash list after a refused merge");
+    assert!(
+        String::from_utf8_lossy(&stash.stdout).trim().is_empty(),
+        "a refused merge must not create a stash entry"
+    );
+}
+
+#[test]
+fn merge_gitlink_agreed_pointer_survives_a_conflicted_rebase_replay() {
+    // A replay that BOTH carries a pass-through gitlink and stops on a real
+    // content conflict: the conflict path stages and materializes the merged
+    // entries, and a submodule pointer has no blob to write.
+    let repo = create_gitlink_repo_with(GITLINK_BASE, true);
+    let p = repo.path();
+
+    let conflicted = run_libra_command(&["rebase", "feature"], p);
+    let (_, report) = parse_cli_error_stderr(&conflicted.stderr);
+    assert_eq!(
+        report.error_code, "LBR-CONFLICT-001",
+        "the fixture must stop on a content conflict, not on the submodule"
+    );
+
+    std::fs::write(p.join("tracked.txt"), "resolved\n").expect("resolve the conflict");
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], p),
+        "stage the resolution",
+    );
+    assert_cli_success(
+        &run_libra_command(&["rebase", "--continue"], p),
+        "finish the conflicted rebase",
+    );
+
+    assert_eq!(
+        gitlink_tree_line(p, "HEAD").as_deref(),
+        Some(format!("160000 commit {GITLINK_BASE}\tvendor").as_str()),
+        "a submodule carried across a CONFLICTED replay must survive --continue"
+    );
+}
+
+#[test]
+fn merge_gitlink_hard_reset_restores_a_tree_carrying_a_pointer() {
+    // `reset --hard` rebuilds the index from the tree and restores the working
+    // tree from it; a gitlink names a SUBMODULE's commit, which is not an
+    // object of this repository, so neither step may ask for it as a blob.
+    let repo = create_gitlink_repo(GITLINK_BASE);
+    let p = repo.path();
+    std::fs::write(p.join("ours.txt"), "dirty\n").expect("dirty a tracked file");
+    // A user who checked the submodule out by hand: the gitlink path is a real
+    // DIRECTORY, so the removal loop must not try to unlink it and the
+    // untracked-overwrite check must not count its contents.
+    std::fs::create_dir_all(p.join("vendor")).expect("materialize the submodule directory");
+    std::fs::write(p.join("vendor").join("inner.txt"), "submodule\n").expect("submodule content");
+
+    let output = run_libra_command(&["reset", "--hard", "HEAD"], p);
+    assert_cli_success(&output, "hard reset in a repository carrying a gitlink");
+    assert!(
+        p.join("vendor").join("inner.txt").exists(),
+        "a checked-out submodule directory is not Libra's to delete"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(p.join("ours.txt")).expect("read ours.txt"),
+        "ours\n",
+        "the hard reset must still restore ordinary files"
+    );
+    assert_eq!(
+        gitlink_tree_line(p, "HEAD").as_deref(),
+        Some(format!("160000 commit {GITLINK_BASE}\tvendor").as_str()),
+        "the submodule pointer stays in the tree"
+    );
+    let files = run_libra_command(&["ls-files", "-s"], p);
+    assert_cli_success(&files, "ls-files after a hard reset");
+    assert!(
+        String::from_utf8_lossy(&files.stdout)
+            .lines()
+            .any(|line| line.starts_with("160000") && line.ends_with("vendor")),
+        "the rebuilt index keeps the gitlink entry"
+    );
+}
+
+/// `main` carries `vendor` at [`GITLINK_BASE`]; `feature` is a DIRECT CHILD of
+/// it that moves the pointer to [`GITLINK_MOVED`]. HEAD stays on `main`, so the
+/// branch is an ancestor of `feature` — the shape `rebase` fast-forwards and
+/// `cherry-pick --ff` fast-forwards, neither of which arbitrates anything.
+fn create_gitlink_fast_forward_repo() -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "update-index",
+                "--cacheinfo",
+                &format!("160000,{GITLINK_BASE},vendor"),
+            ],
+            p,
+        ),
+        "stage the base gitlink",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "add submodule", "--no-verify"], p),
+        "commit the base gitlink",
+    );
+    let base = head_commit(p);
+
+    let side_blob = {
+        let out = run_libra_command(&["hash-object", "-w", "--stdin"], p);
+        assert!(out.status.success(), "hash-object must succeed");
+        stdout_trimmed(&out)
+    };
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "update-index",
+                "--cacheinfo",
+                &format!("100644,{side_blob},side.txt"),
+                "--cacheinfo",
+                &format!("160000,{GITLINK_MOVED},vendor"),
+            ],
+            p,
+        ),
+        "stage the child tree",
+    );
+    let tree = {
+        let out = run_libra_command(&["write-tree"], p);
+        assert_cli_success(&out, "write-tree");
+        stdout_trimmed(&out)
+    };
+    let child = {
+        let out = run_libra_command(
+            &["commit-tree", &tree, "-p", &base, "-m", "move submodule"],
+            p,
+        );
+        assert_cli_success(&out, "commit-tree");
+        stdout_trimmed(&out)
+    };
+    assert_cli_success(
+        &run_libra_command(&["update-ref", "refs/heads/feature", &child], p),
+        "create refs/heads/feature",
+    );
+    assert_cli_success(
+        &run_libra_command(&["update-index", "--remove", "side.txt"], p),
+        "unstage side.txt",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "update-index",
+                "--cacheinfo",
+                &format!("160000,{GITLINK_BASE},vendor"),
+            ],
+            p,
+        ),
+        "restore the base gitlink",
+    );
+
+    repo
+}
+
+#[test]
+fn merge_gitlink_fast_forward_rebase_adopts_a_moved_pointer() {
+    // A rebase whose merge base IS the branch tip fast-forwards onto the
+    // upstream tree wholesale: nothing is arbitrated, so a MOVED submodule
+    // pointer must be adopted rather than refused.
+    let repo = create_gitlink_fast_forward_repo();
+    let p = repo.path();
+
+    let output = run_libra_command(&["rebase", "feature"], p);
+    assert_cli_success(&output, "fast-forward rebase over a moved submodule");
+
+    assert_eq!(
+        gitlink_tree_line(p, "HEAD").as_deref(),
+        Some(format!("160000 commit {GITLINK_MOVED}\tvendor").as_str()),
+        "the fast-forward adopts the upstream pointer"
+    );
+}
+
+#[test]
+fn merge_gitlink_fast_forward_pick_adopts_a_moved_pointer_only_with_ff() {
+    // `cherry-pick --ff` on a direct child of HEAD advances HEAD without
+    // replaying, so it decides nothing and a moved pointer is adopted. The same
+    // pick WITHOUT `--ff` performs a three-way apply and must be refused — the
+    // preflight has to tell the two apart.
+    let repo = create_gitlink_fast_forward_repo();
+    let p = repo.path();
+    let child = {
+        let out = run_libra_command(&["rev-parse", "feature"], p);
+        assert_cli_success(&out, "rev-parse feature");
+        stdout_trimmed(&out)
+    };
+
+    let replayed = run_libra_command(&["cherry-pick", &child], p);
+    let (_, report) = parse_cli_error_stderr(&replayed.stderr);
+    assert_eq!(
+        report.error_code, "LBR-UNSUPPORTED-001",
+        "a replaying pick still has to arbitrate the moved pointer"
+    );
+
+    let output = run_libra_command(&["cherry-pick", "--ff", &child], p);
+    assert_cli_success(&output, "fast-forward pick over a moved submodule");
+    assert_eq!(
+        gitlink_tree_line(p, "HEAD").as_deref(),
+        Some(format!("160000 commit {GITLINK_MOVED}\tvendor").as_str()),
+        "the fast-forward pick adopts the moved pointer"
+    );
+}
+
+/// Run `git` in `cwd`, asserting success. Used only by the `pull --rebase`
+/// fixture below: `pull` needs a real remote, and git is the one tool that can
+/// author a gitlink-bearing history on the far side.
+fn git_in(args: &[&str], cwd: &Path) -> String {
+    let output = std::process::Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .expect("failed to execute git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("git output is utf8")
+        .trim()
+        .to_string()
+}
+
+#[test]
+fn merge_gitlink_pull_rebase_refuses_before_its_autostash() {
+    // `pull --rebase` is a SECOND entry into the replay and pushes its own
+    // autostash before handing off, so the refusal has to come from `pull`
+    // itself — the gate inside the rebase start path would already be too late.
+    let temp_root = tempfile::tempdir().expect("temp root");
+    let remote_dir = temp_root.path().join("remote.git");
+    let work_dir = temp_root.path().join("workdir");
+    git_in(
+        &["init", "--bare", remote_dir.to_str().unwrap()],
+        temp_root.path(),
+    );
+    git_in(&["init", work_dir.to_str().unwrap()], temp_root.path());
+    git_in(&["config", "user.name", "Libra Tester"], &work_dir);
+    git_in(&["config", "user.email", "tester@example.com"], &work_dir);
+
+    std::fs::write(work_dir.join("README.md"), "hello\n").expect("write README");
+    git_in(&["add", "README.md"], &work_dir);
+    git_in(
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{GITLINK_BASE},vendor"),
+        ],
+        &work_dir,
+    );
+    git_in(&["commit", "-m", "initial commit"], &work_dir);
+    let branch = git_in(&["rev-parse", "--abbrev-ref", "HEAD"], &work_dir);
+    git_in(
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        &work_dir,
+    );
+    git_in(
+        &["push", "origin", &format!("HEAD:refs/heads/{branch}")],
+        &work_dir,
+    );
+
+    let local = tempfile::tempdir().expect("local repo");
+    let p = local.path();
+    assert_cli_success(&run_libra_command(&["init"], p), "libra init");
+    assert_cli_success(
+        &run_libra_command(&["config", "user.name", "Libra Tester"], p),
+        "set user.name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "user.email", "tester@example.com"], p),
+        "set user.email",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+            p,
+        ),
+        "remote add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "branch.main.remote", "origin"], p),
+        "set branch.main.remote",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "config",
+                "branch.main.merge",
+                &format!("refs/heads/{branch}"),
+            ],
+            p,
+        ),
+        "set branch.main.merge",
+    );
+    assert_cli_success(&run_libra_command(&["pull"], p), "initial pull");
+    assert_eq!(
+        gitlink_tree_line(p, "HEAD").as_deref(),
+        Some(format!("160000 commit {GITLINK_BASE}\tvendor").as_str()),
+        "the fetched history carries the submodule pointer"
+    );
+
+    // Diverge: a local commit, and a remote commit that MOVES the pointer.
+    std::fs::write(p.join("local.txt"), "local\n").expect("write local.txt");
+    assert_cli_success(
+        &run_libra_command(&["add", "local.txt"], p),
+        "add local.txt",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "local work", "--no-verify"], p),
+        "local commit",
+    );
+    let head_before = head_commit(p);
+
+    git_in(
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{GITLINK_MOVED},vendor"),
+        ],
+        &work_dir,
+    );
+    std::fs::write(work_dir.join("remote.txt"), "remote\n").expect("write remote.txt");
+    git_in(&["add", "remote.txt"], &work_dir);
+    git_in(&["commit", "-m", "move submodule"], &work_dir);
+    git_in(
+        &["push", "origin", &format!("HEAD:refs/heads/{branch}")],
+        &work_dir,
+    );
+
+    std::fs::write(p.join("local.txt"), "dirty\n").expect("dirty the worktree");
+    let output = run_libra_command(&["pull", "--rebase", "--autostash"], p);
+    let (_, report) = parse_cli_error_stderr(&output.stderr);
+
+    assert_eq!(report.error_code, "LBR-UNSUPPORTED-001");
+    assert_eq!(head_commit(p), head_before, "HEAD must not move");
+    assert_eq!(
+        std::fs::read_to_string(p.join("local.txt")).expect("read local.txt"),
+        "dirty\n",
+        "the refused pull must not have stashed and reset the working tree"
+    );
+    let stash = run_libra_command(&["stash", "list"], p);
+    assert_cli_success(&stash, "stash list after a refused pull --rebase");
+    assert!(
+        String::from_utf8_lossy(&stash.stdout).trim().is_empty(),
+        "a refused pull must not create a stash entry"
+    );
+}
+
+/// `main` has no submodule; `feature` is a direct child that ADDS `vendor` at
+/// [`GITLINK_BASE`]. HEAD stays on `main`, so the merge fast-forwards.
+fn create_gitlink_adding_fast_forward_repo() -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let base = head_commit(p);
+
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "update-index",
+                "--cacheinfo",
+                &format!("160000,{GITLINK_BASE},vendor"),
+            ],
+            p,
+        ),
+        "stage the gitlink",
+    );
+    let tree = {
+        let out = run_libra_command(&["write-tree"], p);
+        assert_cli_success(&out, "write-tree");
+        stdout_trimmed(&out)
+    };
+    let child = {
+        let out = run_libra_command(
+            &["commit-tree", &tree, "-p", &base, "-m", "add submodule"],
+            p,
+        );
+        assert_cli_success(&out, "commit-tree");
+        stdout_trimmed(&out)
+    };
+    assert_cli_success(
+        &run_libra_command(&["update-ref", "refs/heads/feature", &child], p),
+        "create refs/heads/feature",
+    );
+    assert_cli_success(
+        &run_libra_command(&["update-index", "--remove", "vendor"], p),
+        "unstage the gitlink",
+    );
+
+    repo
+}
+
+#[test]
+fn merge_gitlink_refuses_to_replace_an_untracked_file_at_the_pointer_path() {
+    // Materializing a `160000` entry creates a DIRECTORY placeholder, which
+    // would delete a plain file sitting exactly there. That path is matched
+    // exactly (files UNDER a submodule directory belong to the submodule and
+    // are not overwritten), and the refusal lands before HEAD moves.
+    let repo = create_gitlink_adding_fast_forward_repo();
+    let p = repo.path();
+    std::fs::write(p.join("vendor"), "not a submodule\n").expect("write untracked file");
+    let head_before = head_commit(p);
+
+    let output = run_libra_command(&["merge", "feature"], p);
+    let (_, report) = parse_cli_error_stderr(&output.stderr);
+
+    assert_eq!(report.error_code, "LBR-CONFLICT-002");
+    assert_eq!(head_commit(p), head_before, "HEAD must not move");
+    assert_eq!(
+        std::fs::read_to_string(p.join("vendor")).expect("read the untracked file"),
+        "not a submodule\n",
+        "the untracked file must survive the refusal"
+    );
+}
+
+#[test]
+fn merge_gitlink_leaves_a_checked_out_submodule_directory_untouched() {
+    // The same fast-forward, but the path is a real submodule checkout: its
+    // files are untracked and live UNDER the pointer, so they neither block the
+    // merge nor get deleted by it.
+    let repo = create_gitlink_adding_fast_forward_repo();
+    let p = repo.path();
+    std::fs::create_dir_all(p.join("vendor")).expect("materialize the submodule");
+    std::fs::write(p.join("vendor").join("inner.txt"), "submodule\n").expect("submodule content");
+
+    let output = run_libra_command(&["merge", "feature"], p);
+    assert_cli_success(&output, "fast-forward adopting a checked-out submodule");
+
+    assert_eq!(
+        std::fs::read_to_string(p.join("vendor").join("inner.txt")).expect("read submodule file"),
+        "submodule\n",
+        "the submodule checkout is not Libra's to touch"
+    );
+    assert_eq!(
+        gitlink_tree_line(p, "HEAD").as_deref(),
+        Some(format!("160000 commit {GITLINK_BASE}\tvendor").as_str()),
+        "the pointer is adopted"
+    );
+}
+
+/// [`create_gitlink_repo`] plus a `dropped` branch: a direct child of HEAD whose
+/// tree no longer declares `vendor`.
+fn create_gitlink_dropping_repo() -> tempfile::TempDir {
+    let repo = create_gitlink_repo(GITLINK_BASE);
+    let p = repo.path();
+    let base = head_commit(p);
+    assert_cli_success(
+        &run_libra_command(&["update-index", "--remove", "vendor"], p),
+        "stage the removal",
+    );
+    let tree = {
+        let out = run_libra_command(&["write-tree"], p);
+        assert_cli_success(&out, "write-tree");
+        stdout_trimmed(&out)
+    };
+    let child = {
+        let out = run_libra_command(
+            &["commit-tree", &tree, "-p", &base, "-m", "drop submodule"],
+            p,
+        );
+        assert_cli_success(&out, "commit-tree");
+        stdout_trimmed(&out)
+    };
+    assert_cli_success(
+        &run_libra_command(&["update-ref", "refs/heads/dropped", &child], p),
+        "create refs/heads/dropped",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "update-index",
+                "--cacheinfo",
+                &format!("160000,{GITLINK_BASE},vendor"),
+            ],
+            p,
+        ),
+        "restore the gitlink",
+    );
+    repo
+}
+
+#[test]
+fn merge_gitlink_fast_forward_dropping_a_pointer_refuses_before_moving_head() {
+    // `restore` refuses to replace a NON-EMPTY materialized submodule directory
+    // (its own long-standing contract). The fast-forward restores AFTER moving
+    // the ref, so that refusal has to be raised beforehand — otherwise the
+    // branch ends up ahead of the index and the working tree.
+    let repo = create_gitlink_dropping_repo();
+    let p = repo.path();
+    std::fs::create_dir_all(p.join("vendor")).expect("materialize the submodule");
+    std::fs::write(p.join("vendor").join("inner.txt"), "submodule\n").expect("submodule content");
+    let head_before = head_commit(p);
+
+    let output = run_libra_command(&["merge", "dropped"], p);
+    let (stderr, _) = parse_cli_error_stderr(&output.stderr);
+
+    assert!(
+        stderr.contains("refusing to replace non-empty worktree directory 'vendor'"),
+        "the refusal must name the submodule directory, got: {stderr}"
+    );
+    assert_eq!(
+        head_commit(p),
+        head_before,
+        "the refusal must land BEFORE the ref moves"
+    );
+    assert!(
+        p.join("vendor").join("inner.txt").exists(),
+        "the submodule checkout survives"
+    );
+    assert_eq!(
+        gitlink_tree_line(p, "HEAD").as_deref(),
+        Some(format!("160000 commit {GITLINK_BASE}\tvendor").as_str()),
+        "HEAD still declares the pointer"
+    );
+}
+
+#[test]
+fn merge_gitlink_fast_forward_dropping_a_pointer_clears_an_empty_placeholder() {
+    // With only Libra's own empty placeholder there, the same fast-forward
+    // completes and HEAD, the index and the working tree all agree.
+    let repo = create_gitlink_dropping_repo();
+    let p = repo.path();
+    std::fs::create_dir_all(p.join("vendor")).expect("materialize the placeholder");
+
+    let output = run_libra_command(&["merge", "dropped"], p);
+    assert_cli_success(&output, "fast-forward dropping an unmaterialized submodule");
+
+    assert_eq!(
+        gitlink_tree_line(p, "HEAD"),
+        None,
+        "the tree drops the pointer"
+    );
+    let files = run_libra_command(&["ls-files", "-s"], p);
+    assert_cli_success(&files, "ls-files after the drop");
+    assert!(
+        !String::from_utf8_lossy(&files.stdout).contains("vendor"),
+        "the index drops the pointer too"
+    );
+}
+
+#[test]
+fn merge_gitlink_restore_refuses_to_delete_an_untracked_file_at_the_pointer_path() {
+    // `restore --source` materializes a `160000` entry as a directory
+    // placeholder, which would remove a plain file sitting exactly there. An
+    // UNTRACKED file is the user's, so the whole restore is refused before any
+    // write; files BENEATH a checked-out submodule are untouched either way.
+    let repo = create_gitlink_adding_fast_forward_repo();
+    let p = repo.path();
+    std::fs::write(p.join("vendor"), "not a submodule\n").expect("write untracked file");
+
+    let output = run_libra_command(&["restore", "--source", "feature", "--worktree", "."], p);
+    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+
+    assert_eq!(report.error_code, "LBR-CONFLICT-002");
+    assert!(
+        stderr.contains("refusing to replace worktree path 'vendor'"),
+        "the refusal must name the path, got: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("vendor")).expect("read the untracked file"),
+        "not a submodule\n",
+        "the untracked file must survive"
+    );
+}
+
+#[test]
+fn merge_gitlink_cleanliness_gate_ignores_a_submodule_but_not_a_plain_file() {
+    // The gate (`status::changes_to_be_staged`, read by
+    // `switch::ensure_clean_status`) ignores the two shapes Libra expects for a
+    // `160000` entry — absent (never materialized) and a directory (checked out
+    // by the user) — otherwise no repository containing a submodule could merge
+    // at all. A plain file at that path is neither, and must NOT be waved
+    // through silently.
+    let repo = create_gitlink_repo(GITLINK_BASE);
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["merge", "feature"], p),
+        "an unmaterialized submodule must not read as a dirty worktree",
+    );
+
+    let repo = create_gitlink_repo(GITLINK_BASE);
+    let p = repo.path();
+    std::fs::create_dir_all(p.join("vendor")).expect("materialize the submodule");
+    std::fs::write(p.join("vendor").join("inner.txt"), "submodule\n").expect("submodule content");
+    assert_cli_success(
+        &run_libra_command(&["merge", "feature"], p),
+        "a checked-out submodule directory must not read as a dirty worktree",
+    );
+
+    let repo = create_gitlink_repo(GITLINK_BASE);
+    let p = repo.path();
+    std::fs::write(p.join("vendor"), "not a submodule\n").expect("write a file at the path");
+    let refused = run_libra_command(&["merge", "feature"], p);
+    let (stderr, report) = parse_cli_error_stderr(&refused.stderr);
+    assert_eq!(
+        report.error_code, "LBR-CONFLICT-002",
+        "a plain file where a submodule belongs is a dirty worktree, not a no-op"
+    );
+    assert!(
+        stderr.contains("uncommitted changes"),
+        "the gate must name the dirty worktree, got: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("vendor")).expect("read the file"),
+        "not a submodule\n"
+    );
+}
+
+#[test]
+fn merge_gitlink_multi_pick_refusal_survives_a_later_empty_commit() {
+    // The whole-sequence preflight stops modelling at a pick the sequencer
+    // would reject for its own reason (here: an empty commit without
+    // `--allow-empty`). It must still decide on what it modelled so far —
+    // otherwise the divergent pointer in the FIRST pick escapes the gate and is
+    // applied before the per-pick guard refuses it.
+    let repo = create_gitlink_repo(GITLINK_MOVED);
+    let p = repo.path();
+    let diverging = {
+        let out = run_libra_command(&["rev-parse", "feature"], p);
+        assert_cli_success(&out, "rev-parse feature");
+        stdout_trimmed(&out)
+    };
+    // An empty commit on top of `feature`: same tree, so the pick would stop
+    // with `EmptyCommit` rather than a gitlink verdict.
+    let feature_tree = {
+        let out = run_libra_command(&["rev-parse", "feature^{tree}"], p);
+        assert_cli_success(&out, "rev-parse feature tree");
+        stdout_trimmed(&out)
+    };
+    let empty = {
+        let out = run_libra_command(
+            &[
+                "commit-tree",
+                &feature_tree,
+                "-p",
+                &diverging,
+                "-m",
+                "empty",
+            ],
+            p,
+        );
+        assert_cli_success(&out, "commit-tree");
+        stdout_trimmed(&out)
+    };
+    let head_before = head_commit(p);
+
+    let output = run_libra_command(&["cherry-pick", &diverging, &empty], p);
+    let (_, report) = parse_cli_error_stderr(&output.stderr);
+
+    assert_eq!(
+        report.error_code, "LBR-UNSUPPORTED-001",
+        "the first pick's divergent pointer must still be refused"
+    );
+    assert_eq!(head_commit(p), head_before, "no pick may be applied");
+}
+
+#[test]
+fn merge_gitlink_restore_refuses_a_file_left_where_the_index_records_a_pointer() {
+    // "Tracked" is not enough to make a path replaceable: the index entry here
+    // IS the gitlink, so the file at that path was never written by Libra and
+    // is not recoverable from the object store. Only ordinary tracked content
+    // may be replaced by the directory placeholder.
+    let repo = create_gitlink_repo(GITLINK_BASE);
+    let p = repo.path();
+    std::fs::write(p.join("vendor"), "left behind\n").expect("write a file at the path");
+
+    let output = run_libra_command(&["restore", "--source", "HEAD", "--worktree", "."], p);
+    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+
+    assert_eq!(report.error_code, "LBR-CONFLICT-002");
+    assert!(
+        stderr.contains("refusing to replace worktree path 'vendor'"),
+        "the refusal must name the path, got: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("vendor")).expect("read the file"),
+        "left behind\n"
+    );
+}
+
+#[test]
+fn merge_gitlink_hard_reset_keeps_a_file_left_where_the_index_records_a_pointer() {
+    // `reset --hard` to a tree WITHOUT the pointer must not delete that file
+    // either: Libra never materialized the submodule, so nothing at that path
+    // is its to remove. (`cherry-pick --ff` delegates here.)
+    let repo = create_gitlink_dropping_repo();
+    let p = repo.path();
+    std::fs::write(p.join("vendor"), "left behind\n").expect("write a file at the path");
+    let dropped = {
+        let out = run_libra_command(&["rev-parse", "dropped"], p);
+        assert_cli_success(&out, "rev-parse dropped");
+        stdout_trimmed(&out)
+    };
+
+    let output = run_libra_command(&["reset", "--hard", &dropped], p);
+    assert_cli_success(&output, "hard reset dropping the pointer");
+
+    assert_eq!(
+        std::fs::read_to_string(p.join("vendor")).expect("read the file"),
+        "left behind\n",
+        "a file at a former submodule path is not Libra's to delete"
+    );
+}
+
+#[test]
+fn merge_gitlink_restore_refuses_to_drop_a_pointer_over_user_content() {
+    // The other direction across the same path: the source no longer declares
+    // the submodule, so a plain restore would REMOVE whatever is there. That
+    // content is the user's — Libra never wrote it — so the restore refuses
+    // before touching anything.
+    let repo = create_gitlink_dropping_repo();
+    let p = repo.path();
+    std::fs::write(p.join("vendor"), "left behind\n").expect("write a file at the path");
+
+    let output = run_libra_command(&["restore", "--source", "dropped", "--worktree", "."], p);
+    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+
+    assert_eq!(report.error_code, "LBR-CONFLICT-002");
+    assert!(
+        stderr.contains("refusing to replace worktree path 'vendor'"),
+        "the refusal must name the path, got: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("vendor")).expect("read the file"),
+        "left behind\n"
+    );
+}
+
+#[test]
+fn merge_gitlink_overlay_restore_still_refuses_a_source_present_replacement() {
+    // `--overlay` only suppresses DELETION of paths the source omits. A source
+    // that REPLACES the submodule with an ordinary blob still writes, so the
+    // guard must stay armed for it.
+    let repo = create_gitlink_repo(GITLINK_BASE);
+    let p = repo.path();
+    let base = head_commit(p);
+    let blob = {
+        let out = run_libra_command_with_stdin(&["hash-object", "-w", "--stdin"], p, "replaced\n");
+        assert!(out.status.success(), "hash-object must succeed");
+        stdout_trimmed(&out)
+    };
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "update-index",
+                "--cacheinfo",
+                &format!("100644,{blob},vendor"),
+            ],
+            p,
+        ),
+        "stage a blob at the submodule path",
+    );
+    let tree = {
+        let out = run_libra_command(&["write-tree"], p);
+        assert_cli_success(&out, "write-tree");
+        stdout_trimmed(&out)
+    };
+    let replaced = {
+        let out = run_libra_command(
+            &["commit-tree", &tree, "-p", &base, "-m", "submodule to file"],
+            p,
+        );
+        assert_cli_success(&out, "commit-tree");
+        stdout_trimmed(&out)
+    };
+    assert_cli_success(
+        &run_libra_command(&["update-ref", "refs/heads/replaced", &replaced], p),
+        "create refs/heads/replaced",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "update-index",
+                "--cacheinfo",
+                &format!("160000,{GITLINK_BASE},vendor"),
+            ],
+            p,
+        ),
+        "restore the gitlink",
+    );
+    std::fs::write(p.join("vendor"), "left behind\n").expect("write a file at the path");
+
+    let output = run_libra_command(
+        &[
+            "restore",
+            "--overlay",
+            "--source",
+            "replaced",
+            "--worktree",
+            ".",
+        ],
+        p,
+    );
+    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+
+    assert_eq!(report.error_code, "LBR-CONFLICT-002");
+    assert!(
+        stderr.contains("refusing to replace worktree path 'vendor'"),
+        "the refusal must name the path, got: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("vendor")).expect("read the file"),
+        "left behind\n"
+    );
+}
+
+#[test]
+fn merge_gitlink_fast_forward_rebase_refuses_before_moving_the_ref() {
+    // `rebase`'s fast-forward branch materializes the worktree AFTER updating
+    // the ref and the index, so a transition the materialization would refuse
+    // (here: a non-empty submodule directory the upstream tree drops) has to be
+    // caught first — otherwise the branch runs ahead of the working tree.
+    let repo = create_gitlink_dropping_repo();
+    let p = repo.path();
+    std::fs::create_dir_all(p.join("vendor")).expect("materialize the submodule");
+    std::fs::write(p.join("vendor").join("inner.txt"), "submodule\n").expect("submodule content");
+    let head_before = head_commit(p);
+
+    let output = run_libra_command(&["rebase", "dropped"], p);
+    let (stderr, _) = parse_cli_error_stderr(&output.stderr);
+
+    assert!(
+        stderr.contains("refusing to replace non-empty worktree directory 'vendor'"),
+        "the refusal must name the submodule directory, got: {stderr}"
+    );
+    assert_eq!(
+        head_commit(p),
+        head_before,
+        "the refusal must land BEFORE the ref moves"
+    );
+    assert!(
+        p.join("vendor").join("inner.txt").exists(),
+        "the submodule checkout survives"
     );
 }

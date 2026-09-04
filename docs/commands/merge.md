@@ -47,6 +47,22 @@ When the corresponding CLI flag is absent, Libra reads these Git-compatible defa
 
 Invalid or unreadable local/global values fail before HEAD, index, worktree, or merge-state mutation (`LBR-CLI-002` or `LBR-IO-001`). Encrypted local/global values are decrypted; unreadable or unsupported system scope is skipped. Exception: a global config store whose schema is newer than this Libra binary is skipped with a one-time deduplicated warning instead of failing (see `LBR-CONFIG-001`).
 
+### Submodules (`160000` gitlink entries)
+
+Libra is a monorepo client and never merges submodule content. A three-way merge treats gitlinks in two tiers:
+
+- **The merge would have to arbitrate the gitlink** — any side records a different commit id than the merge base, including a side that added or removed the entry. The merge is refused **before anything is written** (no merge state, no index or working-tree change, HEAD unmoved) with `LBR-UNSUPPORTED-001` naming the path:
+
+  ```
+  error: merge would have to merge the submodule (gitlink) entry 'vendor': Libra does not support submodules
+  ```
+
+  Resolve the submodule pointer outside Libra, or drop the gitlink entry from the branches being merged.
+
+- **All three sides record the same commit id** — nothing has to be decided, so the pointer is carried into the merge result verbatim. (Previously such entries were silently dropped, which deleted the submodule from the merged tree.)
+
+`libra rebase` and `libra cherry-pick` share the same guard and the same wording, with `rebase` / `cherry-pick` in place of `merge`.
+
 Libra still does not implement octopus merges, merge strategies other than `ours`, strategy options other than `ours`/`theirs`, or interactive message editing (`--edit`/launching an editor). Signature verification (`--verify-signatures`) is supported but limited to the local vault PGP key (no external GPG keyring).
 
 ## Options
@@ -239,6 +255,7 @@ Success output keeps the historical `files_changed` numeric field and adds merge
 | Target ref cannot be resolved | `LBR-CLI-003` | 129 |
 | Failed to load merge target/current commit/tree | `LBR-REPO-002` | 128 |
 | Unrelated histories without `--allow-unrelated-histories` | `LBR-REPO-003` | 128 |
+| Three-way merge would have to arbitrate a `160000` gitlink (submodule) | `LBR-UNSUPPORTED-001` | 128 |
 | Unsupported `-s` / `-X` value or incompatible strategy combination | `LBR-CLI-002` | 129 |
 | `--verify-signatures`: tip unsigned, signature invalid, or vault unavailable | `LBR-REPO-003` | 128 |
 | Merge conflicts | `LBR-CONFLICT-002` | 128 |
