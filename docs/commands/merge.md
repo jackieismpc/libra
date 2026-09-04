@@ -15,9 +15,30 @@ libra merge --restart
 
 `libra merge <branch>` resolves a local branch, commit hash, or remote-tracking ref such as `refs/remotes/origin/main`.
 
-If the current branch can be fast-forwarded, Libra moves the branch pointer to the target commit and restores the index and working tree. If the branches have diverged, Libra performs a single-head three-way merge using the merge base.
+If the current branch can be fast-forwarded, Libra moves the branch pointer to the target commit and restores the index and working tree. If the branches have diverged, Libra performs a single-head three-way merge using the merge base — or, when the history leaves more than one merge base, using a recursive virtual ancestor built from all of them (see below).
 
 The default three-way strategy accepts `-X ours` or `-X theirs`: only conflicting hunks/paths choose that side, while clean changes from both sides remain. This is different from `-s ours`, which always creates a two-parent merge commit (unless the target is already an ancestor) while retaining the entire current HEAD tree. Other strategies and strategy options are rejected during argument parsing.
+
+### Criss-cross histories (several merge bases)
+
+Two branches that have already merged each other leave **several** merge bases, none of them better than the others. Picking one arbitrarily reports conflicts that the history actually explains, so Libra folds them the way Git's recursive strategy does:
+
+1. The merge bases are sorted by object id and folded pairwise, left to right, each fold being itself a three-way merge (with its own merge base, recursively).
+2. The single tree that comes out — the **virtual ancestor** — is the base of the real merge.
+
+Inside the fold, decisions differ from a real merge, matching Git:
+
+- `-X ours` / `-X theirs` do **not** apply; a virtual ancestor is a synthetic input, not something you asked to bias.
+- A content conflict is not surfaced. It is recorded *as content*, with the conflict markers widened by two characters per recursion level so a nested conflict can never be read as one the outer merge produced.
+- A change/delete keeps the base version: there is no midpoint between "changed" and "gone".
+- Binary content (Git's rule: a NUL byte in the first 8000, or an input larger than 1023 MiB) is not line-merged; the ancestor keeps the base's content, or the empty blob when there is no base.
+- Symlinks — and any two sides that are different *kinds* of entry — keep the base version, which means the path is simply absent from the ancestor when there is no base.
+- The resulting file mode follows Git's rule: the other side's mode when the two agree or ours is unchanged, otherwise ours.
+- Nesting deeper than 20 levels, or more than 32 merge bases at one level — counted on the bare ids before any base is loaded, and again on the candidate ancestors collected while folding — is refused with `LBR-UNSUPPORTED-001` rather than recursed (the fold's work grows with the square of the width; a criss-cross has two). `-s ours` and `--ff-only` never fold and are never refused for width (a diverged `--ff-only` merge is refused as non-fast-forward, as always).
+
+The synthetic commit's parents are **all** the real merge bases folded so far (Git chains one two-parent virtual commit per fold step); the reachable history is the same, the object ids are not. The virtual ancestor's tree and its synthetic commit are written as ordinary loose objects, but they are **one-shot**: they are deliberately *not* recorded in the merge state, so they are not garbage-collection roots. `libra maintenance run --task gc` may reclaim them at any time, including while a conflicted merge is still in progress — nothing depends on them surviving, and `libra merge --restart` recomputes the same ancestor from the real merge bases. Consequently `merge-state.json` records a `base` only when the merge base is a single real commit.
+
+`libra merge --dry-run` previews a criss-cross merge under the same contract as any other preview — no object-store, index, working-tree, HEAD, reflog, merge-state or autostash-sidecar write: the fold keeps its blobs in memory and materializes no virtual tree or commit. (What the contract does *not* cover is repository-wide housekeeping the CLI performs before any command runs, such as the schema auto-upgrade on database open; see `docs/development/commands/merge.md`.)
 
 Histories without a common ancestor remain rejected unless `--allow-unrelated-histories` is explicit. With it, Libra uses a virtual empty merge base: disjoint root trees combine normally, overlapping additions conflict normally, and conflict state survives `--continue`, `--abort`, and `--restart` without creating a fake base object.
 
@@ -34,6 +55,8 @@ libra config merge.conflictStyle diff3
 - `merge` (default, or unset) — the two-marker style above.
 - `diff3` — additionally emits the common-ancestor content between a `||||||| base` marker and the `=======` separator, so you can see what both sides started from.
 - Any other value — including the unimplemented `zdiff3` — is a hard error when a conflict must be rendered (exit 128), never a silent fall-back to the default style.
+
+For a merge with **several merge bases** the value is read before the merge runs rather than only when a conflict is rendered, because the recursive virtual ancestor's own content depends on it (Git does the same at every recursion depth). An invalid value therefore stops a criss-cross merge even when that merge would have come out clean.
 
 The config is honored by both `libra merge` and `libra cherry-pick` for line-level text conflicts. Binary and modify/delete conflicts keep their two-part whole-file presentation (Git also emits no base block there), and `libra rebase` currently renders whole-file markers without a base block regardless of this setting.
 
@@ -225,6 +248,7 @@ Success output keeps the historical `files_changed` numeric field and adds merge
 | Branch target | `<branch>` (single target) | `<commit>...` (one or more) | N/A (use `jj new`) |
 | Fast-forward | Supported | Supported | N/A |
 | Single-head three-way | Supported | Supported | N/A |
+| Criss-cross (several merge bases) | Recursive virtual ancestor (fold order: ascending object id; max depth 20, max 32 bases per level) | Recursive virtual ancestor (`-s recursive`/`ort`, unbounded depth) | N/A |
 | Continue / abort | `--continue`, `--abort` | `--continue`, `--abort` | N/A |
 | Octopus merge | Not supported | Supported | N/A |
 | Fast-forward only | `--ff-only` | `--ff-only` | N/A |
@@ -256,6 +280,7 @@ Success output keeps the historical `files_changed` numeric field and adds merge
 | Failed to load merge target/current commit/tree | `LBR-REPO-002` | 128 |
 | Unrelated histories without `--allow-unrelated-histories` | `LBR-REPO-003` | 128 |
 | Three-way merge would have to arbitrate a `160000` gitlink (submodule) | `LBR-UNSUPPORTED-001` | 128 |
+| Recursive virtual ancestor would nest deeper than 20 levels or fold more than 32 bases at one level | `LBR-UNSUPPORTED-001` | 128 |
 | Unsupported `-s` / `-X` value or incompatible strategy combination | `LBR-CLI-002` | 129 |
 | `--verify-signatures`: tip unsigned, signature invalid, or vault unavailable | `LBR-REPO-003` | 128 |
 | Merge conflicts | `LBR-CONFLICT-002` | 128 |

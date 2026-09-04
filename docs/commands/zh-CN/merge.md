@@ -15,9 +15,30 @@ libra merge --restart
 
 `libra merge <branch>` 会解析本地分支、提交哈希，或 `refs/remotes/origin/main` 这样的远程跟踪引用。
 
-如果当前分支可以快进，Libra 会将分支指针移动到目标提交，并恢复索引和工作树。如果分支已经分叉，Libra 会使用 merge base 执行单头三方合并。
+如果当前分支可以快进，Libra 会将分支指针移动到目标提交，并恢复索引和工作树。如果分支已经分叉，Libra 会使用 merge base 执行单头三方合并；当历史留下不止一个 merge base 时，改用由它们递归折叠出的虚拟祖先（见下文）。
 
 默认三方策略支持 `-X ours` / `-X theirs`：只在冲突 hunk/路径选择指定一侧，双方无冲突变更仍全部保留。它不同于 `-s ours`；后者会创建双父 merge commit（目标已经是当前分支祖先时除外），但完整保留当前 HEAD tree。其它 strategy/strategy option 会在参数解析阶段拒绝。
+
+### 交叉合并历史（多个 merge base）
+
+两条互相合并过的分支会留下**多个** merge base，彼此之间没有谁更好。任取其一会报出历史本可解释的冲突，因此 Libra 按 Git recursive 策略折叠它们：
+
+1. merge base 按 object id 升序排序，从左到右两两折叠，每次折叠本身又是一次三方合并（递归地拥有自己的 merge base）。
+2. 折叠出的单一 tree —— **虚拟祖先** —— 作为真实合并的 base。
+
+折叠内部的判定与真实合并不同，这一点与 Git 一致：
+
+- `-X ours` / `-X theirs` **不生效**：虚拟祖先是合成输入，用户并未要求对它偏袒。
+- 内容冲突不上抛，而是**作为内容**记录下来；冲突标记每递归一层加宽两个字符，使嵌套冲突绝不会被误读成外层合并产生的冲突。
+- change/delete 保留 base 版本——「已修改」与「已删除」之间没有中点。
+- 二进制内容（与 Git 判据一致：前 8000 字节含 NUL，或单个输入超过 1023 MiB）不做行级合并：祖先取 base 的内容；无 base 时取空 blob。
+- 符号链接，以及两侧**类型不同**的条目，一律保留 base 版本；无 base 时该路径在祖先中直接不存在。
+- 结果 mode 遵循 Git 规则：两侧一致或 ours 未改时取对侧 mode，否则取 ours。
+- 嵌套超过 20 层，或同一层要折叠超过 32 个 merge base 时——在加载任何 base 之前先按裸 id 计数，折叠过程中再按收集到的候选祖先计数——报 `LBR-UNSUPPORTED-001` 拒绝而不是继续（折叠的工作量随宽度平方增长；交叉合并只有两个）。`-s ours` 与 `--ff-only` 从不折叠，也从不因宽度被拒（分叉的 `--ff-only` 一如既往以 non-fast-forward 拒绝）。
+
+合成 commit 的 parents 是**到目前为止折叠过的全部真实 merge base**（Git 每折叠一步串一个双父虚拟提交）；可达历史相同，object id 不同。虚拟祖先的 tree 与合成 commit 会作为普通 loose object 写入，但它们是**一次性对象**：有意不写入 merge state，因而不是 GC root。`libra maintenance run --task gc` 随时可以回收它们（包括冲突合并仍在进行时）——没有任何东西依赖它们存活，`libra merge --restart` 会从真实 merge base 重新算出同一个祖先。因此 `merge-state.json` 只在 merge base 是单个真实提交时才记录 `base`。
+
+`libra merge --dry-run` 预演交叉合并遵循与其它预演相同的契约——不写对象库、索引、工作树、HEAD、reflog、merge 状态与 autostash sidecar：折叠把 blob 留在内存里，不落任何虚拟 tree 或 commit。（该契约**不**覆盖 CLI 在任何命令运行之前做的仓库级例行维护，例如打开数据库时的 schema 自动升级；见 `docs/development/commands/merge.md`。）
 
 没有共同祖先的历史默认仍被拒绝。显式传入 `--allow-unrelated-histories` 时，Libra 使用虚拟空 merge base：不相交的 root tree 正常合并，重叠新增正常冲突，且 conflict state 可跨 `--continue` / `--abort` / `--restart` 恢复，不会写入伪造的 base object。
 
@@ -25,7 +46,7 @@ libra merge --restart
 
 ### 冲突标记风格（`merge.conflictStyle`）
 
-标记格式遵循 Git 兼容的 `merge.conflictStyle` 配置键（仅配置——与 Git 一致，`merge` 无 CLI 风格参数）：`libra config merge.conflictStyle diff3`。`merge`（默认/未设置）为上述双标记风格；`diff3` 额外在 `||||||| base` 标记与 `=======` 分隔符之间输出共同祖先内容；其它值（含未实现的 `zdiff3`）在需要渲染冲突时直接报错（退出 128），绝不静默回落默认风格。该配置同时被 `libra merge` 与 `libra cherry-pick` 的行级文本冲突尊重；二进制与 modify/delete 冲突保持两段式整文件呈现（Git 亦不为其输出 base 块），`libra rebase` 目前始终渲染无 base 块的整文件标记、不受此配置影响。
+标记格式遵循 Git 兼容的 `merge.conflictStyle` 配置键（仅配置——与 Git 一致，`merge` 无 CLI 风格参数）：`libra config merge.conflictStyle diff3`。`merge`（默认/未设置）为上述双标记风格；`diff3` 额外在 `||||||| base` 标记与 `=======` 分隔符之间输出共同祖先内容；其它值（含未实现的 `zdiff3`）在需要渲染冲突时直接报错（退出 128），绝不静默回落默认风格。**多 merge base 的合并是例外**：递归虚拟祖先自身的内容依赖该风格（Git 在每一层递归同样传入它），因此该值在合并开始前就被解析——非法值会拦下一个本来会干净完成的交叉合并。该配置同时被 `libra merge` 与 `libra cherry-pick` 的行级文本冲突尊重；二进制与 modify/delete 冲突保持两段式整文件呈现（Git 亦不为其输出 base 块），`libra rebase` 目前始终渲染无 base 块的整文件标记、不受此配置影响。
 
 ### 子模块（`160000` gitlink 条目）
 
@@ -200,6 +221,7 @@ Merge aborted.
 | 分支目标 | `<branch>`（单个目标） | `<commit>...`（一个或多个） | N/A（使用 `jj new`） |
 | 快进 | 支持 | 支持 | N/A |
 | 单头三方合并 | 支持 | 支持 | N/A |
+| 交叉合并（多个 merge base） | 递归虚拟祖先（折叠顺序：object id 升序；最大深度 20，每层最多 32 个 base） | 递归虚拟祖先（`-s recursive`/`ort`，深度无上限） | N/A |
 | Continue / abort | `--continue`, `--abort` | `--continue`, `--abort` | N/A |
 | Octopus merge | 不支持 | 支持 | N/A |
 | 仅快进 | `--ff-only` | `--ff-only` | N/A |
@@ -231,6 +253,7 @@ Merge aborted.
 | 无法加载合并目标/当前提交/树 | `LBR-REPO-002` | 128 |
 | 未传 `--allow-unrelated-histories` 的无关历史 | `LBR-REPO-003` | 128 |
 | 三路合并需要裁决 `160000` gitlink（submodule） | `LBR-UNSUPPORTED-001` | 128 |
+| 递归虚拟祖先嵌套超过 20 层或同层超过 32 个 base | `LBR-UNSUPPORTED-001` | 128 |
 | 不支持的 `-s` / `-X` 值或不兼容的 strategy 组合 | `LBR-CLI-002` | 129 |
 | `--verify-signatures`：tip 未签名、签名无效或 vault 不可用 | `LBR-REPO-003` | 128 |
 | 合并冲突 | `LBR-CONFLICT-002` | 128 |

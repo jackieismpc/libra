@@ -16,6 +16,7 @@ use git_internal::{
         object::{
             blob::Blob,
             commit::Commit,
+            signature::{Signature, SignatureType},
             tree::{Tree, TreeItemMode},
         },
     },
@@ -397,10 +398,13 @@ pub(crate) struct MergeState {
     pub orig_head: String,
     pub target: String,
     pub target_ref: String,
-    /// Common ancestor used by the three-way merge. `None` represents the
-    /// virtual empty base used by `--allow-unrelated-histories`. Deserializing
-    /// older state files remains compatible because a JSON string maps to
-    /// `Some` and missing fields use the default.
+    /// Common ancestor used by the three-way merge, when it is a real commit.
+    /// `None` represents the virtual empty base used by
+    /// `--allow-unrelated-histories` AND the recursive virtual ancestor of a
+    /// criss-cross merge, which is a one-shot object deliberately left out of
+    /// this file so it is not a GC root (ADR-MG-04, see [`recorded_merge_base`]).
+    /// Deserializing older state files remains compatible because a JSON string
+    /// maps to `Some` and missing fields use the default.
     #[serde(default)]
     pub base: Option<String>,
     /// Strategy needed to preserve `--no-commit -s ours` through `--continue`.
@@ -660,6 +664,25 @@ pub(crate) enum PullMergeError {
     /// than silently dropped from the merge result the way it used to be.
     #[error("{0}")]
     GitlinkUnsupported(GitlinkNotSupported),
+    /// The recursive virtual ancestor (MG-02) would have to nest deeper than
+    /// [`MAX_VIRTUAL_ANCESTOR_DEPTH`]. Git recurses without a ceiling; Libra
+    /// folds the bases with real recursion, so it stops with a message instead
+    /// of risking a stack overflow on a pathological history.
+    #[error(
+        "merging these branches needs a virtual common ancestor nested more than \
+         {MAX_VIRTUAL_ANCESTOR_DEPTH} levels deep, which Libra does not build"
+    )]
+    VirtualAncestorTooDeep,
+    /// More merge bases than [`MAX_VIRTUAL_ANCESTOR_BASES`] at one level of
+    /// the fold. Every base folded in costs another merge-base walk against
+    /// every base already folded, so the fold's work grows with the SQUARE of
+    /// the width; the ceiling keeps that bounded instead of letting a
+    /// pathological history run for hours.
+    #[error(
+        "merging these branches needs a virtual common ancestor folded from {bases} merge \
+         bases, more than the {MAX_VIRTUAL_ANCESTOR_BASES} Libra folds"
+    )]
+    VirtualAncestorTooWide { bases: usize },
     #[error("merge has conflicts in {paths}")]
     Conflicts { paths: String },
     #[error("no merge in progress")]
@@ -744,6 +767,14 @@ impl From<PullMergeError> for CliError {
             }
             PullMergeError::UnrelatedHistories => CliError::failure(error.to_string())
                 .with_stable_code(StableErrorCode::RepoStateInvalid),
+            PullMergeError::VirtualAncestorTooDeep | PullMergeError::VirtualAncestorTooWide { .. } => {
+                CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::Unsupported)
+                .with_hint(
+                    "merge the branches' common ancestors together first, so the history has a single merge base",
+                )
+                .with_hint("or record the merge with 'libra merge -s ours' and reconcile the tree by hand")
+            }
             PullMergeError::GitlinkUnsupported(..) => CliError::failure(error.to_string())
                 .with_stable_code(StableErrorCode::Unsupported)
                 .with_hint(
@@ -1465,7 +1496,10 @@ pub(crate) async fn run_merge_for_pull_with_options(
     // repository-wide stash-stack lock — a repository lock never nests inside
     // a local one. The cleanup afterwards is identity-checked, so a sidecar
     // replaced in the unlocked window is preserved, never deleted.
-    let held_snapshot = if options.preserve_held_autostash {
+    // `--dry-run` writes nothing, and promoting a stale sidecar into the stash
+    // list (then deleting it) is a write — so a preview leaves a leftover
+    // sidecar exactly where it found it, for the next REAL merge to recover.
+    let held_snapshot = if options.preserve_held_autostash || options.dry_run {
         None
     } else {
         snapshot_held_autostash().map_err(PullMergeError::Autostash)?
@@ -1542,11 +1576,18 @@ pub(crate) async fn run_merge_for_pull_with_options(
         }
     }
 
+    let dry_run = options.dry_run;
     let result = run_merge_for_pull_inner(target_commit, upstream, output, options).await;
     // Uniform finalize: applies when no merge state persists (clean success,
     // up-to-date, squash, or a start failure), holds while state exists
     // (conflict / --no-commit). The merge outcome itself is never changed.
-    let autostash_outcome = resolve_pending_autostash(output).await;
+    // Skipped for `--dry-run`, which took no autostash and must not apply or
+    // promote a held one either.
+    let autostash_outcome = if dry_run {
+        None
+    } else {
+        resolve_pending_autostash(output).await
+    };
     match result {
         Ok(mut summary) => {
             summary.autostash = autostash_outcome;
@@ -1568,8 +1609,41 @@ pub(crate) async fn run_merge_for_pull_with_options(
 /// Whether the target is already reachable from HEAD — nothing to merge.
 /// Shared by the merge itself and by [`preflight_merge_gitlinks`] so the two can
 /// never disagree about which merges arbitrate anything (GC-02).
-fn merge_is_up_to_date(lca: Option<&Commit>, target_commit: &Commit) -> bool {
-    lca.is_some_and(|base| base.id == target_commit.id)
+///
+/// Phrased over the merge-base SET (MG-02): a commit that is an ancestor of the
+/// other dominates every other common ancestor, so "already merged" is exactly
+/// the shape where the target is the ONE merge base. A criss-cross history with
+/// several bases is never up to date and never fast-forwardable.
+fn merge_is_up_to_date(bases: &[Commit], target_commit: &Commit) -> bool {
+    matches!(bases, [base] if base.id == target_commit.id)
+}
+
+/// Whether a merge run with `options` would fold several merge bases into a
+/// virtual ancestor at all. Shared by the preflight and the engine so the width
+/// ceiling can never fire for a merge that decides the shape some other way.
+fn merge_options_will_fold(options: &PullMergeOptions) -> bool {
+    options.strategy.is_none() && !options.ff_only
+}
+
+/// Whether HEAD is the sole merge base — the shape a fast-forward (and
+/// `--ff-only`) requires.
+fn merge_head_is_sole_base(bases: &[Commit], current_commit: &Commit) -> bool {
+    matches!(bases, [base] if base.id == current_commit.id)
+}
+
+/// The merge base recorded in `merge-state.json`.
+///
+/// `None` for an unrelated-history merge (virtual empty base) AND for a
+/// criss-cross merge, whose base is the recursive virtual ancestor: a one-shot
+/// object that is deliberately not a GC root (ADR-MG-04). Recording it would
+/// pin the very object `maintenance gc` is meant to be free to reclaim, and
+/// nothing needs it — `--continue` finishes from the index, and `--restart`
+/// recomputes the ancestor from the real bases.
+fn recorded_merge_base(bases: &[Commit]) -> Option<ObjectHash> {
+    match bases {
+        [base] => Some(base.id),
+        _ => None,
+    }
 }
 
 /// Whether the merge will fast-forward: HEAD is the merge base and no option
@@ -1577,11 +1651,11 @@ fn merge_is_up_to_date(lca: Option<&Commit>, target_commit: &Commit) -> bool {
 /// it decides nothing — gitlinks included. Shared with
 /// [`preflight_merge_gitlinks`] (GC-02).
 fn merge_is_fast_forward(
-    lca: Option<&Commit>,
+    bases: &[Commit],
     current_commit: &Commit,
     options: &PullMergeOptions,
 ) -> bool {
-    lca.is_some_and(|base| base.id == current_commit.id)
+    merge_head_is_sole_base(bases, current_commit)
         && options.strategy.is_none()
         && !options.no_ff
         && !options.squash
@@ -1612,40 +1686,72 @@ async fn preflight_merge_gitlinks(
             commit_id: current_commit_id.to_string(),
             detail: error.to_string(),
         })?;
-    let lca = lca_commit(&current_commit, target_commit)
-        .map_err(|error| PullMergeError::History(error.to_string()))?;
+    let bases = merge_base_commits(
+        &current_commit,
+        target_commit,
+        merge_options_will_fold(options),
+    )?;
     // Every shape the engine settles WITHOUT arbitrating is skipped here, so a
     // gitlink refusal can never pre-empt the engine's own verdict:
     //   * unrelated histories the user did not opt into are rejected outright;
     //   * `--ff-only` on a genuinely diverged history is rejected outright;
     //   * an up-to-date or fast-forward merge adopts a tree wholesale.
-    if lca.is_none() && !options.allow_unrelated_histories {
+    if bases.is_empty() && !options.allow_unrelated_histories {
         return Ok(());
     }
-    if options.ff_only
-        && !lca
-            .as_ref()
-            .is_some_and(|base| base.id == current_commit.id)
+    if options.ff_only && !merge_head_is_sole_base(&bases, &current_commit) {
+        return Ok(());
+    }
+    if merge_is_up_to_date(&bases, target_commit)
+        || merge_is_fast_forward(&bases, &current_commit, options)
     {
         return Ok(());
     }
-    if merge_is_up_to_date(lca.as_ref(), target_commit)
-        || merge_is_fast_forward(lca.as_ref(), &current_commit, options)
-    {
-        return Ok(());
-    }
-    let base_gitlinks = match lca.as_ref() {
-        Some(base) => commit_gitlink_entries(base)?,
-        None => GitlinkEntries::new(),
-    };
-    ensure_gitlinks_not_arbitrated(
-        "merge",
-        &base_gitlinks,
+    ensure_merge_gitlinks_uniform(
+        &bases,
         &commit_gitlink_entries(&current_commit)?,
         &commit_gitlink_entries(target_commit)?,
     )
     .map(|_| ())
-    .map_err(PullMergeError::GitlinkUnsupported)
+}
+
+/// ADR-MG-01 for a merge with any number of merge bases (MG-00 × MG-02).
+///
+/// EVERY merge base has to agree with both sides about every gitlink, not just
+/// the one that happens to sort first: with a criss-cross history the fold
+/// merges the bases against each other first, so a gitlink two bases disagree
+/// about would be arbitrated inside the virtual ancestor — before the outer
+/// merge ever looked at it. Asking the question once per base is the same
+/// fail-closed rule applied to every input the merge actually reads, and it
+/// runs BEFORE the fold writes anything.
+///
+/// Returns the pass-through set (identical for every base, since passing
+/// requires all three sides to carry the same object id).
+fn ensure_merge_gitlinks_uniform(
+    bases: &[Commit],
+    our_gitlinks: &GitlinkEntries,
+    their_gitlinks: &GitlinkEntries,
+) -> Result<GitlinkEntries, PullMergeError> {
+    if bases.is_empty() {
+        return ensure_gitlinks_not_arbitrated(
+            "merge",
+            &GitlinkEntries::new(),
+            our_gitlinks,
+            their_gitlinks,
+        )
+        .map_err(PullMergeError::GitlinkUnsupported);
+    }
+    let mut passthrough = GitlinkEntries::new();
+    for base in bases {
+        passthrough = ensure_gitlinks_not_arbitrated(
+            "merge",
+            &commit_gitlink_entries(base)?,
+            our_gitlinks,
+            their_gitlinks,
+        )
+        .map_err(PullMergeError::GitlinkUnsupported)?;
+    }
+    Ok(passthrough)
 }
 
 fn merge_completed_for_post_hook(summary: &PullMergeSummary) -> bool {
@@ -1693,14 +1799,17 @@ async fn run_merge_for_pull_inner(
             detail: error.to_string(),
         })?;
 
-    let lca = lca_commit(&current_commit, &target_commit)
-        .map_err(|error| PullMergeError::History(error.to_string()))?;
+    let bases = merge_base_commits(
+        &current_commit,
+        &target_commit,
+        merge_options_will_fold(&options),
+    )?;
 
-    if lca.is_none() && !options.allow_unrelated_histories {
+    if bases.is_empty() && !options.allow_unrelated_histories {
         return Err(PullMergeError::UnrelatedHistories);
     }
 
-    if merge_is_up_to_date(lca.as_ref(), &target_commit) {
+    if merge_is_up_to_date(&bases, &target_commit) {
         return Ok(PullMergeSummary {
             strategy: "already-up-to-date".to_string(),
             old_commit: Some(current_commit_id.to_string()),
@@ -1717,7 +1826,7 @@ async fn run_merge_for_pull_inner(
         });
     }
 
-    if merge_is_fast_forward(lca.as_ref(), &current_commit, &options) {
+    if merge_is_fast_forward(&bases, &current_commit, &options) {
         let files_changed = count_changed_files(Some(&current_commit), &target_commit)?;
         // `--dry-run`: report the fast-forward preview without applying it.
         if !options.dry_run {
@@ -1744,11 +1853,7 @@ async fn run_merge_for_pull_inner(
     // a genuinely diverged history: a fast-forwardable `--squash`/`--no-commit`
     // merely skipped the fast-forward branch above and is allowed (Git accepts
     // `merge.ff=only` + `--squash` when the target is fast-forwardable).
-    if options.ff_only
-        && !lca
-            .as_ref()
-            .is_some_and(|base| base.id == current_commit.id)
-    {
+    if options.ff_only && !merge_head_is_sole_base(&bases, &current_commit) {
         return Err(PullMergeError::NonFastForward {
             current: current_commit.id.to_string(),
             target: target_commit.id.to_string(),
@@ -1771,8 +1876,14 @@ async fn run_merge_for_pull_inner(
             perform_ours_merge(current_commit, target_commit, upstream, merge_options).await
         }
         None => {
-            perform_three_way_merge(current_commit, target_commit, lca, upstream, merge_options)
-                .await
+            perform_three_way_merge(
+                current_commit,
+                target_commit,
+                bases,
+                upstream,
+                merge_options,
+            )
+            .await
         }
     }
 }
@@ -1969,7 +2080,7 @@ async fn perform_ours_merge(
 async fn perform_three_way_merge(
     current_commit: Commit,
     target_commit: Commit,
-    base_commit: Option<Commit>,
+    base_commits: Vec<Commit>,
     upstream: &str,
     options: ThreeWayMergeOptions<'_>,
 ) -> Result<PullMergeSummary, PullMergeError> {
@@ -1983,28 +2094,54 @@ async fn perform_three_way_merge(
     }
 
     let head_name = current_head_name().await?;
-    let (base_items, base_gitlinks) = match base_commit.as_ref() {
-        Some(base) => commit_tree_split(base)?,
-        None => (HashMap::new(), GitlinkEntries::new()),
-    };
     let (our_items, our_gitlinks) = commit_tree_split(&current_commit)?;
     let (their_items, their_gitlinks) = commit_tree_split(&target_commit)?;
     // ADR-MG-01 fail-closed gate: refuse before the first write (this runs
     // ahead of the `--dry-run` report as well, so the preview is honest) if any
-    // submodule pointer diverged. Gitlinks the three sides agree on are carried
-    // into the result tree untouched instead of vanishing from it.
+    // submodule pointer diverged — for EVERY merge base, so the recursive fold
+    // below can never end up arbitrating one either. Gitlinks all the inputs
+    // agree on are carried into the result tree untouched instead of vanishing
+    // from it.
     let passthrough_gitlinks =
-        ensure_gitlinks_not_arbitrated("merge", &base_gitlinks, &our_gitlinks, &their_gitlinks)
-            .map_err(PullMergeError::GitlinkUnsupported)?;
+        ensure_merge_gitlinks_uniform(&base_commits, &our_gitlinks, &their_gitlinks)?;
+    // MG-02: a criss-cross history leaves several merge bases, none of them
+    // better than the others. Fold them into one virtual ancestor (Git's
+    // recursive strategy, `merge-ort.c:5313`) instead of arbitrarily picking
+    // one, which reports conflicts the recursion resolves.
+    let (base_items, mut virtual_blobs) = match base_commits.as_slice() {
+        [] => (HashMap::new(), VirtualBlobs::new()),
+        [base] => (commit_tree_items(base)?, VirtualBlobs::new()),
+        bases => {
+            // A conflict INSIDE the virtual ancestor is rendered with the
+            // configured style, exactly as Git renders one at any call depth.
+            // Resolving the style here rather than only on the outer conflict
+            // path is what a multi-base merge costs: an invalid
+            // `merge.conflictStyle` stops a criss-cross merge even when the
+            // merge itself would come out clean.
+            let conflict_style = conflict_style_from_config().await.map_err(|e| match e {
+                ConflictStyleError::Invalid(value) => PullMergeError::InvalidConflictStyle(value),
+                ConflictStyleError::Read(detail) => PullMergeError::ConflictStyleRead(detail),
+            })?;
+            let base_ids: Vec<ObjectHash> = bases.iter().map(|base| base.id).collect();
+            let ancestor = virtual_merge_base(
+                &base_ids,
+                &passthrough_gitlinks,
+                !options.dry_run,
+                conflict_style,
+            )?;
+            (ancestor.items, ancestor.blobs)
+        }
+    };
     // Under `--dry-run`, auto-merged blobs are computed in memory only
     // (persist=false) so the preview writes nothing to the object store —
     // under tiered storage a `save_object` would even upload to the remote.
+    // The virtual ancestor obeys the same rule: its blobs stay in
+    // `virtual_blobs` and its one-shot tree/commit are not materialized.
     let merge_result = merge_tree_items(
         &base_items,
         &our_items,
         &their_items,
-        !options.dry_run,
-        options.favor,
+        &mut TreeMergeContext::top_level(!options.dry_run, options.favor, &mut virtual_blobs),
     )?;
     let files_changed = count_item_map_changes(&our_items, &merge_result.merged_items);
 
@@ -2025,7 +2162,8 @@ async fn perform_three_way_merge(
 
     // `--dry-run`: the outcome is fully known here — report it and stop before
     // the FIRST write (no merge state, index, worktree, HEAD, or reflog
-    // mutation; no conflict markers; conflict-style config not consulted).
+    // mutation; no conflict markers). The conflict-style config is consulted
+    // only for the multi-base fold above, whose ancestor content depends on it.
     if options.dry_run {
         let conflicted_paths: Vec<String> = merge_result
             .conflicts
@@ -2064,8 +2202,10 @@ async fn perform_three_way_merge(
     )?;
 
     if !merge_result.conflicts.is_empty() {
-        // Resolved only on the conflict path: a clean merge never renders
-        // markers, so an invalid style config cannot block it.
+        // For a single-base merge the style is resolved only here, on the
+        // conflict path, so an invalid value cannot block a clean merge. A
+        // multi-base merge already resolved it above (the fold's content
+        // depends on it) — this second read then simply agrees with the first.
         let conflict_style = conflict_style_from_config().await.map_err(|e| match e {
             ConflictStyleError::Invalid(value) => PullMergeError::InvalidConflictStyle(value),
             ConflictStyleError::Read(detail) => PullMergeError::ConflictStyleRead(detail),
@@ -2074,7 +2214,7 @@ async fn perform_three_way_merge(
             head_name,
             message: resolved_message,
             upstream: upstream.to_string(),
-            base: base_commit.as_ref().map(|base| base.id),
+            base: recorded_merge_base(&base_commits),
             allow_unrelated_histories: options.allow_unrelated_histories,
             skip_hooks: options.skip_hooks,
             ours: current_commit.id,
@@ -2139,7 +2279,7 @@ async fn perform_three_way_merge(
             orig_head: current_commit.id.to_string(),
             target: target_commit.id.to_string(),
             target_ref: upstream.to_string(),
-            base: base_commit.as_ref().map(|base| base.id.to_string()),
+            base: recorded_merge_base(&base_commits).map(|base| base.to_string()),
             strategy: None,
             allow_unrelated_histories: options.allow_unrelated_histories,
             skip_hooks: options.skip_hooks,
@@ -2672,20 +2812,40 @@ async fn resolve_merge_target(target_ref: &str) -> Result<ObjectHash, Box<dyn st
     get_target_commit(target_ref).await
 }
 
-fn lca_commit(lhs: &Commit, rhs: &Commit) -> Result<Option<Commit>, CliError> {
-    let Some(base_id) = merge_base::merge_base(&lhs.id, &rhs.id).map_err(|error| {
-        CliError::fatal(format!("failed to compute merge base: {error}"))
-            .with_stable_code(StableErrorCode::RepoCorrupt)
-    })?
-    else {
-        return Ok(None);
-    };
-
-    let base = load_object::<Commit>(&base_id).map_err(|error| {
-        CliError::fatal(format!("failed to load merge base {base_id}: {error}"))
-            .with_stable_code(StableErrorCode::RepoCorrupt)
+/// EVERY merge base of `lhs` and `rhs`, in the ascending-hex order
+/// `merge_base::merge_bases` guarantees — which is also the order the recursive
+/// virtual ancestor folds them in ([`virtual_base_fold_order`]).
+///
+/// Empty when the two share no history. More than one means a criss-cross
+/// history, which MG-02 resolves by folding them rather than by picking one.
+///
+/// `will_fold` is whether several bases would actually be FOLDED; when it is
+/// set the width ceiling is enforced here, on the bare ids, before a single base
+/// commit or tree is loaded — the ceiling exists to bound work, so it has to
+/// fire before the work starts. Callers pass [`merge_options_will_fold`]:
+/// `-s ours` never folds, and a diverged `--ff-only` merge is refused as
+/// non-fast-forward before any fold could start — neither may be refused for
+/// width instead.
+fn merge_base_commits(
+    lhs: &Commit,
+    rhs: &Commit,
+    will_fold: bool,
+) -> Result<Vec<Commit>, PullMergeError> {
+    let base_ids = merge_base::merge_bases(&lhs.id, &rhs.id).map_err(|error| {
+        PullMergeError::History(format!("failed to compute merge base: {error}"))
     })?;
-    Ok(Some(base))
+    if will_fold {
+        ensure_virtual_ancestor_width(base_ids.len())?;
+    }
+    base_ids
+        .into_iter()
+        .map(|base_id| {
+            load_object::<Commit>(&base_id).map_err(|error| PullMergeError::ObjectLoad {
+                object_id: base_id.to_string(),
+                detail: format!("failed to load merge base: {error}"),
+            })
+        })
+        .collect()
 }
 
 async fn apply_fast_forward_merge(
@@ -3105,9 +3265,9 @@ fn resolve_three_way(
     base: Option<&MergeTreeEntry>,
     ours: Option<&MergeTreeEntry>,
     theirs: Option<&MergeTreeEntry>,
-    persist_merged_blobs: bool,
-    favor: Option<MergeFavor>,
+    context: &mut TreeMergeContext<'_>,
 ) -> Result<MergeResolution, PullMergeError> {
+    let favor = context.favor;
     let base_present = base.is_some();
     let ours_state = classify_relative_to_base(base, ours);
     let theirs_state = classify_relative_to_base(base, theirs);
@@ -3140,8 +3300,7 @@ fn resolve_three_way(
             if ours == theirs {
                 MergeResolution::Use(theirs)
             } else if let Some(base) = base
-                && let Some(merged) =
-                    try_merge_blob_contents(base, ours, theirs, persist_merged_blobs, favor)?
+                && let Some(merged) = try_merge_blob_contents(base, ours, theirs, context)?
             {
                 MergeResolution::Use(merged)
             } else if let Some(favor) = favor {
@@ -3197,22 +3356,34 @@ fn try_merge_blob_contents(
     base: &MergeTreeEntry,
     ours: MergeTreeEntry,
     theirs: MergeTreeEntry,
-    persist: bool,
-    favor: Option<MergeFavor>,
+    context: &mut TreeMergeContext<'_>,
 ) -> Result<Option<MergeTreeEntry>, PullMergeError> {
-    if base.mode != ours.mode
-        || base.mode != theirs.mode
-        || !matches!(base.mode, TreeItemMode::Blob | TreeItemMode::BlobExecutable)
+    if base.mode != ours.mode || base.mode != theirs.mode || !is_regular_file_mode(base.mode) {
+        return Ok(None);
+    }
+
+    let base_blob = load_merge_blob(base.hash, context.virtual_blobs)?;
+    let ours_blob = load_merge_blob(ours.hash, context.virtual_blobs)?;
+    let theirs_blob = load_merge_blob(theirs.hash, context.virtual_blobs)?;
+
+    // Git routes ANY binary input to `ll_binary_merge` instead of the
+    // line-level merge (`merge-ll.c` `ll_xdl_merge`), and inside a virtual
+    // ancestor that is what decides the content — so the line-level path has to
+    // decline here and let [`virtual_conflict_resolution`] apply the rule. The
+    // depth-0 behaviour is deliberately left exactly as it was: binary content
+    // merging for the user's own merge is a different axis, untouched by MG-02.
+    if context.depth > 0
+        && (merge_input_is_binary(&base_blob.data)
+            || merge_input_is_binary(&ours_blob.data)
+            || merge_input_is_binary(&theirs_blob.data))
     {
         return Ok(None);
     }
 
-    let base_blob = load_merge_blob(base.hash)?;
-    let ours_blob = load_merge_blob(ours.hash)?;
-    let theirs_blob = load_merge_blob(theirs.hash)?;
-
-    let marker_len =
-        unambiguous_conflict_marker_length(&[&base_blob.data, &ours_blob.data, &theirs_blob.data]);
+    let marker_len = conflict_marker_length_at_depth(
+        &[&base_blob.data, &ours_blob.data, &theirs_blob.data],
+        context.depth,
+    );
     let mut merge_options = diffy::MergeOptions::new();
     merge_options
         .set_conflict_style(diffy::ConflictStyle::Diff3)
@@ -3220,7 +3391,7 @@ fn try_merge_blob_contents(
     let merged_bytes =
         match merge_options.merge_bytes(&base_blob.data, &ours_blob.data, &theirs_blob.data) {
             Ok(merged) => merged,
-            Err(conflicted) => match favor {
+            Err(conflicted) => match context.favor {
                 Some(favor) => resolve_favored_content(conflicted, marker_len, favor)
                     .map_err(PullMergeError::TreeCreate)?,
                 None => return Ok(None),
@@ -3230,15 +3401,10 @@ fn try_merge_blob_contents(
     let merged_blob = Blob::from_content_bytes(merged_bytes);
     // `--dry-run` (persist=false): the merged OID is computed in memory only —
     // persisting here would write the object store (and, under tiered storage,
-    // upload to the durable tier) from a preview.
-    if persist {
-        save_object(&merged_blob, &merged_blob.id).map_err(|error| {
-            PullMergeError::TreeCreate(format!(
-                "failed to save auto-merged blob {}: {error}",
-                merged_blob.id
-            ))
-        })?;
-    }
+    // upload to the durable tier) from a preview. It still has to stay
+    // ADDRESSABLE, because inside the recursive fold this blob becomes the
+    // virtual ancestor's content and the outer merge loads it by id.
+    context.record_merged_blob(&merged_blob)?;
 
     Ok(Some(MergeTreeEntry {
         hash: merged_blob.id,
@@ -3348,19 +3514,587 @@ fn unambiguous_conflict_marker_length(sides: &[&[u8]]) -> usize {
     DEFAULT_MARKER_LENGTH.max(longest.saturating_add(1))
 }
 
-fn load_merge_blob(hash: ObjectHash) -> Result<Blob, PullMergeError> {
+/// Load a blob a three-way merge needs, preferring the content the recursive
+/// virtual ancestor synthesized over the object store.
+///
+/// The fold keeps every blob it creates in [`VirtualBlobs`] as well as (when
+/// the merge is real) writing it, which is what lets a `--dry-run` preview of a
+/// criss-cross history compute the same result without writing anything.
+fn load_merge_blob(hash: ObjectHash, virtual_blobs: &VirtualBlobs) -> Result<Blob, PullMergeError> {
+    if let Some(data) = virtual_blobs.get(&hash) {
+        return Ok(Blob::from_content_bytes(data.clone()));
+    }
     load_object(&hash).map_err(|error| PullMergeError::ObjectLoad {
         object_id: hash.to_string(),
         detail: error.to_string(),
     })
 }
 
+/// How deep the recursive virtual-ancestor fold may nest before `merge` gives
+/// up (MG-02).
+///
+/// Git recurses without a ceiling (`merge-ort.c:5313`); Libra folds the bases
+/// with real recursion, so a ceiling is what turns a pathological history into
+/// a message instead of a stack overflow. Twenty levels is far past anything
+/// real history produces — each level needs the merge bases of the previous
+/// level's bases to themselves be multiple — while still bounding the stack.
+pub(crate) const MAX_VIRTUAL_ANCESTOR_DEPTH: usize = 20;
+
+/// How many merge bases one level of the fold may combine.
+///
+/// The fold's cost is quadratic in this width: folding the `k`-th base asks
+/// for the merge bases of `next` against each of the `k − 1` already folded
+/// ([`merge_bases_of_folded`]), and each of those is a full paint-down walk
+/// through the object store — `internal::merge_base` deliberately exposes only
+/// per-call APIs (MG-01), so the fold cannot share one graph read across them.
+/// The depth ceiling bounds nesting, not width; this bounds width. Thirty-two
+/// mutually independent common ancestors is far past any real history (a
+/// criss-cross has two).
+pub(crate) const MAX_VIRTUAL_ANCESTOR_BASES: usize = 32;
+
+/// The two side labels Git renders inside a virtual-ancestor merge
+/// (`merge-ort.c:5429` swaps `opt->branch1`/`branch2` for these while it folds).
+const VIRTUAL_OURS_LABEL: &str = "Temporary merge branch 1";
+const VIRTUAL_THEIRS_LABEL: &str = "Temporary merge branch 2";
+
+/// Commit message of the synthetic commit standing in for a folded ancestor.
+const VIRTUAL_ANCESTOR_MESSAGE: &str = "merged common ancestors\n";
+
+/// Blobs synthesized while folding several merge bases into one virtual
+/// ancestor, addressable by object id without going through the object store.
+///
+/// Always empty for a merge with zero or one merge base.
+type VirtualBlobs = HashMap<ObjectHash, Vec<u8>>;
+
+/// The recursive virtual ancestor of a multi-base merge: the flattened tree the
+/// outer three-way merge uses as its base, plus the blobs the fold created for
+/// it.
+struct VirtualAncestor {
+    items: HashMap<PathBuf, MergeTreeEntry>,
+    blobs: VirtualBlobs,
+}
+
+/// Everything a three-way tree merge needs beyond the three item maps.
+struct TreeMergeContext<'a> {
+    /// Write auto-merged blobs to the object store. `false` under `--dry-run`,
+    /// where the merged object ids are computed in memory only.
+    persist_merged_blobs: bool,
+    /// Resolve otherwise-conflicting hunks in favor of one side. Always `None`
+    /// inside the virtual-ancestor fold: Git disables `-X ours`/`-X theirs`
+    /// there (`merge-ort.c` sets `ll_opts.variant = 0` whenever
+    /// `call_depth` is non-zero), because a virtual ancestor is an input the
+    /// user never asked to bias.
+    favor: Option<MergeFavor>,
+    /// Recursion depth: 0 for the merge the user asked for, 1 for the merges
+    /// that fold its merge bases, 2 for the merges that fold *those* bases, and
+    /// so on — Git's `call_depth`.
+    depth: usize,
+    /// Blobs this merge (and, inside the recursive fold, every level below it)
+    /// synthesized WITHOUT writing them, consulted by [`load_merge_blob`] ahead
+    /// of the object store.
+    ///
+    /// Mutable because a merged blob has to land somewhere the next reader can
+    /// find it: when `persist_merged_blobs` is set that place is the object
+    /// store, and when it is not — a `--dry-run` preview — it is this map. A
+    /// virtual ancestor's content is exactly the case where the difference
+    /// matters: the outer merge reads it back by object id.
+    virtual_blobs: &'a mut VirtualBlobs,
+}
+
+impl TreeMergeContext<'_> {
+    /// The context for a real (depth 0) merge.
+    fn top_level(
+        persist_merged_blobs: bool,
+        favor: Option<MergeFavor>,
+        virtual_blobs: &mut VirtualBlobs,
+    ) -> TreeMergeContext<'_> {
+        TreeMergeContext {
+            persist_merged_blobs,
+            favor,
+            depth: 0,
+            virtual_blobs,
+        }
+    }
+
+    /// Record a blob this merge produced: written to the object store, or —
+    /// when nothing may be written — kept addressable in memory instead.
+    fn record_merged_blob(&mut self, blob: &Blob) -> Result<(), PullMergeError> {
+        if self.persist_merged_blobs {
+            save_object(blob, &blob.id).map_err(|error| {
+                PullMergeError::TreeCreate(format!(
+                    "failed to save auto-merged blob {}: {error}",
+                    blob.id
+                ))
+            })?;
+        } else {
+            self.virtual_blobs.insert(blob.id, blob.data.clone());
+        }
+        Ok(())
+    }
+}
+
+/// The conflict-marker length to use at recursion depth `depth`.
+///
+/// Git widens the markers by two per level — `merge-ort.c` passes
+/// `opt->priv->call_depth * 2` as `extra_marker_size` and `ll_xdl_merge` adds
+/// it to `DEFAULT_CONFLICT_MARKER_SIZE` — so a conflict recorded inside a
+/// virtual ancestor cannot be mistaken for one the outer merge produced when
+/// the ancestor's content is merged again one level up. Composed with Libra's
+/// existing content-driven bump ([`unambiguous_conflict_marker_length`]), which
+/// is what keeps a marker run distinguishable from the *inputs*.
+fn conflict_marker_length_at_depth(sides: &[&[u8]], depth: usize) -> usize {
+    unambiguous_conflict_marker_length(sides).saturating_add(2 * depth)
+}
+
+/// Refuse to fold merge bases nested deeper than [`MAX_VIRTUAL_ANCESTOR_DEPTH`].
+fn ensure_virtual_ancestor_depth(depth: usize) -> Result<(), PullMergeError> {
+    if depth > MAX_VIRTUAL_ANCESTOR_DEPTH {
+        return Err(PullMergeError::VirtualAncestorTooDeep);
+    }
+    Ok(())
+}
+
+/// Refuse to fold more than [`MAX_VIRTUAL_ANCESTOR_BASES`] bases at one level.
+fn ensure_virtual_ancestor_width(bases: usize) -> Result<(), PullMergeError> {
+    if bases > MAX_VIRTUAL_ANCESTOR_BASES {
+        return Err(PullMergeError::VirtualAncestorTooWide { bases });
+    }
+    Ok(())
+}
+
+/// The order the merge bases are folded in: ascending hex id.
+///
+/// Git folds them in whatever order `get_merge_bases()` returned, which makes
+/// the virtual ancestor's content depend on traversal order. Sorting makes the
+/// fold — and therefore the merge result and every object it writes —
+/// reproducible, which is what lets `--restart` recompute the same ancestor
+/// after `maintenance gc` has reclaimed it (ADR-MG-04).
+fn virtual_base_fold_order(bases: &[ObjectHash]) -> Vec<ObjectHash> {
+    let mut ordered = bases.to_vec();
+    ordered.sort_by_key(|id| id.to_string());
+    ordered.dedup();
+    ordered
+}
+
+/// Load one of the merge bases being folded. Reported as a plain object load:
+/// it is neither the current nor the target commit, and naming it as one would
+/// misdirect anyone reading the error.
+fn load_merge_commit(id: &ObjectHash) -> Result<Commit, PullMergeError> {
+    load_object(id).map_err(|error| PullMergeError::ObjectLoad {
+        object_id: id.to_string(),
+        detail: error.to_string(),
+    })
+}
+
+/// The merge bases of the ancestor folded from `folded` with `next`.
+///
+/// Git asks this of the synthetic commit it just built (`merge-ort.c:5429`
+/// chains `make_virtual_commit` so the next round can call `get_merge_bases()`
+/// on it). The same set falls out of the REAL bases folded so far: the virtual
+/// commit's ancestry is exactly the union of theirs, so the common ancestors of
+/// it and `next` are `⋃ᵢ (anc(folded[i]) ∩ anc(next))`, and the maximal elements
+/// of a union are always among the maximal elements of its parts — i.e. among
+/// `⋃ᵢ merge_bases(folded[i], next)`, filtered for domination across the parts.
+///
+/// Deriving it this way keeps the fold from having to read back an object it
+/// wrote, which is what lets a `--dry-run` preview of a criss-cross history
+/// write nothing at all.
+///
+/// Work: one merge-base walk per base already folded, plus — only when MORE
+/// than one part contributed candidates — one ancestry walk per candidate pair
+/// drawn from DIFFERENT parts (a single part's candidates are already mutually
+/// maximal, so they never need checking against each other). The first fold
+/// step, which is the whole fold for the common two-base criss-cross, is
+/// therefore exactly one walk with no filtering.
+///
+/// Bounded: the parts are at most [`MAX_VIRTUAL_ANCESTOR_BASES`] (checked
+/// here as well as by the caller), and candidate collection stops — with the
+/// same refusal — the moment MORE than that many distinct candidates have been
+/// seen, BEFORE any pairwise ancestry walk. The maximal set is a subset of the
+/// candidates, so this is conservative: a nested history whose candidates
+/// exceed the ceiling is refused even if domination would have thinned them.
+fn merge_bases_of_folded(
+    folded: &[ObjectHash],
+    next: &ObjectHash,
+) -> Result<Vec<ObjectHash>, PullMergeError> {
+    let history = |error: merge_base::MergeBaseError| PullMergeError::History(error.to_string());
+    ensure_virtual_ancestor_width(folded.len())?;
+    let [single] = folded else {
+        // Candidates tagged with the part (folded base) that produced them.
+        let mut candidates: Vec<(usize, ObjectHash)> = Vec::new();
+        for (part, base) in folded.iter().enumerate() {
+            for candidate in merge_base::merge_bases(base, next).map_err(history)? {
+                if !candidates.iter().any(|(_, known)| *known == candidate) {
+                    candidates.push((part, candidate));
+                    ensure_virtual_ancestor_width(candidates.len())?;
+                }
+            }
+        }
+        let mut maximal = Vec::new();
+        for (part, candidate) in &candidates {
+            let mut dominated = false;
+            for (other_part, other) in &candidates {
+                if other_part == part {
+                    continue;
+                }
+                if merge_base::is_ancestor(candidate, other).map_err(history)? {
+                    dominated = true;
+                    break;
+                }
+            }
+            if !dominated {
+                maximal.push(*candidate);
+            }
+        }
+        return Ok(virtual_base_fold_order(&maximal));
+    };
+    merge_base::merge_bases(single, next).map_err(history)
+}
+
+/// Fold every merge base of a criss-cross history into ONE virtual ancestor
+/// (ADR-MG-04, Git's `merge-ort.c:5313`).
+///
+/// `persist` is `false` under `--dry-run`: the fold then keeps its blobs in
+/// memory and materializes nothing.
+fn virtual_merge_base(
+    bases: &[ObjectHash],
+    gitlinks: &GitlinkEntries,
+    persist: bool,
+    conflict_style: diffy::ConflictStyle,
+) -> Result<VirtualAncestor, PullMergeError> {
+    let mut blobs = VirtualBlobs::new();
+    let items = fold_merge_bases(bases, gitlinks, 1, persist, conflict_style, &mut blobs)?;
+    Ok(VirtualAncestor { items, blobs })
+}
+
+/// One level of the fold: merge `bases` pairwise, left to right in hex order,
+/// into a single ancestor tree. `depth` is the `call_depth` of the merges this
+/// level performs (1 for the bases of the user's merge, 2 for the bases of
+/// those, …).
+fn fold_merge_bases(
+    bases: &[ObjectHash],
+    gitlinks: &GitlinkEntries,
+    depth: usize,
+    persist: bool,
+    conflict_style: diffy::ConflictStyle,
+    blobs: &mut VirtualBlobs,
+) -> Result<HashMap<PathBuf, MergeTreeEntry>, PullMergeError> {
+    ensure_virtual_ancestor_depth(depth)?;
+    let ordered = virtual_base_fold_order(bases);
+    ensure_virtual_ancestor_width(ordered.len())?;
+    let Some((first, rest)) = ordered.split_first() else {
+        // No common ancestor at this level: the virtual ancestor is the empty
+        // tree, exactly as an unrelated-history merge uses one.
+        return Ok(HashMap::new());
+    };
+    let first_commit = load_merge_commit(first)?;
+    let mut folded_ids = vec![*first];
+    let mut timestamp = first_commit.committer.timestamp;
+    let mut items = commit_tree_items(&first_commit)?;
+    for next in rest {
+        let next_commit = load_merge_commit(next)?;
+        let next_items = commit_tree_items(&next_commit)?;
+        let sub_bases = merge_bases_of_folded(&folded_ids, next)?;
+        let sub_items = fold_merge_bases(
+            &sub_bases,
+            gitlinks,
+            depth + 1,
+            persist,
+            conflict_style,
+            blobs,
+        )?;
+        items = merge_virtual_items(
+            &sub_items,
+            &items,
+            &next_items,
+            depth,
+            persist,
+            conflict_style,
+            blobs,
+        )?;
+        folded_ids.push(*next);
+        timestamp = timestamp.max(next_commit.committer.timestamp);
+        if persist {
+            materialize_virtual_ancestor(&items, gitlinks, &folded_ids, timestamp)?;
+        }
+    }
+    Ok(items)
+}
+
+/// Merge one pair of ancestors inside the fold.
+///
+/// The difference from the user's merge is that this one can never fail: a
+/// virtual ancestor is a synthetic input, so every path has to end up with
+/// SOME content. Git resolves the same way — a content conflict is recorded
+/// with its markers, and a modify/delete "simply reuse[s] the base version for
+/// [the] virtual merge base" (`merge-recursive.c`, `handle_change_delete`).
+fn merge_virtual_items(
+    base_items: &HashMap<PathBuf, MergeTreeEntry>,
+    our_items: &HashMap<PathBuf, MergeTreeEntry>,
+    their_items: &HashMap<PathBuf, MergeTreeEntry>,
+    depth: usize,
+    persist: bool,
+    conflict_style: diffy::ConflictStyle,
+    blobs: &mut VirtualBlobs,
+) -> Result<HashMap<PathBuf, MergeTreeEntry>, PullMergeError> {
+    let mut all_paths: BTreeSet<PathBuf> = base_items.keys().cloned().collect();
+    all_paths.extend(our_items.keys().cloned());
+    all_paths.extend(their_items.keys().cloned());
+
+    let mut merged = HashMap::new();
+    for path in all_paths {
+        let base = base_items.get(&path);
+        let ours = our_items.get(&path);
+        let theirs = their_items.get(&path);
+        let resolution = {
+            let mut context = TreeMergeContext {
+                persist_merged_blobs: persist,
+                favor: None,
+                depth,
+                virtual_blobs: blobs,
+            };
+            resolve_three_way(base, ours, theirs, &mut context)?
+        };
+        let entry = match resolution {
+            MergeResolution::Use(entry) => Some(entry),
+            MergeResolution::Delete => None,
+            MergeResolution::Conflict(_) => virtual_conflict_resolution(
+                base,
+                ours,
+                theirs,
+                depth,
+                persist,
+                conflict_style,
+                blobs,
+            )?,
+        };
+        if let Some(entry) = entry {
+            merged.insert(path, entry);
+        }
+    }
+    Ok(merged)
+}
+
+/// Turn a conflict inside the fold into an ancestor entry (see
+/// [`merge_virtual_items`]).
+///
+/// Every branch here mirrors Git at `call_depth > 0`, where the answer is never
+/// "ask the user":
+///
+/// * only one side survives (modify/delete) — keep the original, because there
+///   is no midpoint between "changed" and "gone"
+///   (`merge-recursive.c` `handle_change_delete`);
+/// * the two sides are different KINDS of entry, or are not regular files
+///   (symlinks) — keep the original, which is *nothing* when there is none
+///   (`merge-ort.c` `handle_content_merge`: `result->mode = o->mode;
+///   oidcpy(&result->oid, &o->oid)` under `call_depth`);
+/// * any side is binary — keep the original's CONTENT, the empty blob when
+///   there is no original (`merge-ll.c` `ll_binary_merge` steals `orig` for a
+///   virtual ancestor, and `read_mmblob` of a null oid is empty);
+/// * otherwise merge the text and record it with its markers.
+fn virtual_conflict_resolution(
+    base: Option<&MergeTreeEntry>,
+    ours: Option<&MergeTreeEntry>,
+    theirs: Option<&MergeTreeEntry>,
+    depth: usize,
+    persist: bool,
+    conflict_style: diffy::ConflictStyle,
+    blobs: &mut VirtualBlobs,
+) -> Result<Option<MergeTreeEntry>, PullMergeError> {
+    let (Some(ours), Some(theirs)) = (ours, theirs) else {
+        return Ok(base.copied());
+    };
+    if tree_item_kind(ours.mode) != tree_item_kind(theirs.mode) || !is_regular_file_mode(ours.mode)
+    {
+        return Ok(base.copied());
+    }
+    // Git treats an original of a DIFFERENT type as no original at all and
+    // merges two-way (`merge-ort.c`'s `two_way`). The MODE rule below still
+    // sees the real original, exactly as Git's does.
+    let base_content = base.filter(|entry| is_regular_file_mode(entry.mode));
+    let base_bytes = match base_content {
+        Some(entry) => Some(load_merge_blob(entry.hash, blobs)?.data),
+        None => None,
+    };
+    let ours_blob = load_merge_blob(ours.hash, blobs)?;
+    let theirs_blob = load_merge_blob(theirs.hash, blobs)?;
+    let mode = virtual_merged_mode(base, ours, theirs);
+    let base_bytes = base_bytes.as_deref().unwrap_or(&[]);
+
+    let mut record = |blob: &Blob| {
+        TreeMergeContext {
+            persist_merged_blobs: persist,
+            favor: None,
+            depth,
+            virtual_blobs: blobs,
+        }
+        .record_merged_blob(blob)
+    };
+
+    if merge_input_is_binary(base_bytes)
+        || merge_input_is_binary(&ours_blob.data)
+        || merge_input_is_binary(&theirs_blob.data)
+    {
+        let Some(entry) = base_content else {
+            // No original: Git's empty buffer, materialized as the empty blob
+            // so the ancestor still HAS the path (an absent one would turn the
+            // outer merge's add/add into a one-sided add).
+            let empty = Blob::from_content_bytes(Vec::new());
+            record(&empty)?;
+            return Ok(Some(MergeTreeEntry {
+                hash: empty.id,
+                mode,
+            }));
+        };
+        return Ok(Some(MergeTreeEntry {
+            hash: entry.hash,
+            mode,
+        }));
+    }
+
+    let content = merge_virtual_content(
+        base_bytes,
+        &ours_blob.data,
+        &theirs_blob.data,
+        depth,
+        conflict_style,
+    );
+    let blob = Blob::from_content_bytes(content);
+    record(&blob)?;
+    Ok(Some(MergeTreeEntry {
+        hash: blob.id,
+        mode,
+    }))
+}
+
+/// Git's largest input the line-level merge accepts (`xdiff/xdiff.h`
+/// `MAX_XDIFF_SIZE`, 1023 MiB). `merge-ll.c` `ll_xdl_merge` hands anything
+/// larger to `ll_binary_merge` exactly as it hands NUL-carrying content.
+const MAX_XDIFF_SIZE: usize = 1024 * 1024 * 1023;
+
+/// Whether `ll_xdl_merge` would refuse to line-merge this input: larger than
+/// [`MAX_XDIFF_SIZE`], or a NUL byte anywhere in the first 8000 bytes
+/// (`xdiff-interface.c` `buffer_is_binary`). The NUL half is duplicated rather
+/// than shared with `grep`'s private copy of the same rule — promoting it would
+/// move a helper into `src/utils/`, a cross-cutting surface this card has no
+/// reason to touch.
+fn merge_input_is_binary(content: &[u8]) -> bool {
+    merge_input_exceeds_xdiff_size(content.len())
+        || content.iter().take(8000).any(|&byte| byte == 0)
+}
+
+/// The size half of [`merge_input_is_binary`], on the length alone so the
+/// boundary can be pinned without allocating a gibibyte.
+fn merge_input_exceeds_xdiff_size(len: usize) -> bool {
+    len > MAX_XDIFF_SIZE
+}
+
+/// The `S_IFMT` class of a tree entry: Git only content-merges two entries of
+/// the SAME class, and decides everything else elsewhere.
+fn tree_item_kind(mode: TreeItemMode) -> u8 {
+    match mode {
+        TreeItemMode::Blob | TreeItemMode::BlobExecutable => 0,
+        TreeItemMode::Link => 1,
+        TreeItemMode::Tree => 2,
+        TreeItemMode::Commit => 3,
+    }
+}
+
+fn is_regular_file_mode(mode: TreeItemMode) -> bool {
+    matches!(mode, TreeItemMode::Blob | TreeItemMode::BlobExecutable)
+}
+
+/// Git's mode rule for a conflicted content merge (`merge-recursive.c`,
+/// `merge_mode_and_contents`): take theirs when the two sides agree or when
+/// ours is unchanged, otherwise keep ours.
+fn virtual_merged_mode(
+    base: Option<&MergeTreeEntry>,
+    ours: &MergeTreeEntry,
+    theirs: &MergeTreeEntry,
+) -> TreeItemMode {
+    if ours.mode == theirs.mode || base.is_some_and(|base| base.mode == ours.mode) {
+        theirs.mode
+    } else {
+        ours.mode
+    }
+}
+
+/// The content one path of a virtual ancestor ends up with: the clean merge
+/// when there is one, otherwise the conflicted text with markers widened for
+/// `depth` and labelled the way Git labels a virtual-ancestor merge.
+fn merge_virtual_content(
+    base: &[u8],
+    ours: &[u8],
+    theirs: &[u8],
+    depth: usize,
+    conflict_style: diffy::ConflictStyle,
+) -> Vec<u8> {
+    let marker_len = conflict_marker_length_at_depth(&[base, ours, theirs], depth);
+    let mut options = diffy::MergeOptions::new();
+    options
+        .set_conflict_style(conflict_style)
+        .set_conflict_marker_length(marker_len);
+    match options.merge_bytes(base, ours, theirs) {
+        Ok(merged) => merged,
+        Err(conflicted) => relabel_conflict_markers(
+            conflicted,
+            marker_len,
+            VIRTUAL_OURS_LABEL,
+            VIRTUAL_THEIRS_LABEL,
+        ),
+    }
+}
+
+/// Write the folded ancestor as a one-shot tree + synthetic commit (ADR-MG-04).
+///
+/// The commit's parents are exactly the real bases folded so far, so its
+/// reachability matches the chained virtual commit Git builds. It is
+/// DELIBERATELY not recorded in `merge-state.json` and therefore not a GC root:
+/// `maintenance gc` may reclaim it, and `merge --restart` recomputes it from
+/// the real bases. Nothing reads it back — the fold derives the next step's
+/// merge bases from those same real bases ([`merge_bases_of_folded`]) — so a
+/// `--dry-run` can skip this entirely and still preview the same result.
+fn materialize_virtual_ancestor(
+    items: &HashMap<PathBuf, MergeTreeEntry>,
+    gitlinks: &GitlinkEntries,
+    parents: &[ObjectHash],
+    timestamp: usize,
+) -> Result<ObjectHash, PullMergeError> {
+    let mut tree_items = items.clone();
+    for (path, gitlink) in gitlinks {
+        tree_items.insert(
+            path.clone(),
+            MergeTreeEntry {
+                hash: *gitlink,
+                mode: TreeItemMode::Commit,
+            },
+        );
+    }
+    let tree_id = create_tree_from_items_map(&tree_items).map_err(PullMergeError::TreeCreate)?;
+    let signature = |signature_type| Signature {
+        signature_type,
+        name: "Libra".to_string(),
+        email: "virtual-merge-base@libra.invalid".to_string(),
+        timestamp,
+        timezone: "+0000".to_string(),
+    };
+    let commit = Commit::new(
+        signature(SignatureType::Author),
+        signature(SignatureType::Committer),
+        tree_id,
+        parents.to_vec(),
+        VIRTUAL_ANCESTOR_MESSAGE,
+    );
+    save_object(&commit, &commit.id)
+        .map_err(|error| PullMergeError::CommitSave(error.to_string()))?;
+    Ok(commit.id)
+}
+
 fn merge_tree_items(
     base_items: &HashMap<PathBuf, MergeTreeEntry>,
     our_items: &HashMap<PathBuf, MergeTreeEntry>,
     their_items: &HashMap<PathBuf, MergeTreeEntry>,
-    persist_merged_blobs: bool,
-    favor: Option<MergeFavor>,
+    context: &mut TreeMergeContext<'_>,
 ) -> Result<ThreeWayMergeResult, PullMergeError> {
     let mut all_paths: HashSet<PathBuf> = base_items.keys().cloned().collect();
     all_paths.extend(our_items.keys().cloned());
@@ -3373,8 +4107,7 @@ fn merge_tree_items(
             base_items.get(&path),
             our_items.get(&path),
             their_items.get(&path),
-            persist_merged_blobs,
-            favor,
+            context,
         )? {
             MergeResolution::Use(hash) => {
                 merged_items.insert(path, hash);
@@ -3626,6 +4359,7 @@ pub(crate) fn render_line_level_conflict(
         Err(conflicted) => Some(relabel_conflict_markers(
             conflicted,
             marker_len,
+            "HEAD",
             commit_label,
         )),
         // Content merged cleanly with no markers (no real text conflict — e.g. a
@@ -3668,7 +4402,12 @@ fn conflict_marker_length(sides: &[&[u8]]) -> usize {
 /// [`conflict_marker_length`] bump (which guarantees no input line *starts* with
 /// that many markers), this leaves any content that merely *contains* a
 /// marker-like substring — e.g. `prefix <<<<<<< ours` — untouched.
-fn relabel_conflict_markers(conflicted: Vec<u8>, marker_len: usize, commit_label: &str) -> Vec<u8> {
+fn relabel_conflict_markers(
+    conflicted: Vec<u8>,
+    marker_len: usize,
+    ours_label: &str,
+    theirs_label: &str,
+) -> Vec<u8> {
     let open = "<".repeat(marker_len);
     let close = ">".repeat(marker_len);
     let bars = "|".repeat(marker_len);
@@ -3676,30 +4415,35 @@ fn relabel_conflict_markers(conflicted: Vec<u8>, marker_len: usize, commit_label
     let theirs_marker = format!("{close} theirs");
     // `diffy`'s diff3 base marker; only emitted under ConflictStyle::Diff3.
     let original_marker = format!("{bars} original");
-    let head_marker = format!("{open} HEAD");
-    let label_marker = format!("{close} {commit_label}");
+    let head_marker = format!("{open} {ours_label}");
+    let label_marker = format!("{close} {theirs_label}");
     // Match the `||||||| base` label convention `restore --conflict=diff3` uses.
     let base_marker = format!("{bars} base");
 
-    let text = String::from_utf8_lossy(&conflicted);
-    // `split('\n')` + `join('\n')` round-trips exactly (including a trailing
-    // newline, which yields a final empty segment that re-joins cleanly).
-    let relabelled = text
-        .split('\n')
-        .map(|line| {
-            if line == ours_marker {
-                head_marker.as_str()
-            } else if line == theirs_marker {
-                label_marker.as_str()
-            } else if line == original_marker {
-                base_marker.as_str()
-            } else {
-                line
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    relabelled.into_bytes()
+    // Byte-wise, never through `String::from_utf8_lossy`: the recursive
+    // virtual-ancestor fold relabels content that Git's binary rule considers
+    // TEXT (no NUL byte) but that need not be valid UTF-8, and a lossy
+    // conversion would rewrite those bytes as U+FFFD.
+    //
+    // `split(b'\n')` + rejoining round-trips exactly, including a trailing
+    // newline (which yields a final empty segment that re-joins cleanly).
+    let mut relabelled = Vec::with_capacity(conflicted.len());
+    for (index, line) in conflicted.split(|byte| *byte == b'\n').enumerate() {
+        if index > 0 {
+            relabelled.push(b'\n');
+        }
+        let replacement = if line == ours_marker.as_bytes() {
+            head_marker.as_bytes()
+        } else if line == theirs_marker.as_bytes() {
+            label_marker.as_bytes()
+        } else if line == original_marker.as_bytes() {
+            base_marker.as_bytes()
+        } else {
+            line
+        };
+        relabelled.extend_from_slice(replacement);
+    }
+    relabelled
 }
 
 fn index_tree_items(index: &Index) -> Result<HashMap<PathBuf, MergeTreeEntry>, PullMergeError> {
@@ -4104,43 +4848,27 @@ mod tests {
         let base = merge_entry(1, TreeItemMode::Blob);
         let ours = merge_entry(2, TreeItemMode::Blob);
         let theirs = merge_entry(3, TreeItemMode::Blob);
+        let mut no_virtual_blobs = VirtualBlobs::new();
+        let mut favored = |base, ours, theirs, favor| {
+            let mut context =
+                TreeMergeContext::top_level(false, Some(favor), &mut no_virtual_blobs);
+            resolve_three_way(base, ours, theirs, &mut context).expect("favored resolution")
+        };
 
         assert!(matches!(
-            resolve_three_way(None, Some(&ours), Some(&theirs), false, Some(MergeFavor::Ours))
-                .expect("favor ours for add/add"),
+            favored(None, Some(&ours), Some(&theirs), MergeFavor::Ours),
             MergeResolution::Use(entry) if entry == ours
         ));
         assert!(matches!(
-            resolve_three_way(
-                None,
-                Some(&ours),
-                Some(&theirs),
-                false,
-                Some(MergeFavor::Theirs),
-            )
-            .expect("favor theirs for add/add"),
+            favored(None, Some(&ours), Some(&theirs), MergeFavor::Theirs),
             MergeResolution::Use(entry) if entry == theirs
         ));
         assert!(matches!(
-            resolve_three_way(
-                Some(&base),
-                Some(&ours),
-                None,
-                false,
-                Some(MergeFavor::Ours),
-            )
-            .expect("favor ours for modify/delete"),
+            favored(Some(&base), Some(&ours), None, MergeFavor::Ours),
             MergeResolution::Use(entry) if entry == ours
         ));
         assert!(matches!(
-            resolve_three_way(
-                Some(&base),
-                Some(&ours),
-                None,
-                false,
-                Some(MergeFavor::Theirs),
-            )
-            .expect("favor theirs for modify/delete"),
+            favored(Some(&base), Some(&ours), None, MergeFavor::Theirs),
             MergeResolution::Delete
         ));
     }
@@ -4330,6 +5058,16 @@ mod tests {
             "failed to restore working tree after merge: checkout failed",
         );
         assert_eq!(
+            PullMergeError::VirtualAncestorTooDeep.to_string(),
+            "merging these branches needs a virtual common ancestor nested more than 20 levels \
+             deep, which Libra does not build",
+        );
+        assert_eq!(
+            PullMergeError::VirtualAncestorTooWide { bases: 33 }.to_string(),
+            "merging these branches needs a virtual common ancestor folded from 33 merge bases, \
+             more than the 32 Libra folds",
+        );
+        assert_eq!(
             PullMergeError::GitlinkUnsupported(GitlinkNotSupported {
                 operation: "merge",
                 path: PathBuf::from("vendor/sub"),
@@ -4351,8 +5089,14 @@ mod tests {
         let mut their_items = HashMap::new();
         their_items.insert(path.clone(), theirs);
 
-        let result = merge_tree_items(&base_items, &our_items, &their_items, true, None)
-            .expect("merge tree items");
+        let mut no_virtual_blobs = VirtualBlobs::new();
+        let result = merge_tree_items(
+            &base_items,
+            &our_items,
+            &their_items,
+            &mut TreeMergeContext::top_level(true, None, &mut no_virtual_blobs),
+        )
+        .expect("merge tree items");
 
         assert!(result.conflicts.is_empty());
         assert_eq!(result.merged_items.get(&path), Some(&theirs));
@@ -4444,5 +5188,603 @@ mod tests {
             .expect_err("both submodules diverged");
 
         assert_eq!(refusal.path, PathBuf::from("a/sub"));
+    }
+}
+
+/// MG-02: the recursive virtual ancestor that a criss-cross history's several
+/// merge bases are folded into.
+///
+/// Everything here is exercised without an object store: the fold's only
+/// contact with one is loading commits, and each unit below drives the pieces
+/// below that — the fold order, the depth ceiling, the depth-widened conflict
+/// markers, and the pairwise ancestor merge itself (whose blobs are supplied
+/// through [`VirtualBlobs`] exactly as a `--dry-run` supplies them).
+#[cfg(test)]
+mod recursive {
+    use std::{collections::HashMap, path::PathBuf};
+
+    use git_internal::{
+        hash::ObjectHash,
+        internal::object::{
+            blob::Blob,
+            commit::Commit,
+            signature::{Signature, SignatureType},
+            tree::TreeItemMode,
+        },
+    };
+
+    use super::{
+        GitlinkEntries, MAX_VIRTUAL_ANCESTOR_BASES, MAX_VIRTUAL_ANCESTOR_DEPTH, MAX_XDIFF_SIZE,
+        MergeTreeEntry, PullMergeError, VIRTUAL_OURS_LABEL, VIRTUAL_THEIRS_LABEL, VirtualBlobs,
+        conflict_marker_length_at_depth, ensure_virtual_ancestor_depth, fold_merge_bases,
+        merge_bases_of_folded, merge_input_exceeds_xdiff_size, merge_input_is_binary,
+        merge_virtual_items, recorded_merge_base, virtual_base_fold_order, virtual_merged_mode,
+    };
+
+    fn oid(byte: u8) -> ObjectHash {
+        ObjectHash::new(&[byte; 20])
+    }
+
+    /// Register `content` as a blob the fold can read back, and return the
+    /// entry that names it.
+    fn blob_entry(blobs: &mut VirtualBlobs, content: &str, mode: TreeItemMode) -> MergeTreeEntry {
+        let blob = Blob::from_content_bytes(content.as_bytes().to_vec());
+        blobs.insert(blob.id, blob.data.clone());
+        MergeTreeEntry {
+            hash: blob.id,
+            mode,
+        }
+    }
+
+    fn items(entries: &[(&str, MergeTreeEntry)]) -> HashMap<PathBuf, MergeTreeEntry> {
+        entries
+            .iter()
+            .map(|(path, entry)| (PathBuf::from(path), *entry))
+            .collect()
+    }
+
+    fn raw(blobs: &VirtualBlobs, items: &HashMap<PathBuf, MergeTreeEntry>, path: &str) -> Vec<u8> {
+        let entry = items
+            .get(&PathBuf::from(path))
+            .unwrap_or_else(|| panic!("'{path}' present in the folded ancestor"));
+        blobs
+            .get(&entry.hash)
+            .unwrap_or_else(|| panic!("'{path}' content available"))
+            .clone()
+    }
+
+    fn content(
+        blobs: &VirtualBlobs,
+        items: &HashMap<PathBuf, MergeTreeEntry>,
+        path: &str,
+    ) -> String {
+        let entry = items
+            .get(&PathBuf::from(path))
+            .unwrap_or_else(|| panic!("'{path}' present in the folded ancestor"));
+        String::from_utf8(
+            blobs
+                .get(&entry.hash)
+                .unwrap_or_else(|| panic!("'{path}' content available"))
+                .clone(),
+        )
+        .expect("utf-8 content")
+    }
+
+    fn fold(
+        base: &HashMap<PathBuf, MergeTreeEntry>,
+        ours: &HashMap<PathBuf, MergeTreeEntry>,
+        theirs: &HashMap<PathBuf, MergeTreeEntry>,
+        depth: usize,
+        blobs: &mut VirtualBlobs,
+    ) -> HashMap<PathBuf, MergeTreeEntry> {
+        merge_virtual_items(
+            base,
+            ours,
+            theirs,
+            depth,
+            false,
+            diffy::ConflictStyle::Merge,
+            blobs,
+        )
+        .expect("folding two ancestors never fails")
+    }
+
+    /// G2: the fold order is the bases' ascending hex id, so the same
+    /// criss-cross always produces the same virtual ancestor — which is what
+    /// lets `--restart` recompute one `maintenance gc` has reclaimed.
+    #[test]
+    fn folds_bases_in_ascending_hex_order() {
+        let ordered = virtual_base_fold_order(&[oid(0xcc), oid(0x11), oid(0x77)]);
+        assert_eq!(ordered, vec![oid(0x11), oid(0x77), oid(0xcc)]);
+        assert_eq!(
+            virtual_base_fold_order(&[oid(0x33), oid(0x33)]),
+            vec![oid(0x33)],
+            "a base listed twice is folded once"
+        );
+    }
+
+    /// G3 + G4 at the PRODUCTION entry point: `fold_merge_bases` itself
+    /// refuses one level past the ceiling, and at the ceiling it goes on to
+    /// read — so the guard, not an accident of the fixture, is what stopped it.
+    #[test]
+    fn the_production_fold_refuses_one_level_past_the_ceiling() {
+        let mut blobs = VirtualBlobs::new();
+        let bases = [oid(1), oid(2)];
+        let refused = fold_merge_bases(
+            &bases,
+            &GitlinkEntries::new(),
+            MAX_VIRTUAL_ANCESTOR_DEPTH + 1,
+            false,
+            diffy::ConflictStyle::Merge,
+            &mut blobs,
+        )
+        .expect_err("one level past the ceiling is refused");
+        assert!(matches!(refused, PullMergeError::VirtualAncestorTooDeep));
+
+        let attempted = fold_merge_bases(
+            &bases,
+            &GitlinkEntries::new(),
+            MAX_VIRTUAL_ANCESTOR_DEPTH,
+            false,
+            diffy::ConflictStyle::Merge,
+            &mut blobs,
+        )
+        .expect_err("these ids name no object");
+        assert!(
+            matches!(attempted, PullMergeError::ObjectLoad { .. }),
+            "at the ceiling the fold proceeds to load the bases: {attempted}"
+        );
+    }
+
+    /// The fold's WIDTH has a ceiling too: its work is quadratic in the number
+    /// of bases (one merge-base walk per already-folded base, per step), and
+    /// the depth ceiling says nothing about width. Enforced by the production
+    /// fold before it loads anything.
+    #[test]
+    fn the_production_fold_refuses_more_bases_than_the_width_ceiling() {
+        let mut blobs = VirtualBlobs::new();
+        let too_many: Vec<ObjectHash> = (1..=MAX_VIRTUAL_ANCESTOR_BASES as u8 + 1)
+            .map(oid)
+            .collect();
+        let refused = fold_merge_bases(
+            &too_many,
+            &GitlinkEntries::new(),
+            1,
+            false,
+            diffy::ConflictStyle::Merge,
+            &mut blobs,
+        )
+        .expect_err("one base past the width ceiling is refused");
+        assert!(
+            matches!(refused, PullMergeError::VirtualAncestorTooWide { bases } if bases == MAX_VIRTUAL_ANCESTOR_BASES + 1)
+        );
+
+        let at_ceiling: Vec<ObjectHash> = (1..=MAX_VIRTUAL_ANCESTOR_BASES as u8).map(oid).collect();
+        let attempted = fold_merge_bases(
+            &at_ceiling,
+            &GitlinkEntries::new(),
+            1,
+            false,
+            diffy::ConflictStyle::Merge,
+            &mut blobs,
+        )
+        .expect_err("these ids name no object");
+        assert!(
+            matches!(attempted, PullMergeError::ObjectLoad { .. }),
+            "at the ceiling the fold proceeds to load the bases: {attempted}"
+        );
+    }
+
+    /// The nested collection point has the same ceiling: a fold that somehow
+    /// carried more already-folded bases than the ceiling is refused before
+    /// the first merge-base walk (the ids below name no object, so any walk
+    /// would have failed differently).
+    #[test]
+    fn nested_candidate_collection_is_refused_past_the_width_ceiling() {
+        let too_many: Vec<ObjectHash> = (1..=MAX_VIRTUAL_ANCESTOR_BASES as u8 + 1)
+            .map(oid)
+            .collect();
+        let refused = merge_bases_of_folded(&too_many, &oid(0xee))
+            .expect_err("refused before any graph walk");
+        assert!(
+            matches!(refused, PullMergeError::VirtualAncestorTooWide { bases } if bases == MAX_VIRTUAL_ANCESTOR_BASES + 1)
+        );
+    }
+
+    /// G3 + G4: the recursion has a ceiling and reports it instead of running
+    /// the stack out. Git recurses unbounded (`merge-ort.c:5313`); the ceiling
+    /// is Libra's, because the fold recurses for real.
+    #[test]
+    fn refuses_to_nest_past_the_recursion_ceiling() {
+        ensure_virtual_ancestor_depth(0).expect("the outer merge is always allowed");
+        ensure_virtual_ancestor_depth(MAX_VIRTUAL_ANCESTOR_DEPTH)
+            .expect("the last permitted level still folds");
+        let refused = ensure_virtual_ancestor_depth(MAX_VIRTUAL_ANCESTOR_DEPTH + 1)
+            .expect_err("one level past the ceiling is refused");
+        assert!(matches!(refused, PullMergeError::VirtualAncestorTooDeep));
+        assert_eq!(
+            refused.to_string(),
+            format!(
+                "merging these branches needs a virtual common ancestor nested more than \
+                 {MAX_VIRTUAL_ANCESTOR_DEPTH} levels deep, which Libra does not build"
+            ),
+            "the ceiling is named in the message the user sees"
+        );
+    }
+
+    /// G5: Git widens the markers by two per recursion level (`merge-ort.c`
+    /// passes `call_depth * 2` as `extra_marker_size`), so a conflict recorded
+    /// inside an ancestor cannot be read as one the outer merge produced.
+    #[test]
+    fn conflict_markers_widen_two_per_recursion_level() {
+        let plain: &[&[u8]] = &[b"a\n", b"b\n", b"c\n"];
+        assert_eq!(conflict_marker_length_at_depth(plain, 0), 7);
+        assert_eq!(conflict_marker_length_at_depth(plain, 1), 9);
+        assert_eq!(conflict_marker_length_at_depth(plain, 2), 11);
+
+        // Composed with Libra's content-driven bump, which keeps a marker run
+        // distinguishable from the inputs themselves.
+        let marker_like: &[&[u8]] = &[b"<<<<<<<<<<\n", b"b\n", b"c\n"];
+        assert_eq!(conflict_marker_length_at_depth(marker_like, 0), 11);
+        assert_eq!(
+            conflict_marker_length_at_depth(marker_like, 1),
+            13,
+            "the depth widening applies on top of the content bump, never instead of it"
+        );
+    }
+
+    /// G1: several ancestors fold pairwise, left to right, into ONE tree —
+    /// Git's `merged_merge_bases = merge(merged_merge_bases, next)` loop
+    /// (`merge-ort.c:5429`).
+    #[test]
+    fn folds_three_ancestors_pairwise_into_one_tree() {
+        let mut blobs = VirtualBlobs::new();
+        let root = blob_entry(&mut blobs, "0\n", TreeItemMode::Blob);
+        let first = items(&[("f", root), ("g", root), ("h", root)]);
+        let second = items(&[
+            ("f", blob_entry(&mut blobs, "second\n", TreeItemMode::Blob)),
+            ("g", root),
+            ("h", root),
+        ]);
+        let third = items(&[
+            ("f", root),
+            ("g", blob_entry(&mut blobs, "third\n", TreeItemMode::Blob)),
+            ("h", root),
+        ]);
+
+        // (first ⊕ second) with `first` as their common ancestor, then that
+        // result ⊕ third with `first` again.
+        let folded = fold(&first, &first, &second, 1, &mut blobs);
+        let folded = fold(&first, &folded, &third, 1, &mut blobs);
+
+        assert_eq!(folded.len(), 3, "one tree, not one per base: {folded:?}");
+        assert_eq!(content(&blobs, &folded, "f"), "second\n");
+        assert_eq!(content(&blobs, &folded, "g"), "third\n");
+        assert_eq!(content(&blobs, &folded, "h"), "0\n");
+    }
+
+    /// A conflict inside a virtual ancestor is recorded as content, not
+    /// surfaced: the ancestor is a synthetic merge input, and Git records the
+    /// conflicted text the same way. The markers carry the depth's width and
+    /// Git's temporary-branch labels.
+    #[test]
+    fn records_conflicting_ancestor_content_with_labelled_widened_markers() {
+        let mut blobs = VirtualBlobs::new();
+        let base = items(&[("f", blob_entry(&mut blobs, "0\n", TreeItemMode::Blob))]);
+        let ours = items(&[("f", blob_entry(&mut blobs, "a\n", TreeItemMode::Blob))]);
+        let theirs = items(&[("f", blob_entry(&mut blobs, "b\n", TreeItemMode::Blob))]);
+
+        let folded = fold(&base, &ours, &theirs, 1, &mut blobs);
+        let text = content(&blobs, &folded, "f");
+
+        assert_eq!(
+            text,
+            format!(
+                "<<<<<<<<< {VIRTUAL_OURS_LABEL}\na\n=========\nb\n>>>>>>>>> {VIRTUAL_THEIRS_LABEL}\n"
+            ),
+            "nine-character markers (7 + 2 × depth 1) labelled the way Git labels a \
+             virtual-ancestor merge"
+        );
+    }
+
+    /// A blob the fold merges CLEANLY is just as absent from the object store
+    /// as a conflicted one when nothing may be written, and the outer merge
+    /// loads the virtual ancestor's content BY OBJECT ID — so a `--dry-run`
+    /// has to keep it addressable in memory too, not only the conflicted ones.
+    #[test]
+    fn cleanly_merged_ancestor_content_stays_addressable_without_being_written() {
+        let mut blobs = VirtualBlobs::new();
+        let base = items(&[(
+            "m",
+            blob_entry(&mut blobs, "1\n2\n3\n4\n5\n", TreeItemMode::Blob),
+        )]);
+        let ours = items(&[(
+            "m",
+            blob_entry(&mut blobs, "one\n2\n3\n4\n5\n", TreeItemMode::Blob),
+        )]);
+        let theirs = items(&[(
+            "m",
+            blob_entry(&mut blobs, "1\n2\n3\n4\nfive\n", TreeItemMode::Blob),
+        )]);
+
+        let folded = fold(&base, &ours, &theirs, 1, &mut blobs);
+        let entry = folded
+            .get(&PathBuf::from("m"))
+            .expect("the two sides merge cleanly into one entry");
+        assert!(
+            blobs.contains_key(&entry.hash),
+            "the auto-merged ancestor content was neither written nor cached, so the outer \
+             merge could not read it back"
+        );
+        assert_eq!(content(&blobs, &folded, "m"), "one\n2\n3\n4\nfive\n");
+    }
+
+    /// Git's rule for a change/delete inside a virtual ancestor: there is no
+    /// midpoint between "changed" and "gone", so the ancestor keeps the base
+    /// version (`merge-recursive.c`, `handle_change_delete`).
+    #[test]
+    fn change_delete_inside_an_ancestor_keeps_the_base_version() {
+        let mut blobs = VirtualBlobs::new();
+        let base_entry = blob_entry(&mut blobs, "0\n", TreeItemMode::Blob);
+        let base = items(&[("f", base_entry)]);
+        let ours = items(&[("f", blob_entry(&mut blobs, "a\n", TreeItemMode::Blob))]);
+        let theirs = items(&[]);
+
+        let folded = fold(&base, &ours, &theirs, 1, &mut blobs);
+        assert_eq!(folded.get(&PathBuf::from("f")), Some(&base_entry));
+
+        // Symmetric: the deleting side may be either one.
+        let folded = fold(&base, &theirs, &ours, 1, &mut blobs);
+        assert_eq!(folded.get(&PathBuf::from("f")), Some(&base_entry));
+    }
+
+    /// Binary content has no line-level midpoint. Git's `ll_binary_merge`
+    /// steals the ORIGINAL buffer for a virtual ancestor, so a conflicting
+    /// binary keeps the base's content — never a side's.
+    #[test]
+    fn binary_conflict_inside_an_ancestor_keeps_the_original_content() {
+        let mut blobs = VirtualBlobs::new();
+        let binary = |blobs: &mut VirtualBlobs, byte: u8| {
+            let blob = Blob::from_content_bytes(vec![0xff, byte, 0x00]);
+            blobs.insert(blob.id, blob.data.clone());
+            MergeTreeEntry {
+                hash: blob.id,
+                mode: TreeItemMode::Blob,
+            }
+        };
+        let base_entry = binary(&mut blobs, 1);
+        let base = items(&[("f", base_entry)]);
+        let ours = items(&[("f", binary(&mut blobs, 2))]);
+        let theirs = items(&[("f", binary(&mut blobs, 3))]);
+
+        let folded = fold(&base, &ours, &theirs, 1, &mut blobs);
+        assert_eq!(folded.get(&PathBuf::from("f")), Some(&base_entry));
+    }
+
+    /// With no original at all, Git's binary rule steals an EMPTY buffer
+    /// (`read_mmblob` of a null oid), so the ancestor records the empty blob.
+    /// Recording nothing instead would turn the outer merge's add/add into a
+    /// one-sided add and silently drop a side.
+    #[test]
+    fn binary_add_add_inside_an_ancestor_records_the_empty_blob() {
+        let mut blobs = VirtualBlobs::new();
+        let binary = |blobs: &mut VirtualBlobs, byte: u8| {
+            let blob = Blob::from_content_bytes(vec![0x00, byte]);
+            blobs.insert(blob.id, blob.data.clone());
+            MergeTreeEntry {
+                hash: blob.id,
+                mode: TreeItemMode::Blob,
+            }
+        };
+        let base = items(&[]);
+        let ours = items(&[("f", binary(&mut blobs, 2))]);
+        let theirs = items(&[("f", binary(&mut blobs, 3))]);
+
+        let folded = fold(&base, &ours, &theirs, 1, &mut blobs);
+        assert_eq!(
+            raw(&blobs, &folded, "f"),
+            Vec::<u8>::new(),
+            "an add/add binary ancestor is the empty blob, not one of the sides"
+        );
+    }
+
+    /// The other half of Git's rule: `ll_xdl_merge` refuses inputs past
+    /// `MAX_XDIFF_SIZE` (1023 MiB) regardless of content. Pinned on the length
+    /// alone — allocating a gibibyte in a unit test is not an option, and the
+    /// predicate is a pure comparison.
+    #[test]
+    fn inputs_past_gits_xdiff_size_limit_are_binary() {
+        assert_eq!(
+            MAX_XDIFF_SIZE, 1_072_693_248,
+            "1023 MiB, as in xdiff/xdiff.h"
+        );
+        assert!(!merge_input_exceeds_xdiff_size(MAX_XDIFF_SIZE));
+        assert!(merge_input_exceeds_xdiff_size(MAX_XDIFF_SIZE + 1));
+        assert!(
+            !merge_input_is_binary(b"small text\n"),
+            "ordinary text stays on the line-level path"
+        );
+    }
+
+    /// Binary-ness follows Git's `buffer_is_binary` — a NUL byte in the first
+    /// 8000 — not UTF-8 validity. Valid UTF-8 carrying a NUL is binary…
+    #[test]
+    fn utf8_content_containing_a_nul_is_binary_like_git() {
+        let mut blobs = VirtualBlobs::new();
+        let entry = |blobs: &mut VirtualBlobs, text: &str| {
+            let blob = Blob::from_content_bytes(text.as_bytes().to_vec());
+            blobs.insert(blob.id, blob.data.clone());
+            MergeTreeEntry {
+                hash: blob.id,
+                mode: TreeItemMode::Blob,
+            }
+        };
+        let base_entry = entry(&mut blobs, "a\u{0}b\n");
+        let base = items(&[("f", base_entry)]);
+        let ours = items(&[("f", entry(&mut blobs, "a\u{0}ours\n"))]);
+        let theirs = items(&[("f", entry(&mut blobs, "a\u{0}theirs\n"))]);
+
+        let folded = fold(&base, &ours, &theirs, 1, &mut blobs);
+        assert_eq!(
+            folded.get(&PathBuf::from("f")),
+            Some(&base_entry),
+            "valid UTF-8 with a NUL byte is binary to Git, so the original is kept"
+        );
+    }
+
+    /// …and content that is not valid UTF-8 but carries no NUL is TEXT, which
+    /// must survive the merge byte for byte (a lossy string round-trip would
+    /// rewrite those bytes as U+FFFD).
+    #[test]
+    fn non_utf8_content_without_a_nul_merges_as_text_like_git() {
+        let mut blobs = VirtualBlobs::new();
+        let entry = |blobs: &mut VirtualBlobs, bytes: &[u8]| {
+            let blob = Blob::from_content_bytes(bytes.to_vec());
+            blobs.insert(blob.id, blob.data.clone());
+            MergeTreeEntry {
+                hash: blob.id,
+                mode: TreeItemMode::Blob,
+            }
+        };
+        let base = items(&[("f", entry(&mut blobs, b"\xffkeep\n0\n"))]);
+        let ours = items(&[("f", entry(&mut blobs, b"\xffkeep\nours\n"))]);
+        let theirs = items(&[("f", entry(&mut blobs, b"\xffkeep\ntheirs\n"))]);
+
+        let folded = fold(&base, &ours, &theirs, 1, &mut blobs);
+        let merged = raw(&blobs, &folded, "f");
+        assert!(
+            merged.starts_with(b"\xffkeep\n"),
+            "the shared non-UTF-8 line survives verbatim: {merged:?}"
+        );
+        assert!(
+            merged.windows(9).any(|window| window == b"<<<<<<<<<"),
+            "the diverging line still conflicts with depth-widened markers: {merged:?}"
+        );
+    }
+
+    /// Symlinks are not content-merged: `merge-ort.c` keeps the ORIGINAL under
+    /// `call_depth`, which is NOTHING when there is no original.
+    #[test]
+    fn symlink_conflict_inside_an_ancestor_keeps_the_original() {
+        let mut blobs = VirtualBlobs::new();
+        let link = |blobs: &mut VirtualBlobs, target: &str| {
+            let blob = Blob::from_content_bytes(target.as_bytes().to_vec());
+            blobs.insert(blob.id, blob.data.clone());
+            MergeTreeEntry {
+                hash: blob.id,
+                mode: TreeItemMode::Link,
+            }
+        };
+        let base_entry = link(&mut blobs, "base");
+        let ours = items(&[("l", link(&mut blobs, "ours"))]);
+        let theirs = items(&[("l", link(&mut blobs, "theirs"))]);
+
+        let folded = fold(&items(&[("l", base_entry)]), &ours, &theirs, 1, &mut blobs);
+        assert_eq!(folded.get(&PathBuf::from("l")), Some(&base_entry));
+
+        let folded = fold(&items(&[]), &ours, &theirs, 1, &mut blobs);
+        assert_eq!(
+            folded.get(&PathBuf::from("l")),
+            None,
+            "no original means the ancestor simply does not have the path"
+        );
+    }
+
+    /// Two sides of DIFFERENT kinds are not a content merge at all in Git
+    /// (`handle_content_merge` asserts equal `S_IFMT`); the ancestor keeps the
+    /// original.
+    #[test]
+    fn mixed_kinds_inside_an_ancestor_keep_the_original() {
+        let mut blobs = VirtualBlobs::new();
+        let entry = |blobs: &mut VirtualBlobs, text: &str, mode| {
+            let blob = Blob::from_content_bytes(text.as_bytes().to_vec());
+            blobs.insert(blob.id, blob.data.clone());
+            MergeTreeEntry {
+                hash: blob.id,
+                mode,
+            }
+        };
+        let base_entry = entry(&mut blobs, "0\n", TreeItemMode::Blob);
+        let ours = items(&[("p", entry(&mut blobs, "ours\n", TreeItemMode::Blob))]);
+        let theirs = items(&[("p", entry(&mut blobs, "theirs", TreeItemMode::Link))]);
+
+        let folded = fold(&items(&[("p", base_entry)]), &ours, &theirs, 1, &mut blobs);
+        assert_eq!(folded.get(&PathBuf::from("p")), Some(&base_entry));
+    }
+
+    /// Git's mode rule for a conflicted content merge
+    /// (`merge-recursive.c`, `merge_mode_and_contents`).
+    #[test]
+    fn conflicted_ancestor_mode_follows_gits_rule() {
+        let base = MergeTreeEntry {
+            hash: oid(1),
+            mode: TreeItemMode::Blob,
+        };
+        let ours_plain = MergeTreeEntry {
+            hash: oid(2),
+            mode: TreeItemMode::Blob,
+        };
+        let theirs_exec = MergeTreeEntry {
+            hash: oid(3),
+            mode: TreeItemMode::BlobExecutable,
+        };
+        // Ours kept the base's mode → take theirs.
+        assert_eq!(
+            virtual_merged_mode(Some(&base), &ours_plain, &theirs_exec),
+            TreeItemMode::BlobExecutable
+        );
+        // Both sides changed the mode the same way → take theirs (== ours).
+        assert_eq!(
+            virtual_merged_mode(Some(&base), &theirs_exec, &theirs_exec),
+            TreeItemMode::BlobExecutable
+        );
+        // Both changed it, differently → keep ours.
+        let ours_exec = MergeTreeEntry {
+            hash: oid(4),
+            mode: TreeItemMode::BlobExecutable,
+        };
+        let theirs_link = MergeTreeEntry {
+            hash: oid(5),
+            mode: TreeItemMode::Tree,
+        };
+        assert_eq!(
+            virtual_merged_mode(Some(&base), &ours_exec, &theirs_link),
+            TreeItemMode::BlobExecutable
+        );
+    }
+
+    /// G7: a virtual ancestor is never written into `merge-state.json`, so it
+    /// never becomes a GC root (ADR-MG-04). A single real base still is.
+    #[test]
+    fn only_a_single_real_base_is_recorded_in_the_merge_state() {
+        let signature = |signature_type| Signature {
+            signature_type,
+            name: "Libra".to_string(),
+            email: "test@libra.invalid".to_string(),
+            timestamp: 0,
+            timezone: "+0000".to_string(),
+        };
+        let commit = |byte: u8| {
+            Commit::new(
+                signature(SignatureType::Author),
+                signature(SignatureType::Committer),
+                oid(byte),
+                Vec::new(),
+                "base",
+            )
+        };
+        let one = commit(1);
+        let two = commit(2);
+
+        assert_eq!(recorded_merge_base(&[]), None, "unrelated histories");
+        assert_eq!(
+            recorded_merge_base(std::slice::from_ref(&one)),
+            Some(one.id)
+        );
+        assert_eq!(
+            recorded_merge_base(&[one, two]),
+            None,
+            "a criss-cross merge's base is virtual and must not be rooted"
+        );
     }
 }

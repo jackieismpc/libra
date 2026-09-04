@@ -3479,3 +3479,809 @@ fn merge_gitlink_fast_forward_rebase_refuses_before_moving_the_ref() {
         "the submodule checkout survives"
     );
 }
+
+// ---------------------------------------------------------------------------
+// MG-02: criss-cross histories (several merge bases) and the recursive virtual
+// ancestor they are folded into.
+// ---------------------------------------------------------------------------
+
+/// A criss-cross history, the shape Git's `t6024-recursive-merge.sh`
+/// (git@`3cb9185f6`) is built around: two branches that merged each other, so
+/// the two tips below have TWO merge bases and neither dominates the other.
+///
+/// ```text
+///            ┌─ a(f=1) ─┐    x = merge(a, b) ── ours (adds t)
+///   main(o) ─┤          ├────
+///            └─ b(g=1) ─┘    y = merge(b, a) ── theirs (f=2, g=2)
+/// ```
+///
+/// `merge_bases(ours, theirs) == {a, b}`, and the fixture is chosen so that
+/// EITHER single base gives the wrong answer: relative to `a` the `g` edits on
+/// both sides look divergent, relative to `b` the `f` edits do. Only the
+/// recursive ancestor (`f=1, g=1`) explains both sides' history.
+fn create_crisscross_repo() -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("f.txt"), "0\n").expect("write f");
+    std::fs::write(p.join("g.txt"), "0\n").expect("write g");
+    assert_cli_success(
+        &run_libra_command(&["add", "f.txt", "g.txt"], p),
+        "add roots",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "root", "--no-verify"], p),
+        "commit root",
+    );
+
+    for (branch, file, content) in [("a", "f.txt", "1\n"), ("b", "g.txt", "1\n")] {
+        assert_cli_success(
+            &run_libra_command(&["checkout", "main"], p),
+            "checkout main",
+        );
+        assert_cli_success(&run_libra_command(&["branch", branch], p), "create branch");
+        assert_cli_success(
+            &run_libra_command(&["checkout", branch], p),
+            "checkout branch",
+        );
+        commit_file(p, file, content, "side edit");
+    }
+
+    // The two merges have to be made from THROWAWAY branches: merging `b` into
+    // `a` itself would leave `a` an ancestor of the result, and the second
+    // merge would fast-forward instead of criss-crossing.
+    for (from, tip, other) in [("a", "x", "b"), ("b", "y", "a")] {
+        assert_cli_success(&run_libra_command(&["checkout", from], p), "checkout side");
+        assert_cli_success(&run_libra_command(&["branch", tip], p), "create tip branch");
+        assert_cli_success(&run_libra_command(&["checkout", tip], p), "checkout tip");
+        assert_cli_success(
+            &run_libra_command(&["merge", other], p),
+            "criss-cross merge",
+        );
+    }
+
+    assert_cli_success(&run_libra_command(&["checkout", "x"], p), "checkout x");
+    commit_file(p, "t.txt", "ours\n", "ours-only file");
+
+    assert_cli_success(&run_libra_command(&["checkout", "y"], p), "checkout y");
+    std::fs::write(p.join("f.txt"), "2\n").expect("write f");
+    std::fs::write(p.join("g.txt"), "2\n").expect("write g");
+    assert_cli_success(
+        &run_libra_command(&["add", "f.txt", "g.txt"], p),
+        "add edits",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "theirs edits", "--no-verify"], p),
+        "commit theirs",
+    );
+
+    assert_cli_success(&run_libra_command(&["checkout", "x"], p), "checkout x");
+    repo
+}
+
+fn read_merge_state(p: &Path) -> serde_json::Value {
+    let raw = std::fs::read(p.join(".libra").join("merge-state.json"))
+        .expect("merge-state.json written by a conflicted merge");
+    serde_json::from_slice(&raw).expect("merge-state.json is json")
+}
+
+/// G6: with two merge bases, folding them into a virtual ancestor merges
+/// cleanly where picking either single base reports a conflict.
+#[test]
+fn merge_crisscross_folds_both_bases_and_merges_cleanly() {
+    let repo = create_crisscross_repo();
+    let p = repo.path();
+
+    let output = run_libra_command(&["--json", "merge", "y"], p);
+    assert_cli_success(&output, "criss-cross merge");
+    let json = parse_json_stdout(&output);
+    assert_eq!(json["data"]["strategy"], "three-way");
+    assert!(
+        json["data"]["conflicted_paths"].is_null(),
+        "a clean merge omits the key entirely (frozen schema): {json}"
+    );
+    assert_eq!(
+        json["data"]["files_changed"], 2,
+        "only the two files `theirs` re-edited change"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(p.join("f.txt")).expect("f"),
+        "2\n",
+        "the virtual ancestor already carries f=1, so theirs' edit applies cleanly"
+    );
+    assert_eq!(std::fs::read_to_string(p.join("g.txt")).expect("g"), "2\n");
+    assert_eq!(
+        std::fs::read_to_string(p.join("t.txt")).expect("t"),
+        "ours\n",
+        "our side's own file survives"
+    );
+
+    let raw = run_libra_command(&["cat-file", "-p", "HEAD"], p);
+    assert_cli_success(&raw, "cat-file the merge commit");
+    assert_eq!(
+        String::from_utf8_lossy(&raw.stdout)
+            .lines()
+            .filter(|line| line.starts_with("parent "))
+            .count(),
+        2,
+        "a criss-cross merge still records the two REAL parents, not the virtual ancestor"
+    );
+}
+
+/// G6 (conflict half) + G7: when the sides really do diverge relative to the
+/// virtual ancestor the merge conflicts as usual — and the state it writes
+/// records no `base`, because a virtual ancestor is a one-shot object that must
+/// not become a GC root (ADR-MG-04).
+#[test]
+fn merge_crisscross_conflict_records_no_virtual_base_in_the_state() {
+    let repo = create_crisscross_repo();
+    let p = repo.path();
+    // Diverge from the virtual ancestor (f=1) on OUR side too, so f is a real
+    // both-modified conflict; g stays clean.
+    commit_file(p, "f.txt", "ours-2\n", "ours re-edits f");
+
+    let output = run_libra_command(&["merge", "y"], p);
+    assert_eq!(
+        output.status.code(),
+        Some(128),
+        "the merge conflicts (LBR-CONFLICT-002)"
+    );
+    let conflicted = std::fs::read_to_string(p.join("f.txt")).expect("f");
+    assert!(
+        conflicted.contains("<<<<<<< HEAD") && conflicted.contains("ours-2"),
+        "the OUTER conflict keeps the default seven-character markers: {conflicted}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("g.txt")).expect("g"),
+        "2\n",
+        "the path the virtual ancestor explains still merges cleanly"
+    );
+
+    let state = read_merge_state(p);
+    assert!(
+        state.get("base").is_none_or(serde_json::Value::is_null),
+        "the virtual ancestor is never recorded as the merge base: {state}"
+    );
+    assert!(
+        state["conflicted_paths"]
+            .as_array()
+            .expect("conflicted_paths")
+            .iter()
+            .any(|path| path == "f.txt"),
+        "the conflicted path is recorded: {state}"
+    );
+}
+
+/// The single-base path is untouched by MG-02: an ordinary diverged merge still
+/// records its real base and merges exactly as before.
+#[test]
+fn merge_crisscross_single_base_merge_is_unchanged() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    commit_file(p, "shared.txt", "base\n", "shared base");
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "branch");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], p),
+        "co feature",
+    );
+    commit_file(p, "feature.txt", "feature\n", "feature file");
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "co main");
+    commit_file(p, "main.txt", "main\n", "main file");
+    let base = head_commit(p);
+
+    let output = run_libra_command(&["--json", "merge", "feature"], p);
+    assert_cli_success(&output, "single-base merge");
+    assert_eq!(parse_json_stdout(&output)["data"]["strategy"], "three-way");
+    assert_ne!(head_commit(p), base, "a merge commit was created");
+    assert!(p.join("feature.txt").exists() && p.join("main.txt").exists());
+}
+
+/// `--allow-unrelated-histories` keeps its virtual EMPTY base: zero merge bases
+/// is still zero, not something the fold is asked to build.
+#[test]
+fn merge_crisscross_unrelated_histories_keep_the_empty_base() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["checkout", "--orphan", "imported"], p),
+        "orphan branch",
+    );
+    std::fs::write(p.join("imported.txt"), "imported\n").expect("write imported");
+    assert_cli_success(&run_libra_command(&["add", "imported.txt"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "imported root", "--no-verify"], p),
+        "commit orphan",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "co main");
+
+    let refused = run_libra_command(&["merge", "imported"], p);
+    assert_eq!(refused.status.code(), Some(128), "unrelated by default");
+
+    let output = run_libra_command(
+        &["--json", "merge", "--allow-unrelated-histories", "imported"],
+        p,
+    );
+    assert_cli_success(&output, "unrelated merge with the empty base");
+    assert_eq!(parse_json_stdout(&output)["data"]["strategy"], "three-way");
+    assert!(p.join("imported.txt").exists() && p.join("tracked.txt").exists());
+}
+
+/// `--restart` recomputes the virtual ancestor from the REAL bases and lands on
+/// the same conflict — the fold is deterministic (bases folded in hex order).
+#[test]
+fn merge_crisscross_restart_recomputes_the_virtual_ancestor() {
+    let repo = create_crisscross_repo();
+    let p = repo.path();
+    commit_file(p, "f.txt", "ours-2\n", "ours re-edits f");
+    let ours = head_commit(p);
+
+    assert_eq!(
+        run_libra_command(&["merge", "y"], p).status.code(),
+        Some(128),
+        "the merge conflicts"
+    );
+    let first = std::fs::read_to_string(p.join("f.txt")).expect("f");
+    // Overwrite the conflict resolution: --restart must discard it.
+    std::fs::write(p.join("f.txt"), "hand-resolved\n").expect("resolve");
+
+    let restarted = run_libra_command(&["merge", "--restart"], p);
+    assert_eq!(
+        restarted.status.code(),
+        Some(128),
+        "the restart re-conflicts"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("f.txt")).expect("f"),
+        first,
+        "the recomputed ancestor reproduces the same conflict byte for byte"
+    );
+    assert_eq!(head_commit(p), ours, "HEAD is still the pre-merge commit");
+}
+
+/// Every loose object currently on disk, as `<dir><file>` object ids.
+fn loose_object_ids(p: &Path) -> std::collections::BTreeSet<String> {
+    let mut ids = std::collections::BTreeSet::new();
+    let objects = p.join(".libra").join("objects");
+    let Ok(dirs) = std::fs::read_dir(&objects) else {
+        return ids;
+    };
+    for dir in dirs.flatten() {
+        let prefix = dir.file_name().to_string_lossy().to_string();
+        if prefix.len() != 2 {
+            continue;
+        }
+        if let Ok(files) = std::fs::read_dir(dir.path()) {
+            for file in files.flatten() {
+                ids.insert(format!("{prefix}{}", file.file_name().to_string_lossy()));
+            }
+        }
+    }
+    ids
+}
+
+/// Age every loose object past the prune grace window and drive the GC
+/// quarantine's two phases explicitly, the way `maintenance_test` does, instead
+/// of waiting an hour.
+fn prune_unreachable_objects(p: &Path) -> String {
+    let objects = p.join(".libra").join("objects");
+    let aged = std::process::Command::new("find")
+        .arg(&objects)
+        .args([
+            "-type",
+            "f",
+            "-exec",
+            "touch",
+            "-t",
+            "200001010000",
+            "{}",
+            ";",
+        ])
+        .status()
+        .expect("spawn find");
+    assert!(aged.success(), "backdate the loose objects");
+
+    let first = run_libra_command(&["maintenance", "run", "--task", "gc"], p);
+    assert_cli_success(&first, "gc quarantines the unreachable objects");
+    let ledger_path = p.join(".libra").join("gc-prune-candidates.json");
+    let ledger: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&ledger_path).expect("ledger")).expect("ledger json");
+    let aged_ledger: serde_json::Map<String, serde_json::Value> = ledger
+        .as_object()
+        .expect("ledger object")
+        .keys()
+        .map(|oid| (oid.clone(), serde_json::json!(0)))
+        .collect();
+    assert!(
+        !aged_ledger.is_empty(),
+        "something unreachable must have been quarantined"
+    );
+    std::fs::write(
+        &ledger_path,
+        serde_json::to_vec(&serde_json::Value::Object(aged_ledger)).expect("serialize"),
+    )
+    .expect("age the ledger");
+
+    let gc = run_libra_command(&["maintenance", "run", "--task", "gc"], p);
+    assert_cli_success(&gc, "gc prunes without a dangling-reference error");
+    String::from_utf8_lossy(&gc.stdout).to_string()
+}
+
+/// G8 + G9: the virtual ancestor is NOT a GC root. `maintenance gc` reclaims
+/// the exact objects the fold created, mid-merge, without any
+/// dangling-reference complaint — and `--restart` brings those same object ids
+/// back, which is ADR-MG-04's whole recovery contract (the fold is
+/// deterministic, so recomputation is bit-identical).
+#[test]
+fn merge_crisscross_gc_reclaims_the_virtual_ancestor_and_restart_recovers() {
+    let repo = create_crisscross_repo();
+    let p = repo.path();
+    commit_file(p, "f.txt", "ours-2\n", "ours re-edits f");
+
+    let before_merge = loose_object_ids(p);
+    assert_eq!(
+        run_libra_command(&["merge", "y"], p).status.code(),
+        Some(128),
+        "the merge conflicts and leaves state behind"
+    );
+    let conflicted = std::fs::read_to_string(p.join("f.txt")).expect("f");
+    let created: std::collections::BTreeSet<String> = loose_object_ids(p)
+        .difference(&before_merge)
+        .cloned()
+        .collect();
+    assert!(
+        !created.is_empty(),
+        "the merge writes the virtual ancestor's objects"
+    );
+
+    let target_before = read_merge_state(p)["target"].clone();
+    let gc_out = prune_unreachable_objects(p);
+    let after_gc = loose_object_ids(p);
+    let pruned: Vec<String> = created.difference(&after_gc).cloned().collect();
+    // The synthetic COMMIT is always new; its tree usually is not, because
+    // folding two bases reproduces a tree an earlier merge already wrote and
+    // object storage is content-addressed. What matters is that whatever the
+    // fold DID add is unrooted and reclaimable.
+    assert!(
+        !pruned.is_empty(),
+        "the virtual ancestor is unrooted, so gc takes it (created={created:?}, \
+         gc said: {gc_out})"
+    );
+    assert_eq!(
+        read_merge_state(p)["target"],
+        target_before,
+        "the merge state survives the prune intact — it never named the virtual ancestor, \
+         so the sidecar root check has nothing to fail closed on"
+    );
+
+    // Recovery does not depend on the reclaimed objects: --restart rebuilds the
+    // ancestor from the real merge bases, byte for byte.
+    let restarted = run_libra_command(&["merge", "--restart"], p);
+    assert_eq!(
+        restarted.status.code(),
+        Some(128),
+        "the restart re-runs the merge and re-conflicts"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("f.txt")).expect("f"),
+        conflicted,
+        "the ancestor recomputed after the prune is the same one"
+    );
+    let after_restart = loose_object_ids(p);
+    let missing: Vec<&String> = pruned
+        .iter()
+        .filter(|oid| !after_restart.contains(*oid))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "every reclaimed object is recomputed by --restart: {missing:?}"
+    );
+}
+
+/// G10: a recursive merge adds no field to `merge-state.json`, so a state file
+/// in the pre-existing schema still drives `--abort` to completion.
+#[test]
+fn merge_crisscross_merge_state_keeps_the_older_schema_readable() {
+    let repo = create_crisscross_repo();
+    let p = repo.path();
+    commit_file(p, "f.txt", "ours-2\n", "ours re-edits f");
+    let ours = head_commit(p);
+
+    assert_eq!(
+        run_libra_command(&["merge", "y"], p).status.code(),
+        Some(128),
+        "the merge conflicts"
+    );
+    let state = read_merge_state(p);
+    let known = [
+        "head_name",
+        "orig_head",
+        "target",
+        "target_ref",
+        "base",
+        "strategy",
+        "allow_unrelated_histories",
+        "skip_hooks",
+        "conflicted_paths",
+        "message",
+        // Injected at the JSON layer by `MergeState::save` (W2 worktree
+        // ownership), not part of the merge's own schema.
+        "owner_scope",
+    ];
+    for key in state.as_object().expect("state object").keys() {
+        assert!(
+            known.contains(&key.as_str()),
+            "a recursive merge must not grow the state schema; found '{key}'"
+        );
+    }
+
+    // Rewrite it in the pre-P1-07b shape (no strategy / unrelated / hook flags,
+    // no base) and confirm it is still a state this binary can finish.
+    let old_schema = serde_json::json!({
+        "owner_scope": state["owner_scope"],
+        "head_name": state["head_name"],
+        "orig_head": state["orig_head"],
+        "target": state["target"],
+        "target_ref": state["target_ref"],
+        "conflicted_paths": state["conflicted_paths"],
+        "message": state["message"],
+    });
+    std::fs::write(
+        p.join(".libra").join("merge-state.json"),
+        serde_json::to_vec(&old_schema).expect("serialize"),
+    )
+    .expect("write old-schema state");
+
+    let aborted = run_libra_command(&["merge", "--abort"], p);
+    assert_cli_success(&aborted, "abort reads the older state schema");
+    assert_eq!(head_commit(p), ours);
+    assert_eq!(
+        std::fs::read_to_string(p.join("f.txt")).expect("f"),
+        "ours-2\n"
+    );
+}
+
+/// A criss-cross `--dry-run` previews the folded result and still writes
+/// nothing: the fold keeps its blobs in memory and materializes no virtual
+/// tree or commit when the merge is only being previewed.
+#[test]
+fn merge_crisscross_dry_run_previews_without_writing_objects() {
+    let repo = create_crisscross_repo();
+    let p = repo.path();
+    let head_before = head_commit(p);
+    let objects_before = count_loose_objects(p);
+
+    let output = run_libra_command(&["--json", "merge", "--dry-run", "y"], p);
+    assert_cli_success(&output, "criss-cross dry run");
+    let json = parse_json_stdout(&output);
+    assert_eq!(json["data"]["dry_run"], true);
+    assert!(
+        json["data"]["would_conflict"].is_null(),
+        "a clean preview omits `would_conflict` (frozen schema): {json}"
+    );
+    assert_eq!(json["data"]["files_changed"], 2);
+
+    assert_eq!(count_loose_objects(p), objects_before, "no objects written");
+    assert_eq!(head_commit(p), head_before);
+    assert!(!p.join(".libra").join("merge-state.json").exists());
+    assert_eq!(std::fs::read_to_string(p.join("f.txt")).expect("f"), "1\n");
+}
+
+/// A history with THREE merge bases, which forces the fold to run more than one
+/// step: `merge_bases_of_folded` has to answer for the ancestor already folded
+/// from `a` and `b` before `c` can be folded in.
+///
+/// ```text
+///            ┌─ a(f=1) ─┐
+///   main(o) ─┼─ b(g=1) ─┼── x = ((a ⊕ b) ⊕ c) ── ours
+///            └─ c(h=1) ─┘   y = ((b ⊕ c) ⊕ a) ── theirs
+/// ```
+///
+/// `merge_bases(ours, theirs) == {a, b, c}`, and EVERY single base is wrong:
+/// relative to `a` the `g`/`h` edits look divergent, relative to `b` the `f`/`h`
+/// ones do, and relative to `c` the `f`/`g` ones do. Only the folded ancestor
+/// (`f=1, g=1, h=1`) explains both sides.
+fn create_three_base_crisscross_repo() -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    for file in ["f.txt", "g.txt", "h.txt"] {
+        std::fs::write(p.join(file), "0\n").expect("write root file");
+    }
+    assert_cli_success(
+        &run_libra_command(&["add", "f.txt", "g.txt", "h.txt"], p),
+        "add roots",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "root", "--no-verify"], p),
+        "commit root",
+    );
+
+    for (branch, file) in [("a", "f.txt"), ("b", "g.txt"), ("c", "h.txt")] {
+        assert_cli_success(
+            &run_libra_command(&["checkout", "main"], p),
+            "checkout main",
+        );
+        assert_cli_success(&run_libra_command(&["branch", branch], p), "create branch");
+        assert_cli_success(
+            &run_libra_command(&["checkout", branch], p),
+            "checkout branch",
+        );
+        commit_file(p, file, "1\n", "side edit");
+    }
+
+    for (from, tip, others) in [("a", "x", ["b", "c"]), ("b", "y", ["c", "a"])] {
+        assert_cli_success(&run_libra_command(&["checkout", from], p), "checkout side");
+        assert_cli_success(&run_libra_command(&["branch", tip], p), "create tip branch");
+        assert_cli_success(&run_libra_command(&["checkout", tip], p), "checkout tip");
+        for other in others {
+            assert_cli_success(
+                &run_libra_command(&["merge", other], p),
+                "criss-cross merge",
+            );
+        }
+    }
+
+    assert_cli_success(&run_libra_command(&["checkout", "y"], p), "checkout y");
+    for file in ["f.txt", "g.txt", "h.txt"] {
+        std::fs::write(p.join(file), "2\n").expect("write theirs");
+    }
+    assert_cli_success(
+        &run_libra_command(&["add", "f.txt", "g.txt", "h.txt"], p),
+        "add theirs",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "theirs edits", "--no-verify"], p),
+        "commit theirs",
+    );
+
+    assert_cli_success(&run_libra_command(&["checkout", "x"], p), "checkout x");
+    repo
+}
+
+/// G1 + G2 + G6 at three bases: the two fold steps produce ONE ancestor that
+/// resolves the paths no single base can, the one genuinely divergent path
+/// still conflicts, and `--restart` recomputes the whole fold byte-identically
+/// (the fold order is fixed, so a recompute cannot land anywhere else).
+#[test]
+fn merge_crisscross_three_merge_bases_fold_into_one_ancestor() {
+    let repo = create_three_base_crisscross_repo();
+    let p = repo.path();
+    // Diverge from the folded ancestor (f=1) on our side too, so `f` is a real
+    // both-modified conflict while `g` and `h` stay clean.
+    commit_file(p, "f.txt", "ours-2\n", "ours re-edits f");
+    let ours = head_commit(p);
+
+    assert_eq!(
+        run_libra_command(&["merge", "y"], p).status.code(),
+        Some(128),
+        "only the genuinely divergent path conflicts"
+    );
+    let conflicted = std::fs::read_to_string(p.join("f.txt")).expect("f");
+    assert!(
+        conflicted.contains("<<<<<<< HEAD") && conflicted.contains("ours-2"),
+        "f.txt carries the outer conflict: {conflicted}"
+    );
+    for file in ["g.txt", "h.txt"] {
+        assert_eq!(
+            std::fs::read_to_string(p.join(file)).expect("clean path"),
+            "2\n",
+            "{file} merges cleanly ONLY through the ancestor folded from all three bases"
+        );
+    }
+    let state = read_merge_state(p);
+    assert!(
+        state.get("base").is_none_or(serde_json::Value::is_null),
+        "the folded ancestor is not recorded as the merge base: {state}"
+    );
+
+    std::fs::write(p.join("f.txt"), "hand-resolved\n").expect("resolve");
+    let restarted = run_libra_command(&["merge", "--restart"], p);
+    assert_eq!(
+        restarted.status.code(),
+        Some(128),
+        "the restart re-conflicts"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("f.txt")).expect("f"),
+        conflicted,
+        "two fold steps recompute to the same ancestor, so the conflict is identical"
+    );
+    assert_eq!(head_commit(p), ours, "HEAD is still the pre-merge commit");
+}
+
+/// G5 end to end: a conflict recorded INSIDE the virtual ancestor keeps markers
+/// two characters wider than the merge that reads it back. With
+/// `merge.conflictStyle=diff3` the ancestor's content is printed in the
+/// `|||||||` block of the outer conflict, so both widths are visible in one
+/// file — and the nested ones carry Git's temporary-branch labels.
+#[test]
+fn merge_crisscross_nested_conflict_markers_are_wider_than_the_outer_ones() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.conflictStyle", "diff3"], p),
+        "configure diff3",
+    );
+    std::fs::write(p.join("p.txt"), "0\n").expect("write p");
+    assert_cli_success(&run_libra_command(&["add", "p.txt"], p), "add p");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "root", "--no-verify"], p),
+        "commit root",
+    );
+
+    // Both sides change the SAME line, so folding the two bases conflicts.
+    for (branch, content) in [("a", "a\n"), ("b", "b\n")] {
+        assert_cli_success(
+            &run_libra_command(&["checkout", "main"], p),
+            "checkout main",
+        );
+        assert_cli_success(&run_libra_command(&["branch", branch], p), "create branch");
+        assert_cli_success(
+            &run_libra_command(&["checkout", branch], p),
+            "checkout branch",
+        );
+        commit_file(p, "p.txt", content, "side edit");
+    }
+
+    // The criss-cross merges themselves conflict; resolve each by hand so the
+    // recorded trees do NOT contain what the fold will compute.
+    for (from, tip, other, resolution) in [("a", "x", "b", "x\n"), ("b", "y", "a", "y\n")] {
+        assert_cli_success(&run_libra_command(&["checkout", from], p), "checkout side");
+        assert_cli_success(&run_libra_command(&["branch", tip], p), "create tip branch");
+        assert_cli_success(&run_libra_command(&["checkout", tip], p), "checkout tip");
+        assert_eq!(
+            run_libra_command(&["merge", other], p).status.code(),
+            Some(128),
+            "the criss-cross merge conflicts"
+        );
+        std::fs::write(p.join("p.txt"), resolution).expect("resolve");
+        assert_cli_success(&run_libra_command(&["add", "p.txt"], p), "stage resolution");
+        assert_cli_success(
+            &run_libra_command(&["merge", "--continue", "--no-verify"], p),
+            "finish the criss-cross merge",
+        );
+    }
+
+    assert_cli_success(&run_libra_command(&["checkout", "x"], p), "checkout x");
+    assert_eq!(
+        run_libra_command(&["merge", "y"], p).status.code(),
+        Some(128),
+        "ours and theirs both differ from the folded ancestor"
+    );
+
+    let text = std::fs::read_to_string(p.join("p.txt")).expect("p");
+    assert!(
+        text.contains("<<<<<<<<< Temporary merge branch 1")
+            && text.contains(">>>>>>>>> Temporary merge branch 2"),
+        "the ancestor's own conflict is nine characters wide (7 + 2 x depth 1) and labelled \
+         the way Git labels a virtual-ancestor merge: {text}"
+    );
+    assert!(
+        text.contains("<<<<<<<<<< HEAD"),
+        "the outer merge's markers are widened past the nested ones, so the two levels can \
+         never be confused: {text}"
+    );
+}
+
+/// `--dry-run` must not touch a leftover autostash sidecar either: recovering
+/// one promotes it into the stash list and deletes the file, and both are
+/// writes. A preview leaves it exactly where it found it, for the next REAL
+/// merge to recover.
+#[test]
+fn merge_crisscross_dry_run_leaves_a_stale_autostash_sidecar_untouched() {
+    let repo = create_crisscross_repo();
+    let p = repo.path();
+    // A syntactically valid sidecar naming an object that does not exist: a
+    // real merge would refuse to proceed past it, a preview must not even read
+    // it as something to act on.
+    let sidecar = p.join(".libra").join("merge-autostash.json");
+    let stale = r#"{"stash_commit":"0123456789abcdef0123456789abcdef01234567"}"#;
+    std::fs::write(&sidecar, stale).expect("plant a stale sidecar");
+    let stashes_before = stash_list_len(p);
+    let objects_before = count_loose_objects(p);
+
+    let output = run_libra_command(&["--json", "merge", "--dry-run", "y"], p);
+    assert_cli_success(&output, "dry run with a stale sidecar present");
+    let json = parse_json_stdout(&output);
+    assert_eq!(json["data"]["dry_run"], true);
+    assert!(
+        json["data"]["autostash"].is_null(),
+        "a preview reports no autostash outcome: {json}"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&sidecar).expect("sidecar still present"),
+        stale,
+        "the stale sidecar is neither recovered nor rewritten by a preview"
+    );
+    assert_eq!(
+        stash_list_len(p),
+        stashes_before,
+        "nothing promoted to the stash list"
+    );
+    assert_eq!(count_loose_objects(p), objects_before, "no objects written");
+}
+
+/// The width ceiling on the COMMAND path: with more merge bases than Libra
+/// folds, `merge` is refused with `LBR-UNSUPPORTED-001` before it loads a
+/// single base commit or tree, and — like every refusal — writes nothing.
+///
+/// The fixture builds 33 mutually independent common ancestors (`a01`..`a33`
+/// off `main`) and two tips that each reach all of them by different routes.
+#[test]
+fn merge_crisscross_more_bases_than_the_width_ceiling_is_refused_before_loading() {
+    const WIDTH: usize = 33;
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let names: Vec<String> = (1..=WIDTH).map(|i| format!("a{i:02}")).collect();
+    for name in &names {
+        assert_cli_success(
+            &run_libra_command(&["checkout", "main"], p),
+            "checkout main",
+        );
+        assert_cli_success(
+            &run_libra_command(&["branch", name], p),
+            "create base branch",
+        );
+        assert_cli_success(&run_libra_command(&["checkout", name], p), "checkout base");
+        commit_file(p, &format!("{name}.txt"), "1\n", "independent ancestor");
+    }
+    // x folds a01..a33 in order; y folds a33..a01 in reverse. Both reach every
+    // ancestor, neither reaches the other, and no ancestor dominates another.
+    for (tip, order) in [
+        ("x", names.clone()),
+        ("y", names.iter().rev().cloned().collect::<Vec<_>>()),
+    ] {
+        assert_cli_success(
+            &run_libra_command(&["checkout", &order[0]], p),
+            "checkout first",
+        );
+        assert_cli_success(&run_libra_command(&["branch", tip], p), "create tip");
+        assert_cli_success(&run_libra_command(&["checkout", tip], p), "checkout tip");
+        for other in &order[1..] {
+            assert_cli_success(&run_libra_command(&["merge", other], p), "fold ancestor in");
+        }
+    }
+    assert_cli_success(&run_libra_command(&["checkout", "x"], p), "checkout x");
+    commit_file(p, "ours.txt", "ours\n", "diverge ours");
+    assert_cli_success(&run_libra_command(&["checkout", "y"], p), "checkout y");
+    commit_file(p, "theirs.txt", "theirs\n", "diverge theirs");
+    assert_cli_success(&run_libra_command(&["checkout", "x"], p), "checkout x");
+
+    let head_before = head_commit(p);
+    let objects_before = count_loose_objects(p);
+    let output = run_libra_command(&["merge", "y"], p);
+    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+    assert_eq!(output.status.code(), Some(128), "refused: {stderr}");
+    assert_eq!(report.error_code, "LBR-UNSUPPORTED-001");
+    assert!(
+        stderr.contains("folded from 33 merge bases, more than the 32 Libra folds"),
+        "the refusal names the width: {stderr}"
+    );
+    assert_eq!(head_commit(p), head_before, "HEAD untouched");
+    assert_eq!(count_loose_objects(p), objects_before, "no objects written");
+    assert!(
+        !p.join(".libra").join("merge-state.json").exists(),
+        "no merge state written"
+    );
+    assert!(!p.join("theirs.txt").exists(), "worktree untouched");
+
+    // `--ff-only` never folds either: a diverged history is refused as
+    // non-fast-forward (LBR-CONFLICT-002), exactly as with one merge base —
+    // the width ceiling must not pre-empt that verdict.
+    let ff_only = run_libra_command(&["merge", "--ff-only", "y"], p);
+    let (ff_stderr, ff_report) = parse_cli_error_stderr(&ff_only.stderr);
+    assert_eq!(ff_only.status.code(), Some(128), "refused: {ff_stderr}");
+    assert_eq!(
+        ff_report.error_code, "LBR-CONFLICT-002",
+        "--ff-only reports non-fast-forward, not the width ceiling: {ff_stderr}"
+    );
+    assert!(
+        !ff_stderr.contains("merge bases"),
+        "the width ceiling stays out of a --ff-only verdict: {ff_stderr}"
+    );
+
+    // `-s ours` never folds, so it is never refused for width.
+    let ours = run_libra_command(&["--json", "merge", "-s", "ours", "y"], p);
+    assert_cli_success(&ours, "-s ours ignores the width ceiling");
+    assert_eq!(parse_json_stdout(&ours)["data"]["strategy"], "ours");
+}

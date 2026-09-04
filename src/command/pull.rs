@@ -1050,6 +1050,13 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
         merge::PullMergeError::UnrelatedHistories => {
             CliError::failure(error.to_string()).with_stable_code(StableErrorCode::RepoStateInvalid)
         }
+        merge::PullMergeError::VirtualAncestorTooDeep
+        | merge::PullMergeError::VirtualAncestorTooWide { .. } => CliError::failure(error.to_string())
+            .with_stable_code(StableErrorCode::Unsupported)
+            .with_hint(
+                "merge the branches' common ancestors together first, so the history has a single merge base",
+            )
+            .with_hint("or pull with --rebase, which replays commits one at a time"),
         merge::PullMergeError::GitlinkUnsupported(..) => CliError::failure(error.to_string())
             .with_stable_code(StableErrorCode::Unsupported)
             .with_hint(
