@@ -4751,8 +4751,8 @@ async fn adopt_legacy_capture_scope(
     }
     if !output.quiet {
         println!(
-            "adopted legacy capture session {} into workspace {} at lease fence {}",
-            payload.session_id, payload.workspace_id, payload.workspace_fence
+            "adopted legacy capture session into workspace {} at lease fence {}",
+            payload.workspace_id, payload.workspace_fence
         );
     }
     Ok(())
