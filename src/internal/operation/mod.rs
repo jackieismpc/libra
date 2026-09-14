@@ -4,6 +4,7 @@ pub mod doctor;
 pub mod facet;
 pub mod facets;
 pub mod middleware;
+pub mod reconcile;
 pub mod restore;
 pub mod snapshot;
 pub mod store;
@@ -24,6 +25,7 @@ pub use middleware::{
     OperationTxn, classify_command, run_with_operation,
 };
 pub(crate) use middleware::{current_operation_id, with_operation_id};
+pub use reconcile::{ReconcileEngine, ReconcileError, ReconcileOutcome, RefConflict};
 pub use restore::{
     RestoreEngine, RestoreError, RestoreReceipt, RestoreWhat, recover_restore_transactions,
 };

@@ -520,10 +520,28 @@ where
         {
             Ok(generation) => generation,
             Err(error) => {
-                let _ = store
-                    .update_operation_status(&external_id, OperationStatusV2::Failed)
-                    .await;
-                return Err(OperationError::Cas(error.to_string()));
+                // ADR-OL-06: a concurrent publication keeps both candidates as
+                // sibling heads instead of overwriting one of them; the head
+                // set is converged later by `libra op reconcile`.
+                match store
+                    .merge_op_heads(
+                        &repo_id,
+                        &scope_key,
+                        &external.parent_op_ids,
+                        std::slice::from_ref(&external_id),
+                    )
+                    .await
+                {
+                    Ok(generation) => generation,
+                    Err(merge_error) => {
+                        let _ = store
+                            .update_operation_status(&external_id, OperationStatusV2::Failed)
+                            .await;
+                        return Err(OperationError::Cas(format!(
+                            "{error}; sibling head merge also failed: {merge_error}"
+                        )));
+                    }
+                }
             }
         };
         let mut external_pointer =
@@ -750,10 +768,28 @@ where
     {
         Ok(generation) => generation,
         Err(error) => {
-            let _ = store
-                .update_operation_status(&operation_id, OperationStatusV2::Failed)
-                .await;
-            return Err(OperationError::Cas(error.to_string()));
+            // ADR-OL-06: a concurrent publication keeps both candidates as
+            // sibling heads instead of overwriting one of them; the head set
+            // is converged later by `libra op reconcile`.
+            match store
+                .merge_op_heads(
+                    &repo_id,
+                    &scope_key,
+                    &operation.parent_op_ids,
+                    std::slice::from_ref(&operation_id),
+                )
+                .await
+            {
+                Ok(generation) => generation,
+                Err(merge_error) => {
+                    let _ = store
+                        .update_operation_status(&operation_id, OperationStatusV2::Failed)
+                        .await;
+                    return Err(OperationError::Cas(format!(
+                        "{error}; sibling head merge also failed: {merge_error}"
+                    )));
+                }
+            }
         }
     };
     let mut operation_pointer =

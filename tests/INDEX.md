@@ -26,6 +26,7 @@
 | `agent_shell_operation` | 1 | OL-09 Agent shell/external boundary requires verified before/after evidence | `src/internal/ai/tools/registry.rs`, `src/internal/operation/middleware.rs` |
 | `operation_restore_faults` | 1 | OL-10 restore receipt, facet selection, and fail-closed machine contract | `src/internal/operation/restore.rs`, `src/command/op.rs` |
 | `op_undo_redo` | 1 | OL-11 append-only undo/redo/revert receipt and stable kind contracts | `src/internal/operation/undo.rs`, `src/command/op.rs` |
+| `operation_restore_multi_worktree` | 1 | OL-13 sibling head retention on concurrent publish, unambiguous reconcile convergence, and conflict reporting without guessing | `src/internal/operation/reconcile.rs`, `src/internal/operation/store.rs`, `src/command/op.rs` |
 | `change_id_resolution` | 1 | CH-02 change projection, visibility, and exact/ambiguous/not-found prefix resolution | `src/internal/change/{store,resolve}.rs` |
 | `change_genealogy_rebase` | 1 | CH-03 rewrite builder, Change ID inheritance, typed rebase edges, and atomic projection rollback | `src/internal/change/{builder,genealogy}.rs` |
 | `change_genealogy_squash_split` | 1 | CH-04 squash/split/duplicate multi-edge genealogy, stable Change ID AI links, and FileHistoryStore read migration | `src/internal/change/genealogy.rs`, `src/internal/ai/session/file_history.rs` |

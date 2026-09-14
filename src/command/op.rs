@@ -16,8 +16,8 @@ use crate::{
         head::Head,
         operation::{
             DoctorEngine, DoctorReport, OperationGraphRecord, OperationPage, OperationQueryPage,
-            OperationService, OperationStoreV2, RestoreEngine, RestoreError, RestoreReceipt,
-            RestoreWhat, UndoEngine, UndoError,
+            OperationService, OperationStoreV2, ReconcileEngine, ReconcileError, ReconcileOutcome,
+            RestoreEngine, RestoreError, RestoreReceipt, RestoreWhat, UndoEngine, UndoError,
         },
         operation_wrapper::{OperationMeta, OperationScope, with_operation_log},
         worktree_scope::RequestScope,
@@ -130,6 +130,13 @@ pub enum OpCommand {
         confirm_repo_wide: bool,
     },
 
+    /// Converge concurrent operation heads when their states are provably unambiguous.
+    Reconcile {
+        /// Only report what would happen
+        #[clap(long)]
+        dry_run: bool,
+    },
+
     /// Diagnose operation state; repair is opt-in with --fix.
     Doctor {
         #[clap(long)]
@@ -190,6 +197,8 @@ pub enum OpOutput {
     Redo { receipt: RestoreReceipt },
     #[serde(rename = "revert")]
     Revert { receipt: RestoreReceipt },
+    #[serde(rename = "reconcile")]
+    Reconcile { outcome: ReconcileOutcome },
     #[serde(rename = "doctor")]
     Doctor { report: DoctorReport },
 }
@@ -278,6 +287,7 @@ pub async fn execute_safe(args: OpArgs, output: &OutputConfig) -> CliResult<()> 
             dry_run,
             confirm_repo_wide,
         } => handle_op_revert(op_ref, parent, force, dry_run, confirm_repo_wide, output).await,
+        OpCommand::Reconcile { dry_run } => handle_op_reconcile(dry_run, output).await,
         OpCommand::Doctor { fix, dry_run } => handle_op_doctor(fix, dry_run, output).await,
     }
 }
@@ -354,6 +364,72 @@ async fn handle_op_revert(
         .await
         .map_err(undo_cli_error)?;
     emit_transition_output("revert", receipt, output)
+}
+
+async fn handle_op_reconcile(dry_run: bool, output: &OutputConfig) -> CliResult<()> {
+    let repo_id = current_repo_id().await?;
+    let scope = RequestScope::try_resolve(util::cur_dir())
+        .map_err(|error| CliError::fatal(format!("failed to resolve repository scope: {error}")))?
+        .ok_or_else(|| CliError::fatal("v2 operation state is unavailable in this repository"))?;
+    let storage = ClientStorage::init_local(scope.storage.join("objects"));
+    let database = get_db_conn_instance().await;
+    let store = OperationStoreV2::new_for_repo(&repo_id, database, storage);
+    let engine = ReconcileEngine::new(scope, &repo_id, store);
+    let outcome = engine
+        .reconcile(dry_run)
+        .await
+        .map_err(|error| match &error {
+            ReconcileError::Cas(message) => CliError::fatal(format!(
+                "reconcile failed because the head set changed concurrently: {message}"
+            ))
+            .with_hint("re-run 'libra op reconcile' to converge the new head set"),
+            other => CliError::fatal(other.to_string()),
+        })?;
+    let payload = OpOutput::Reconcile { outcome };
+    if output.is_json() {
+        emit_json_data("op", &payload, output)
+    } else if output.quiet {
+        Ok(())
+    } else {
+        match &payload {
+            OpOutput::Reconcile { outcome } => match outcome {
+                ReconcileOutcome::NothingToReconcile => {
+                    println!("Nothing to reconcile: the operation log has a single head.");
+                }
+                ReconcileOutcome::DryRunConverged { parents } => {
+                    println!(
+                        "Would converge {} concurrent operation heads:\n  {}",
+                        parents.len(),
+                        parents.join("\n  ")
+                    );
+                }
+                ReconcileOutcome::Converged {
+                    reconcile_op_id,
+                    parents,
+                    generation,
+                } => {
+                    println!(
+                        "Converged {} concurrent operation heads into reconcile operation {reconcile_op_id} (generation {generation}).",
+                        parents.len()
+                    );
+                }
+                ReconcileOutcome::Conflicted { conflicts } => {
+                    eprintln!(
+                        "Cannot reconcile: concurrent heads disagree on {} reference(s). The head set is preserved; resolve the conflicts and retry.",
+                        conflicts.len()
+                    );
+                    for conflict in conflicts {
+                        eprintln!("  {} {}:", conflict.kind, conflict.name);
+                        for (head, target) in &conflict.targets {
+                            eprintln!("    {head} -> {target}");
+                        }
+                    }
+                }
+            },
+            _ => unreachable!("payload constructed above"),
+        }
+        Ok(())
+    }
 }
 
 async fn handle_op_doctor(fix: bool, dry_run: bool, output: &OutputConfig) -> CliResult<()> {

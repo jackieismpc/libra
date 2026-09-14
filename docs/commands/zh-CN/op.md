@@ -232,4 +232,23 @@ pointer/CAS 在 replay 开始前发生变化，则仍须从新的 baseline 重�
 - 检测到身份漂移时，同样丢弃 listing 并把捕获标记为 `Partial`。快照不会冻结外部文件系统，也不保证任意持续并发改写下的原子视图，包括两次检查之间先改变再恢复的 ABA。Listing 可能读取 ignore 规则，不是仅 metadata 的操作；扫描 deadline 不等于所有捕获阶段或任意文件系统 I/O 均有 30 秒硬时限。
 - 命令结果、快照完整性与可恢复性是不同维度。命令失败仍可能留下 operation／pre-snapshot 记录，但这不允许捕获不透明的嵌套内容。`Full` 或 `--force` 都不会赋予恢复未捕获内容或不受支持状态的能力。
 
+## `libra op reconcile`
+
+当并发操作 head 的状态可证明无歧义时，收敛 head 集合（plan-20260822 OL-13）。
+
+```bash
+libra op reconcile [--dry-run]
+```
+
+并发发布（例如两个 CLI 进程或两个 worktree 对同一 operation head 集合发布）会保留为兄弟 head：后发布者被 head 比较交换（CAS）拦截，随后作为额外 head 记录，而不是覆盖先发布者。只要存在多个 head，`op undo/redo/revert/restore` 都会拒绝执行（`refusing to guess`），因为不存在唯一的当前 head。
+
+`op reconcile` 检查每个兄弟 head 捕获的 view，并且：
+
+- 当所有共享引用在各并发 view 中一致时收敛 head 集合：记录一个 append-only 的 `reconcile` 操作（所有兄弟 head 作为显式父节点），并把 head 集合推进到该单一节点；
+- 当至少一个引用在不同 head 间目标不同（包括双方观察到的目标）时报告全部冲突并保持 head 集合不变——reconcile 绝不猜测胜者。
+
+reconcile 操作本身不改变任何仓库内容，只记录收敛点，使后续 undo/restore 操作有唯一的无歧义 head 可供锚定。
+
+收敛或「无可收敛」时退出码为 `0`；报告冲突时为非零（JSON 输出携带 `outcome: "conflicted"` 与完整冲突列表）。
+
 当前分支尚未发布的数据库过渡见 [operation-v2 收敛](init.md#operation-v2-收敛当前分支未发布)。

@@ -646,6 +646,11 @@ path = "tests/operation_restore_faults.rs"
 name = "op_undo_redo"
 path = "tests/op_undo_redo.rs"
 
+# plan-20260822 OL-13: multi-worktree operation heads and reconcile contracts.
+[[test]]
+name = "operation_restore_multi_worktree"
+path = "tests/operation_restore_multi_worktree.rs"
+
 # plan-20260822 CH-02: change projection and prefix-resolution contracts.
 [[test]]
 name = "change_id_resolution"
