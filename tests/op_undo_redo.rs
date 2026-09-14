@@ -23,6 +23,20 @@ fn oid(label: &[u8]) -> ObjectHash {
     ObjectHash::from_type_and_data(ObjectType::Blob, label)
 }
 
+async fn branch_tip(database: &sea_orm::DatabaseConnection, branch: &str) -> Option<String> {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    let row = database
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT `commit` FROM reference WHERE kind = 'Branch' AND name = ? \
+             AND remote IS NULL",
+            [branch.to_string().into()],
+        ))
+        .await
+        .expect("branch tip query");
+    row.and_then(|row| row.try_get::<Option<String>>("", "commit").ok().flatten())
+}
+
 fn scope(root: &std::path::Path) -> RequestScope {
     let gitdir = root.join(".libra");
     fs::create_dir_all(&gitdir).expect("gitdir");
@@ -810,4 +824,148 @@ async fn doctor_dry_run_does_not_repair_and_fix_rebuilds_a_missing_pointer() {
         OperationStatusV2::Failed
     );
     assert!(WorkspaceStatePointer::load(&pinned).await.is_ok());
+}
+
+#[tokio::test]
+async fn undo_restores_symbolic_head_branch_tip_to_exact_commit() {
+    // Review P1: a default undo/restore must restore the commit OID that the
+    // symbolic HEAD branch points at, not just the symbolic reference name.
+    // Assert against the actual `reference` table commit, never the branch
+    // name alone.
+    let _test_lock = lock_cli_repository_tests().await;
+    let repository = tempdir().expect("repository");
+    libra::utils::test::setup_with_new_libra_in(repository.path()).await;
+    fs::write(repository.path().join("a.txt"), "one\n").expect("file");
+
+    fn run(repository: &std::path::Path, args: &[&str]) {
+        let output = Command::new(env!("CARGO_BIN_EXE_libra"))
+            .env("LIBRA_SKIP_WEB_BUILD", "1")
+            .args(args)
+            .current_dir(repository)
+            .output()
+            .expect("libra command");
+        assert!(
+            output.status.success(),
+            "libra {args:?} failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    run(repository.path(), &["add", "a.txt"]);
+    run(repository.path(), &["commit", "-m", "first", "--no-verify"]);
+    fs::write(repository.path().join("a.txt"), "two\n").expect("file update");
+    run(repository.path(), &["add", "a.txt"]);
+    run(
+        repository.path(),
+        &["commit", "-m", "second", "--no-verify"],
+    );
+
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+
+    let pinned = RequestScope::resolve(repository.path().to_path_buf()).expect("scope");
+    let database = get_db_conn_instance_for_path(&pinned.storage.join(util::DATABASE))
+        .await
+        .expect("database");
+    let repo_id = ConfigKv::get_with_conn(&database, "libra.repoid")
+        .await
+        .expect("repo id")
+        .expect("repo id entry")
+        .value;
+    let storage = ClientStorage::init_local(pinned.storage.join("objects"));
+    let store = OperationStoreV2::new_for_repo(&repo_id, database.clone(), storage.clone());
+
+    let operations = store.list_operations().await.expect("operations");
+    let target = operations
+        .iter()
+        .rev()
+        .find(|operation| {
+            operation.status == OperationStatusV2::Success
+                && operation.parent_op_ids.len() == 1
+                && operation.kind == OperationKind::Command
+        })
+        .expect("a v2 commit operation")
+        .clone();
+    // The branch tip the snapshot captured for the target's parent state:
+    // undo must move the live branch row back to exactly this commit.
+    let pre_view = store.load_view(&target.pre_view_oid).expect("pre view");
+    let pre_snapshot = store
+        .load_snapshot(pre_view.workspaces.values().next().expect("pre snapshot"))
+        .expect("pre snapshot");
+    let branch = match &pre_snapshot.head {
+        libra::internal::operation::HeadState::Symbolic { reference, .. } => reference
+            .strip_prefix("refs/heads/")
+            .unwrap_or(reference)
+            .to_string(),
+        libra::internal::operation::HeadState::Detached { .. } => {
+            panic!("expected a symbolic HEAD for the commit test")
+        }
+    };
+    let pre_bytes = store
+        .load_object(&pre_view.refs_facet_oid)
+        .expect("pre refs facet");
+    let pre_value: serde_json::Value = serde_json::from_slice(&pre_bytes).expect("pre refs json");
+    let pre_commit = pre_value["references"]
+        .as_array()
+        .expect("refs array")
+        .iter()
+        .find(|entry| {
+            entry["kind"] == "Branch"
+                && entry["name"] == branch.as_str()
+                && entry["remote"].is_null()
+        })
+        .and_then(|entry| entry["commit"].as_str())
+        .map(str::to_string)
+        .expect("pre-view branch tip commit");
+
+    // The branch tip the target state carried: undo must move the live
+    // branch row from the target's commit back to the pre-view commit.
+    let post_view = store.load_view(&target.post_view_oid).expect("post view");
+    let post_bytes = store
+        .load_object(&post_view.refs_facet_oid)
+        .expect("post refs facet");
+    let post_value: serde_json::Value =
+        serde_json::from_slice(&post_bytes).expect("post refs json");
+    let post_commit = post_value["references"]
+        .as_array()
+        .expect("refs array")
+        .iter()
+        .find(|entry| {
+            entry["kind"] == "Branch"
+                && entry["name"] == branch.as_str()
+                && entry["remote"].is_null()
+        })
+        .and_then(|entry| entry["commit"].as_str())
+        .map(str::to_string)
+        .expect("post-view branch tip commit");
+
+    // HEAD is symbolic on the branch; the current branch tip is the target
+    // commit (post-view) before undo.
+    assert_eq!(
+        branch_tip(&database, &branch).await.as_deref(),
+        Some(post_commit.as_str()),
+        "branch tip must be the target commit before undo"
+    );
+
+    run(repository.path(), &["op", "undo", &target.op_id, "--force"]);
+
+    // The live branch row must now point at the commit from the target's
+    // pre-view (the parent commit), while HEAD stays symbolic on the branch.
+    assert_eq!(
+        branch_tip(&database, &branch).await.as_deref(),
+        Some(pre_commit.as_str()),
+        "undo must restore the symbolic HEAD branch tip to the exact parent commit OID"
+    );
+    let head_row = database
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT name FROM reference WHERE kind = 'Head' AND name = ?",
+            [branch.clone().into()],
+        ))
+        .await
+        .expect("head query");
+    assert!(
+        head_row.is_some(),
+        "HEAD must remain symbolic on branch '{branch}' after undo"
+    );
 }
