@@ -24,7 +24,6 @@ use git_internal::{
 };
 use sea_orm::ConnectionTrait;
 use serde::Serialize;
-use uuid::Uuid;
 
 use crate::{
     command::{
@@ -38,7 +37,7 @@ use crate::{
     common_utils::{format_commit_msg, parse_commit_msg},
     internal::{
         branch::Branch,
-        change::{RelationKind, record_current_repo_commit_revision},
+        change::{RelationKind, record_current_repo_commit_revision_for_active_operation},
         config::ConfigKv,
         head::Head,
         reflog::{ReflogAction, ReflogContext, with_reflog},
@@ -1723,8 +1722,7 @@ async fn create_cherry_pick_commit(
 
     save_object(&commit, &commit.id)
         .map_err(|e| CherryPickSingleError::SaveFailed(format!("failed to save commit: {e}")))?;
-    record_current_repo_commit_revision(
-        Uuid::now_v7().to_string(),
+    record_current_repo_commit_revision_for_active_operation(
         commit.id.to_string(),
         Some((original_commit.id.to_string(), RelationKind::CherryPick)),
     )

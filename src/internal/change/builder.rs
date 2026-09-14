@@ -2,6 +2,7 @@
 
 use sea_orm::{DatabaseConnection, DatabaseTransaction};
 use thiserror::Error;
+use uuid::Uuid;
 
 use super::{
     AiOperationLink, ChangeId, ChangeRevision, ChangeStore, ChangeStoreError, GenealogyError,
@@ -21,12 +22,14 @@ pub enum ChangeRevisionBuildError {
     EmptyCommitOid,
     #[error("repository identity unavailable: {0}")]
     RepositoryIdentity(String),
+    #[error("repository mutation has no active operation id")]
+    MissingOperationContext,
 }
 
 /// Record a revision for a commit produced by a normal or rewrite command.
-/// Rewrite callers pass their predecessor OID; when that predecessor already
-/// has a projection, its stable Change ID is inherited. Legacy commits without
-/// a projection receive a new random ID while retaining the typed edge.
+/// Rewrite callers pass typed predecessor edges; only identity-preserving
+/// relations inherit a predecessor's known Change ID. Split and duplicate
+/// relations retain genealogy while starting a new Change identity.
 pub async fn record_current_repo_commit_revision(
     op_id: impl Into<String>,
     commit_oid: impl Into<String>,
@@ -41,9 +44,9 @@ pub async fn record_current_repo_commit_revision(
 }
 
 /// Record one revision with an ordered, possibly multi-edge predecessor set.
-/// The first predecessor with a known projection supplies the stable Change
-/// ID; callers use this for squash (fold target first, folded commit second),
-/// split, and duplicate workflows.
+/// The first identity-preserving predecessor with a known projection supplies
+/// the stable Change ID. Split and duplicate edges remain in genealogy but
+/// always start a new logical change.
 pub async fn record_current_repo_commit_revision_with_predecessors(
     op_id: impl Into<String>,
     commit_oid: impl Into<String>,
@@ -57,21 +60,14 @@ pub async fn record_current_repo_commit_revision_with_predecessors(
     let op_id = op_id.into();
     let operation_id = op_id.clone();
     let commit_oid = commit_oid.into();
-    let inherited = if let Some((predecessor_oid, _)) = predecessors.first() {
-        ChangeStore::new(database.clone())
-            .change_id_for_commit(repo_id.as_str(), predecessor_oid)
-            .await?
-    } else {
-        None
-    };
-    let builder = match inherited {
-        Some(change_id) => {
-            ChangeRevisionBuilder::for_rewrite(database.clone(), repo_id.as_str(), op_id, change_id)
-        }
-        None => ChangeRevisionBuilder::for_new_change(database.clone(), repo_id.as_str(), op_id),
-    }
-    .set_commit_oid(commit_oid);
-    let revision = builder.set_predecessors(predecessors).build().await?;
+    let revision = build_revision_with_predecessors(
+        database.clone(),
+        repo_id.as_str(),
+        op_id,
+        commit_oid,
+        predecessors,
+    )
+    .await?;
     link_ai_operation(
         &database,
         &AiOperationLink {
@@ -102,6 +98,64 @@ pub async fn record_current_repo_commit_revision_with_predecessors(
     attach_pending_ai_operation_links(&database, &repo_id, revision.change_id, &operation_ids)
         .await?;
     Ok(revision)
+}
+
+async fn build_revision_with_predecessors(
+    database: DatabaseConnection,
+    repo_id: &str,
+    op_id: String,
+    commit_oid: String,
+    predecessors: Vec<(String, RelationKind)>,
+) -> Result<ChangeRevision, ChangeRevisionBuildError> {
+    let inherited_predecessor = predecessors
+        .iter()
+        .find(|(_, relation_kind)| relation_kind.preserves_change_identity());
+    let inherited = if let Some((predecessor_oid, _)) = inherited_predecessor {
+        ChangeStore::new(database.clone())
+            .change_id_for_commit(repo_id, predecessor_oid)
+            .await?
+    } else {
+        None
+    };
+    let builder = match inherited {
+        Some(change_id) => {
+            ChangeRevisionBuilder::for_rewrite(database.clone(), repo_id, op_id, change_id)
+        }
+        None => ChangeRevisionBuilder::for_new_change(database, repo_id, op_id),
+    }
+    .set_commit_oid(commit_oid);
+    Ok(builder.set_predecessors(predecessors).build().await?)
+}
+
+/// Record a revision using the persisted operation boundary active for this command.
+///
+/// In a pinned repository invocation, missing operation context is an error: a
+/// fresh UUID would sever provenance from the operation log. Direct in-process
+/// command callers that have no request boundary retain the standalone fallback.
+pub async fn record_current_repo_commit_revision_for_active_operation(
+    commit_oid: impl Into<String>,
+    predecessor: Option<(String, RelationKind)>,
+) -> Result<ChangeRevision, ChangeRevisionBuildError> {
+    record_current_repo_commit_revision_with_predecessors_for_active_operation(
+        commit_oid,
+        predecessor.into_iter().collect(),
+    )
+    .await
+}
+
+/// Record an ordered predecessor set using the operation boundary active for this command.
+pub async fn record_current_repo_commit_revision_with_predecessors_for_active_operation(
+    commit_oid: impl Into<String>,
+    predecessors: Vec<(String, RelationKind)>,
+) -> Result<ChangeRevision, ChangeRevisionBuildError> {
+    let op_id = match crate::internal::operation::current_operation_id() {
+        Some(op_id) => op_id,
+        None if crate::internal::worktree_scope::WorktreeScope::request_scope().is_some() => {
+            return Err(ChangeRevisionBuildError::MissingOperationContext);
+        }
+        None => Uuid::now_v7().to_string(),
+    };
+    record_current_repo_commit_revision_with_predecessors(op_id, commit_oid, predecessors).await
 }
 
 /// Record the visible revisions created by a split operation. Each output has
@@ -166,6 +220,32 @@ mod tests {
     use crate::internal::{change::ChangeStore, db};
 
     #[tokio::test]
+    async fn active_operation_revision_fails_closed_without_a_boundary_id() {
+        let root = tempdir().expect("scope root");
+        let scope = crate::internal::worktree_scope::RequestScope {
+            scope: crate::internal::worktree_scope::WorktreeScope::Main,
+            workdir: root.path().to_path_buf(),
+            gitdir: root.path().join(".libra"),
+            storage: root.path().to_path_buf(),
+            worktree_root: root.path().to_path_buf(),
+        };
+
+        let error = crate::internal::worktree_scope::with_request_scope(
+            Some(scope),
+            record_current_repo_commit_revision_for_active_operation(
+                "commit-without-boundary",
+                None,
+            ),
+        )
+        .await
+        .expect_err("a pinned command must not invent operation provenance");
+        assert!(matches!(
+            error,
+            ChangeRevisionBuildError::MissingOperationContext
+        ));
+    }
+
+    #[tokio::test]
     async fn new_change_duplicate_and_rewrite_identity_contract() {
         let dir = tempdir().expect("tempdir");
         let database = db::create_database(dir.path().join("repo.db").to_str().unwrap())
@@ -197,6 +277,73 @@ mod tests {
                 .await
                 .expect("rewrite revision");
         assert_eq!(rewritten.change_id, first.change_id);
+    }
+
+    #[tokio::test]
+    async fn split_and_duplicate_edges_start_new_identities_from_registered_sources() {
+        let dir = tempdir().expect("tempdir");
+        let database = db::create_database(dir.path().join("repo.db").to_str().unwrap())
+            .await
+            .expect("database");
+        let source = ChangeRevisionBuilder::for_new_change(database.clone(), "repo", "source-op")
+            .set_commit_oid("source-commit")
+            .build()
+            .await
+            .expect("source revision");
+        let store = ChangeStore::new(database.clone());
+        assert_eq!(
+            store
+                .change_id_for_commit("repo", "source-commit")
+                .await
+                .expect("source projection"),
+            Some(source.change_id)
+        );
+
+        let split = build_revision_with_predecessors(
+            database.clone(),
+            "repo",
+            "split-op".to_string(),
+            "split-commit".to_string(),
+            vec![("source-commit".to_string(), RelationKind::Split)],
+        )
+        .await
+        .expect("split revision");
+        let duplicate = build_revision_with_predecessors(
+            database.clone(),
+            "repo",
+            "duplicate-op".to_string(),
+            "duplicate-commit".to_string(),
+            vec![("source-commit".to_string(), RelationKind::Duplicate)],
+        )
+        .await
+        .expect("duplicate revision");
+        let amended = build_revision_with_predecessors(
+            database.clone(),
+            "repo",
+            "amend-op".to_string(),
+            "amended-commit".to_string(),
+            vec![("source-commit".to_string(), RelationKind::Amend)],
+        )
+        .await
+        .expect("amended revision");
+
+        assert_ne!(split.change_id, source.change_id);
+        assert_ne!(duplicate.change_id, source.change_id);
+        assert_eq!(amended.change_id, source.change_id);
+        assert_eq!(
+            crate::internal::change::evolution_for_commit(&database, "split-commit", 10)
+                .await
+                .expect("split genealogy")[0]
+                .relation_kind,
+            RelationKind::Split
+        );
+        assert_eq!(
+            crate::internal::change::evolution_for_commit(&database, "duplicate-commit", 10)
+                .await
+                .expect("duplicate genealogy")[0]
+                .relation_kind,
+            RelationKind::Duplicate
+        );
     }
 
     #[tokio::test]

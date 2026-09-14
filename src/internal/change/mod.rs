@@ -8,8 +8,10 @@ mod store;
 mod workflows;
 pub use builder::{
     ChangeRevisionBuildError, ChangeRevisionBuilder, record_current_repo_commit_revision,
-    record_current_repo_commit_revision_with_predecessors, record_duplicate_revision,
-    record_split_revisions,
+    record_current_repo_commit_revision_for_active_operation,
+    record_current_repo_commit_revision_with_predecessors,
+    record_current_repo_commit_revision_with_predecessors_for_active_operation,
+    record_duplicate_revision, record_split_revisions,
 };
 pub use genealogy::{
     AiOperationLink, GenealogyError, GenealogyRevision, PredecessorEdge, RelationKind,

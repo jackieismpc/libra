@@ -2912,6 +2912,9 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
         }) => Some(name.clone()),
         _ => None,
     };
+    let control_operation_id = control_boundary
+        .as_ref()
+        .map(|boundary| boundary.op_id().to_string());
     let command_future = async {
         match args.command {
             Commands::Init(cmd_args) => {
@@ -3200,7 +3203,12 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
             Err(error) => Err(operation_error_to_cli(error, remote_prune_name.as_deref())),
         }
     } else {
-        command_future.await
+        match control_operation_id {
+            Some(operation_id) => {
+                crate::internal::operation::with_operation_id(operation_id, command_future).await
+            }
+            None => command_future.await,
+        }
     };
 
     background_index_guard.finish().await;

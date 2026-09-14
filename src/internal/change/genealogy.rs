@@ -20,6 +20,17 @@ pub enum RelationKind {
 }
 
 impl RelationKind {
+    /// Whether this edge describes a new revision of the same logical change.
+    ///
+    /// Split outputs and explicit duplicates create independent change
+    /// identities even when their source commit already has a projection.
+    pub(super) fn preserves_change_identity(self) -> bool {
+        matches!(
+            self,
+            Self::Amend | Self::Rebase | Self::CherryPick | Self::Squash
+        )
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Amend => "amend",

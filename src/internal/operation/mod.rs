@@ -23,6 +23,7 @@ pub use middleware::{
     ClassificationError, MutationClass, OperationError, OperationFuture, OperationResult,
     OperationTxn, classify_command, run_with_operation,
 };
+pub(crate) use middleware::{current_operation_id, with_operation_id};
 pub use restore::{
     RestoreEngine, RestoreError, RestoreReceipt, RestoreWhat, recover_restore_transactions,
 };

@@ -22,7 +22,6 @@ use sea_orm::{
     ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryOrder, Statement, Value,
 };
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::{
     cli_error,
@@ -30,7 +29,10 @@ use crate::{
     common_utils::{format_commit_msg, parse_commit_msg},
     internal::{
         branch::Branch,
-        change::{RelationKind, record_current_repo_commit_revision_with_predecessors},
+        change::{
+            RelationKind,
+            record_current_repo_commit_revision_with_predecessors_for_active_operation,
+        },
         head::Head,
         model::{reference as ref_model, reflog as reflog_model},
         reflog,
@@ -3538,8 +3540,7 @@ async fn run_rebase_continue(output: &OutputConfig) -> Result<RebaseOutput, Reba
                 })?;
         save_object(&new_commit, &new_commit.id)
             .map_err(|e| RebaseError::CommitSave(e.to_string()))?;
-        record_current_repo_commit_revision_with_predecessors(
-            Uuid::now_v7().to_string(),
+        record_current_repo_commit_revision_with_predecessors_for_active_operation(
             new_commit.id.to_string(),
             replay_genealogy_predecessors(&original_commit, state.current_head, action),
         )
@@ -5290,8 +5291,7 @@ async fn replay_commit_with_conflict_detection(
     if let Err(e) = save_object(&new_commit, &new_commit.id) {
         return ReplayResult::internal(ReplayErrorKind::CommitSave, e.to_string());
     }
-    if let Err(error) = record_current_repo_commit_revision_with_predecessors(
-        Uuid::now_v7().to_string(),
+    if let Err(error) = record_current_repo_commit_revision_with_predecessors_for_active_operation(
         new_commit.id.to_string(),
         replay_genealogy_predecessors(&commit_to_replay, *new_parent_id, action),
     )
