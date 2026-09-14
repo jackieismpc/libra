@@ -1,5 +1,8 @@
 //! Single entry point for new and rewritten Change revisions.
 
+use std::str::FromStr;
+
+use git_internal::hash::ObjectHash;
 use sea_orm::{DatabaseConnection, DatabaseTransaction};
 use thiserror::Error;
 use uuid::Uuid;
@@ -110,12 +113,24 @@ async fn build_revision_with_predecessors(
     let inherited_predecessor = predecessors
         .iter()
         .find(|(_, relation_kind)| relation_kind.preserves_change_identity());
-    let inherited = if let Some((predecessor_oid, _)) = inherited_predecessor {
-        ChangeStore::new(database.clone())
-            .change_id_for_commit(repo_id, predecessor_oid)
-            .await?
-    } else {
-        None
+    let (inherited, origin) = match inherited_predecessor {
+        Some((predecessor_oid, _)) => {
+            match ChangeStore::new(database.clone())
+                .change_id_for_commit(repo_id, predecessor_oid)
+                .await?
+            {
+                Some(change_id) => (Some(change_id), "generated"),
+                // ADR-OL-04: a legacy commit without a sidecar projection
+                // keeps a stable logical identity across its first rewrite
+                // through the deterministic, domain-separated synthetic
+                // Change ID derived from its commit OID.
+                None => (
+                    synthetic_change_id_for_legacy_predecessor(predecessor_oid),
+                    "synthetic",
+                ),
+            }
+        }
+        None => (None, "generated"),
     };
     let builder = match inherited {
         Some(change_id) => {
@@ -123,7 +138,8 @@ async fn build_revision_with_predecessors(
         }
         None => ChangeRevisionBuilder::for_new_change(database, repo_id, op_id),
     }
-    .set_commit_oid(commit_oid);
+    .set_commit_oid(commit_oid)
+    .with_identity_origin(origin);
     builder.set_predecessors(predecessors).build().await
 }
 
@@ -208,6 +224,7 @@ pub struct ChangeRevisionBuilder {
     commit_oid: Option<String>,
     visibility: RevisionVisibility,
     allow_existing_identity: bool,
+    origin: &'static str,
 }
 
 #[cfg(test)]
@@ -387,6 +404,71 @@ mod tests {
             .expect("identity row must have rolled back");
         assert_eq!(retry.change_id, change_id);
     }
+
+    #[test]
+    fn synthetic_legacy_predecessor_is_deterministic_and_format_separated() {
+        let sha1_oid = "0123456789abcdef0123456789abcdef01234567";
+        let first = synthetic_change_id_for_legacy_predecessor(sha1_oid).expect("synthetic id");
+        let second = synthetic_change_id_for_legacy_predecessor(sha1_oid).expect("synthetic id");
+        assert_eq!(first, second);
+        // A 64-hex oid is a SHA-256 commit and must not alias the SHA-1
+        // synthetic identity for the same bytes.
+        let sha256_oid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let sha256 =
+            synthetic_change_id_for_legacy_predecessor(sha256_oid).expect("sha256 synthetic");
+        assert_ne!(first, sha256);
+        assert!(synthetic_change_id_for_legacy_predecessor("not-hex").is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_rewrite_records_the_synthetic_origin() {
+        use sea_orm::ConnectionTrait;
+
+        let dir = tempdir().expect("tempdir");
+        let database = db::create_database(dir.path().join("repo.db").to_str().unwrap())
+            .await
+            .expect("database");
+        let predecessor =
+            ObjectHash::from_str("0123456789abcdef0123456789abcdef01234567").expect("legacy oid");
+        let synthetic = synthetic_change_id_for_legacy_predecessor(&predecessor.to_string())
+            .expect("synthetic id");
+        let rewritten = ChangeRevisionBuilder::for_rewrite(
+            database.clone(),
+            "repo",
+            "op-legacy-rewrite",
+            synthetic,
+        )
+        .with_identity_origin("synthetic")
+        .set_commit_oid(predecessor.to_string())
+        .build()
+        .await
+        .expect("legacy rewrite revision");
+        assert_eq!(rewritten.change_id, synthetic);
+
+        let row = database
+            .query_one_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Sqlite,
+                "SELECT origin FROM change_identity WHERE change_id = ?",
+                [synthetic.to_string().into()],
+            ))
+            .await
+            .expect("identity row");
+        assert_eq!(
+            row.expect("identity row")
+                .try_get::<String>("", "origin")
+                .expect("origin column"),
+            "synthetic"
+        );
+    }
+}
+
+/// Derive the deterministic synthetic Change ID for a legacy commit that has
+/// no sidecar projection (ADR-OL-04). Returns `None` when the OID does not
+/// parse as an object hash.
+fn synthetic_change_id_for_legacy_predecessor(predecessor_oid: &str) -> Option<ChangeId> {
+    ObjectHash::from_str(predecessor_oid)
+        .ok()
+        .map(|hash| ChangeId::synthetic_for_commit(hash.kind().as_str(), hash.as_ref()))
 }
 
 #[allow(clippy::items_after_test_module)]
@@ -405,7 +487,15 @@ impl ChangeRevisionBuilder {
             commit_oid: None,
             visibility: RevisionVisibility::Visible,
             allow_existing_identity: false,
+            origin: "generated",
         }
+    }
+
+    /// Record the identity as derived from a legacy commit's deterministic
+    /// synthetic Change ID (ADR-OL-04) instead of fresh generation.
+    pub fn with_identity_origin(mut self, origin: &'static str) -> Self {
+        self.origin = origin;
+        self
     }
 
     pub fn for_rewrite(
@@ -496,7 +586,7 @@ impl ChangeRevisionBuilder {
                     database,
                     &self.repo_id,
                     change_id,
-                    "generated",
+                    self.origin,
                     &self.op_id,
                 )
                 .await
@@ -505,7 +595,7 @@ impl ChangeRevisionBuilder {
                     database,
                     &self.repo_id,
                     change_id,
-                    "generated",
+                    self.origin,
                     &self.op_id,
                 )
                 .await
