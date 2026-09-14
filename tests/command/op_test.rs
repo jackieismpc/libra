@@ -61,7 +61,7 @@ fn test_op_log_json_lists_latest_operations_newest_first() {
     let topic = run_libra_command(&["branch", "topic"], repo.path());
     assert_cli_success(&topic, "branch topic");
 
-    let json = run_json_op(repo.path(), &["log", "-n", "10"]);
+    let json = run_json_op(repo.path(), &["log", "-n", "10", "--command", "branch"]);
     assert_eq!(json["command"], Value::String("op".to_string()));
 
     let data = &json["data"];
@@ -130,8 +130,14 @@ fn test_op_log_json_page_two_returns_older_operation() {
         assert_cli_success(&output, branch_name);
     }
 
-    let page_one = run_json_op(repo.path(), &["log", "-n", "1", "--page", "1"]);
-    let page_two = run_json_op(repo.path(), &["log", "-n", "1", "--page", "2"]);
+    let page_one = run_json_op(
+        repo.path(),
+        &["log", "-n", "1", "--page", "1", "--command", "branch"],
+    );
+    let page_two = run_json_op(
+        repo.path(),
+        &["log", "-n", "1", "--page", "2", "--command", "branch"],
+    );
 
     assert_eq!(page_one["data"]["page"], Value::from(1));
     assert_eq!(page_one["data"]["per_page"], Value::from(1));
@@ -393,6 +399,233 @@ fn test_op_log_human_page_two_uses_filtered_global_index() {
     );
 }
 
+#[tokio::test]
+/// Verifies mixed legacy/v2 log indices resolve identically through show,
+/// restore, undo, and redo, including the v2 external snapshot entry.
+async fn test_op_indices_share_mixed_legacy_v2_history_through_transitions() {
+    let repo = create_committed_repo_via_cli();
+
+    let branch = run_libra_command(&["branch", "feature"], repo.path());
+    assert_cli_success(&branch, "branch feature");
+
+    std::fs::write(
+        repo.path().join("tracked.txt"),
+        "tracked\nexternal workspace edit\n",
+    )
+    .expect("edit tracked file outside libra");
+    let add = run_libra_command(&["add", "tracked.txt"], repo.path());
+    assert_cli_success(&add, "add after external workspace edit");
+
+    let log = run_json_op(repo.path(), &["log", "-n", "100"]);
+    let operations = log["data"]["operations"]
+        .as_array()
+        .expect("operation array");
+    let external = operations
+        .iter()
+        .find(|entry| entry["command_name"] == "external.snapshot")
+        .expect("external snapshot in unified log");
+    assert!(
+        operations
+            .iter()
+            .any(|entry| entry["command_name"] == "branch")
+    );
+    assert!(
+        operations
+            .iter()
+            .any(|entry| entry["command_name"] == "add")
+    );
+
+    for entry in operations.iter() {
+        let index = entry["index"].as_u64().expect("global log index");
+        let reference = format!("@{{{index}}}");
+        let shown = run_json_op(repo.path(), &["show", &reference]);
+        assert_eq!(
+            shown["data"]["op_id"], entry["op_id"],
+            "show {reference} must resolve to its log row"
+        );
+    }
+
+    let external_index = external["index"].as_u64().expect("external index");
+    let external_ref = format!("@{{{external_index}}}");
+    let restored = run_json_op(
+        repo.path(),
+        &["restore", &external_ref, "--dry-run", "--force"],
+    );
+    assert_eq!(
+        restored["data"]["receipt"]["target_op_id"], external["op_id"],
+        "restore must retain the external snapshot's canonical index"
+    );
+
+    let legacy_branch = operations
+        .iter()
+        .find(|entry| entry["command_name"] == "branch")
+        .expect("legacy branch operation in unified log");
+    let legacy_index = legacy_branch["index"].as_u64().expect("legacy index");
+    let legacy_ref = format!("@{{{legacy_index}}}");
+    let legacy_restore = run_libra_command(
+        &["op", "restore", &legacy_ref, "--dry-run", "--force"],
+        repo.path(),
+    );
+    assert_cli_success(&legacy_restore, "restore legacy history index");
+    let legacy_restore_stdout = String::from_utf8_lossy(&legacy_restore.stdout);
+    let legacy_short_id = &legacy_branch["op_id"]
+        .as_str()
+        .expect("legacy operation id")[..8];
+    assert!(
+        legacy_restore_stdout.contains(&format!("Would restore to operation {legacy_short_id}")),
+        "legacy restore must retain the unified log index: {legacy_restore_stdout}"
+    );
+
+    let add_entry = operations
+        .iter()
+        .find(|entry| entry["command_name"] == "add")
+        .expect("v2 add operation in unified log");
+    let add_index = add_entry["index"].as_u64().expect("add index");
+    let add_ref = format!("@{{{add_index}}}");
+    let undone = run_json_op(repo.path(), &["undo", "--force", &add_ref]);
+    assert_eq!(
+        undone["data"]["receipt"]["target_op_id"], add_entry["op_id"],
+        "undo must use the operation selected from the unified log"
+    );
+    let undo_id = undone["data"]["receipt"]["new_op_id"]
+        .as_str()
+        .expect("undo operation id");
+    assert_eq!(
+        run_json_op(repo.path(), &["show", "@{0}"])["data"]["op_id"],
+        undo_id
+    );
+
+    let redone = run_json_op(repo.path(), &["redo", "--force", "@{0}"]);
+    let redo_id = redone["data"]["receipt"]["new_op_id"]
+        .as_str()
+        .expect("redo operation id");
+    assert_eq!(
+        run_json_op(repo.path(), &["show", "@{0}"])["data"]["op_id"],
+        redo_id
+    );
+
+    let after_redo = run_json_op(repo.path(), &["log", "-n", "100"]);
+    let rows = after_redo["data"]["operations"]
+        .as_array()
+        .expect("operation array after redo");
+    let add_entry = rows
+        .iter()
+        .find(|entry| entry["op_id"] == add_entry["op_id"])
+        .expect("original add operation after redo");
+    let external_entry = rows
+        .iter()
+        .find(|entry| entry["op_id"] == external["op_id"])
+        .expect("external snapshot after redo");
+    let add_ref = format!(
+        "@{{{}}}",
+        add_entry["index"].as_u64().expect("add index after redo")
+    );
+    let parent_ref = format!(
+        "@{{{}}}",
+        external_entry["index"]
+            .as_u64()
+            .expect("external index after redo")
+    );
+    let reverted = run_json_op(
+        repo.path(),
+        &[
+            "revert",
+            &add_ref,
+            "--parent",
+            &parent_ref,
+            "--force",
+            "--dry-run",
+        ],
+    );
+    assert_eq!(
+        reverted["data"]["receipt"]["target_op_id"], add_entry["op_id"],
+        "revert target must resolve through the unified history"
+    );
+}
+
+#[test]
+/// V2 transitions resolve canonical indices but reject legacy-only targets.
+fn test_op_transitions_reject_legacy_indices_from_unified_history() {
+    let repo = create_committed_repo_via_cli();
+    let branch = run_libra_command(&["branch", "feature"], repo.path());
+    assert_cli_success(&branch, "branch feature");
+
+    std::fs::write(
+        repo.path().join("tracked.txt"),
+        "tracked\nexternal workspace edit\n",
+    )
+    .expect("edit tracked file outside libra");
+    let add = run_libra_command(&["add", "tracked.txt"], repo.path());
+    assert_cli_success(&add, "add after external workspace edit");
+
+    let history = run_json_op(repo.path(), &["log", "-n", "100"]);
+    let operations = history["data"]["operations"]
+        .as_array()
+        .expect("operation array");
+    let legacy = operations
+        .iter()
+        .find(|entry| entry["command_name"] == "branch")
+        .expect("legacy branch operation");
+    let legacy_ref = format!(
+        "@{{{}}}",
+        legacy["index"].as_u64().expect("legacy operation index")
+    );
+    let v2 = operations
+        .iter()
+        .find(|entry| entry["command_name"] == "add")
+        .expect("v2 add operation");
+    let v2_ref = format!("@{{{}}}", v2["index"].as_u64().expect("v2 index"));
+
+    let undo = run_libra_command(&["op", "undo", "--force", &legacy_ref], repo.path());
+    assert_invalid_target_error(&undo, "resolves to legacy history");
+
+    let revert = run_libra_command(
+        &[
+            "op",
+            "revert",
+            &v2_ref,
+            "--parent",
+            &legacy_ref,
+            "--force",
+            "--dry-run",
+        ],
+        repo.path(),
+    );
+    assert_invalid_target_error(&revert, "resolves to legacy history");
+}
+
+#[test]
+/// Filtered pages keep the row's rank in the complete mixed-version history.
+fn test_op_log_filtered_page_index_resolves_after_v2_entries() {
+    let repo = create_committed_repo_via_cli();
+    for branch_name in ["feature", "topic", "release"] {
+        let branch = run_libra_command(&["branch", branch_name], repo.path());
+        assert_cli_success(&branch, branch_name);
+    }
+
+    std::fs::write(
+        repo.path().join("tracked.txt"),
+        "tracked\nexternal workspace edit\n",
+    )
+    .expect("edit tracked file outside libra");
+    let add = run_libra_command(&["add", "tracked.txt"], repo.path());
+    assert_cli_success(&add, "add after external workspace edit");
+
+    let filtered = run_json_op(
+        repo.path(),
+        &["log", "-n", "1", "--page", "2", "--command", "branch"],
+    );
+    let entry = filtered["data"]["operations"][0].clone();
+    let index = entry["index"].as_u64().expect("global history index");
+    assert!(
+        index >= 2,
+        "filtered index must include newer non-branch rows"
+    );
+    let reference = format!("@{{{index}}}");
+    let shown = run_json_op(repo.path(), &["show", &reference]);
+    assert_eq!(shown["data"]["op_id"], entry["op_id"]);
+}
+
 #[test]
 /// Verifies `switch -c` does not record a branch-only intermediate snapshot.
 fn test_switch_create_branch_does_not_record_branch_operation() {
@@ -441,7 +674,10 @@ fn test_op_log_normalizes_zero_page_and_page_size() {
     let feature = run_libra_command(&["branch", "feature"], repo.path());
     assert_cli_success(&feature, "branch feature");
 
-    let json = run_json_op(repo.path(), &["log", "-n", "0", "--page", "0"]);
+    let json = run_json_op(
+        repo.path(),
+        &["log", "-n", "0", "--page", "0", "--command", "branch"],
+    );
     assert_eq!(json["data"]["page"], Value::from(1));
     assert_eq!(json["data"]["per_page"], Value::from(50));
     assert_eq!(json["data"]["total"], Value::from(1));
@@ -600,7 +836,7 @@ fn test_op_restore_out_of_range_index_reports_invalid_target() {
     let output = run_libra_command(&["op", "restore", "@{99}"], repo.path());
     let (_human, report) = parse_cli_error_stderr(&output.stderr);
 
-    assert_invalid_target_error(&output, "fatal: v2 operation index out of range: @{99}");
+    assert_invalid_target_error(&output, "fatal: operation index 99 out of range");
     assert_eq!(
         report.hints,
         vec!["use 'libra op log' to see available operations"]
@@ -703,6 +939,82 @@ async fn test_op_restore_force_allows_dirty_worktree_and_emits_confirmation() {
         .expect("feature branch lookup should succeed")
         .expect("feature branch should still exist after force restore");
     assert_eq!(feature_branch.commit.to_string(), base_commit);
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn undo_restores_current_symbolic_branch_tip_and_preserves_other_refs() {
+    let repo = create_committed_repo_via_cli();
+    let _guard = ChangeDirGuard::new(repo.path());
+    let base_commit = Head::current_commit()
+        .await
+        .expect("base commit")
+        .to_string();
+
+    assert_cli_success(
+        &run_libra_command(&["branch", "feature"], repo.path()),
+        "create feature branch",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "side"], repo.path()),
+        "create side branch",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], repo.path()),
+        "switch to feature",
+    );
+
+    std::fs::write(repo.path().join("tracked.txt"), "tracked\nfeature one\n")
+        .expect("write first feature revision");
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], repo.path()),
+        "stage first feature revision",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "feature one", "--no-verify"], repo.path()),
+        "commit first feature revision",
+    );
+    let first_feature_commit = Head::current_commit()
+        .await
+        .expect("first feature commit")
+        .to_string();
+
+    std::fs::write(repo.path().join("tracked.txt"), "tracked\nfeature two\n")
+        .expect("write second feature revision");
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], repo.path()),
+        "stage second feature revision",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "feature two", "--no-verify"], repo.path()),
+        "commit second feature revision",
+    );
+    let second_feature_op = latest_operation_id(repo.path());
+    assert_ne!(first_feature_commit, base_commit);
+
+    assert_cli_success(
+        &run_libra_command(&["op", "undo", "--force", &second_feature_op], repo.path()),
+        "undo second feature commit",
+    );
+
+    assert_eq!(
+        Head::current_commit()
+            .await
+            .expect("restored feature commit")
+            .to_string(),
+        first_feature_commit
+    );
+    assert!(matches!(
+        Head::current().await,
+        Head::Branch(branch) if branch == "feature"
+    ));
+    for (branch_name, expected) in [("feature", first_feature_commit), ("side", base_commit)] {
+        let branch = Branch::find_branch_result(branch_name, None)
+            .await
+            .expect("branch lookup")
+            .expect("branch exists");
+        assert_eq!(branch.commit.to_string(), expected, "{branch_name} ref");
+    }
 }
 
 #[test]

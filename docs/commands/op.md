@@ -29,6 +29,14 @@ It currently supports three subcommands:
 - A reflog-style index, for example `@{0}` for the newest operation or `@{1}`
   for the previous one
 
+Indices use one newest-first history across retained legacy and operation-v2
+records. V2-only entries such as `external.snapshot`, undo, and redo appear in
+that same history. The `index` in `op log --json` is the zero-based index for
+the complete history; command filters and pagination do not renumber it. Thus
+`op show @{n}` and `op restore @{n}` target the operation displayed at index
+`n`. `op undo`, `op redo`, and `op revert` resolve that same index, but require
+a v2 operation; selecting a legacy-only row reports an unsupported target.
+
 ## `libra op log`
 
 List operation history.
