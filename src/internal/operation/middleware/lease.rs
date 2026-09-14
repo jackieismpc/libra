@@ -141,6 +141,27 @@ impl ScopeLease {
         repo_id: &str,
         shared_repository: Option<&str>,
     ) -> Result<Self, OperationError> {
+        Self::acquire_repository_with_wait(scope, repo_id, shared_repository, false).await
+    }
+
+    /// Acquire the shared-ref lease while waiting for another worktree
+    /// lifecycle operation to finish. Worktree add/remove/prune already
+    /// serialize on Git's worktree registry lock, so concurrent lifecycle
+    /// commands must queue here instead of failing fast before reaching it.
+    pub(crate) async fn acquire_repository_wait(
+        scope: &PinnedRequestScope,
+        repo_id: &str,
+        shared_repository: Option<&str>,
+    ) -> Result<Self, OperationError> {
+        Self::acquire_repository_with_wait(scope, repo_id, shared_repository, true).await
+    }
+
+    async fn acquire_repository_with_wait(
+        scope: &PinnedRequestScope,
+        repo_id: &str,
+        shared_repository: Option<&str>,
+        wait: bool,
+    ) -> Result<Self, OperationError> {
         let permissions = LeaseFilePermissions::from_shared_repository(shared_repository)?;
         let key = format!("{repo_id}:repository");
         let path = scope.storage.join("operation-v2-repository.lock");
@@ -156,8 +177,22 @@ impl ScopeLease {
                 path.display()
             ))
         })??;
-        file.try_lock()
-            .map_err(|error| lock_error(error, &key, &path))?;
+        if wait {
+            loop {
+                match file.try_lock() {
+                    Ok(()) => break,
+                    Err(TryLockError::WouldBlock) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    Err(TryLockError::Error(error)) => {
+                        return Err(storage_error(&format!("lock for {key}"), &path, error));
+                    }
+                }
+            }
+        } else {
+            file.try_lock()
+                .map_err(|error| lock_error(error, &key, &path))?;
+        }
         verify_parent(&parent, &scope.storage)?;
         Ok(Self {
             _file: file,

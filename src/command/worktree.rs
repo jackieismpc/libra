@@ -2306,7 +2306,7 @@ async fn acquire_worktree_ref_lease()
             "core.sharedRepository must be plaintext before changing worktree refs".to_string(),
         ));
     }
-    crate::internal::operation::middleware::ScopeLease::acquire_repository(
+    crate::internal::operation::middleware::ScopeLease::acquire_repository_wait(
         &scope,
         &repo_id,
         shared_repository.as_ref().map(|entry| entry.value.as_str()),
