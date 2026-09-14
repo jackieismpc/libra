@@ -124,7 +124,7 @@ async fn build_revision_with_predecessors(
         None => ChangeRevisionBuilder::for_new_change(database, repo_id, op_id),
     }
     .set_commit_oid(commit_oid);
-    Ok(builder.set_predecessors(predecessors).build().await?)
+    builder.set_predecessors(predecessors).build().await
 }
 
 /// Record a revision using the persisted operation boundary active for this command.
