@@ -5311,7 +5311,35 @@ async fn move_worktree(src: String, dest: String) -> WorktreeResult<WorktreeMove
         return Err(e);
     }
 
-    if let Err(e) = fs::rename(&src_path, &dest_path) {
+    let move_result = fs::rename(&src_path, &dest_path).or_else(|error| {
+        if error.kind() != io::ErrorKind::CrossesDevices {
+            return Err(error);
+        }
+
+        // `rename(2)` cannot cross filesystems. Copy first, then remove the
+        // source only after the destination is complete; this preserves the
+        // worktree if either phase fails.
+        let mut options = fs_extra::dir::CopyOptions::new();
+        options.overwrite = false;
+        options.copy_inside = false;
+        let destination_parent = dest_path.parent().unwrap_or_else(|| Path::new("."));
+        fs_extra::dir::copy(&src_path, destination_parent, &options)
+            .map_err(|copy_error| io::Error::other(copy_error.to_string()))?;
+        let copied_path = destination_parent.join(
+            src_path
+                .file_name()
+                .ok_or_else(|| io::Error::other("worktree source has no directory name"))?,
+        );
+        if copied_path != dest_path {
+            fs::rename(&copied_path, &dest_path)?;
+        }
+        if let Err(remove_error) = fs::remove_dir_all(&src_path) {
+            let _ = fs::remove_dir_all(&dest_path);
+            return Err(remove_error);
+        }
+        Ok(())
+    });
+    if let Err(e) = move_result {
         state.entries[index].path = old_path;
         write_state(&state)?;
         let _ = journal_resolve(&db, journal_id).await;

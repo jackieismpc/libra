@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.22.19"
+version = "0.22.24"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -39,6 +39,7 @@ clap = { version = "4.6.1", features = ["derive"] }
 clap_complete = "4.6.6"
 colored = "3.1.1"
 fastrand = "2.3.0"
+fs_extra = "1.3.0"
 flate2 = "1.1.9"  # add features = ["zlib"] if slow
 tar = "0.4"
 zip = "0.6"
@@ -552,6 +553,11 @@ required-features = ["test-upgrade"]
 [[test]]
 name = "upgrade_publish_contract_test"
 path = "tests/upgrade_publish_contract_test.rs"
+required-features = ["test-upgrade"]
+
+[[test]]
+name = "old_reader_oracle_test"
+path = "tests/old_reader_oracle_test.rs"
 required-features = ["test-upgrade"]
 
 [[test]]

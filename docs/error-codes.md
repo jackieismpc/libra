@@ -92,7 +92,7 @@ structured report is always present.
 | `128` | `LBR-REPO-003` | `repo` | Repository state blocks the operation | no commits yet, detached state mismatch, missing configured remote |
 | `128` | `LBR-WORKTREE-001` | `repo` | Pagination cursor is malformed, foreign, or expired | `libra worktree doctor --cursor <garbage>` |
 | `128` | `LBR-WORKTREE-002` | `repo` | A worktree/workspace scope is corrupt or unreadable, so the diagnosis would be incomplete | `libra worktree doctor` where a `workspace_record` row or the worktree registry cannot be read |
-| `128` | `LBR-CONFIG-001` | `config` | Global config DB schema is newer than this Libra binary supports | `pull`, `push`, `fetch`, `clone`, or `cloud` would otherwise silently ignore global storage config |
+| `128` | `LBR-CONFIG-001` | `config` | Required Global/System config has a future configuration schema or unsupported migration receipt | `pull`, `push`, `fetch`, `clone`, or `cloud` must not silently ignore unsupported defaults; `configuration_schema_versions` is role-scoped and known Repository receipts / valid configuration barriers are accepted |
 | `128` | `LBR-UPGRADE-001` | `config` | Reserved upgrade settings file (`{LIBRA_HOME}/upgrade/settings.json`) is unreadable or corrupt (unsupported `upgrade.*` config spellings are usage errors, `LBR-CLI-002`) | `libra config get --global upgrade.mode` on a hand-edited, non-JSON settings file |
 | `128` | `LBR-CONFLICT-001` | `conflict` | Unresolved conflict is present | merge/rebase conflict still unresolved |
 | `128` | `LBR-CONFLICT-002` | `conflict` | Operation blocked to avoid overwriting state | non-fast-forward, destination exists, dirty worktree, an unsafe v2 restore target/lease/CAS state, or an ambiguous undo/redo/revert transition |
@@ -189,7 +189,7 @@ structured report is always present.
 
 | Stable code | Meaning |
 | --- | --- |
-| `LBR-CONFIG-001` | Global config database schema is newer than this Libra binary supports; update Libra or explicitly use `--offline` / `LIBRA_READ_POLICY=offline|local` when local-only object access is intended. |
+| `LBR-CONFIG-001` | Required Global/System configuration has a future schema or unsupported receipt. Upgrade Libra; never edit SQLite receipts manually. Use `--offline` / `LIBRA_READ_POLICY=offline|local` only for intentional local-only object access, not remote synchronization. Existing JSON fields remain stable; `config_scope`, `schema_ledger`, and `schema_reason` identify the issue without values or untrusted receipt names. |
 | `LBR-UPGRADE-001` | The reserved upgrade settings file (`{LIBRA_HOME}/upgrade/settings.json`) is unreadable or corrupt; rewrite it with `libra config set --global upgrade.mode <auto\|manual\|off>`. Unsupported `upgrade.*` config spellings are usage errors (`LBR-CLI-002`). |
 
 ### Conflict

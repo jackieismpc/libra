@@ -21,6 +21,27 @@ use tempfile::tempdir;
 use super::*;
 
 #[test]
+fn test_worktree_move_cross_device_error_is_portable() {
+    let source = include_str!("../../src/command/worktree.rs");
+    let compact: String = source.split_whitespace().collect();
+    assert!(compact.contains("error.kind()!=io::ErrorKind::CrossesDevices"));
+    assert!(!source.contains("libc::EXDEV"));
+    #[cfg(unix)]
+    let raw_error = libc::EXDEV;
+    #[cfg(windows)]
+    let raw_error = 17; // Windows ERROR_NOT_SAME_DEVICE.
+    #[cfg(any(unix, windows))]
+    assert_eq!(
+        std::io::Error::from_raw_os_error(raw_error).kind(),
+        std::io::ErrorKind::CrossesDevices
+    );
+    assert_ne!(
+        std::io::Error::from(std::io::ErrorKind::PermissionDenied).kind(),
+        std::io::ErrorKind::CrossesDevices
+    );
+}
+
+#[test]
 fn test_worktree_cli_outside_repository_returns_fatal_128() {
     let temp = tempdir().unwrap();
     let output = run_libra_command(&["worktree", "list"], temp.path());
@@ -1217,7 +1238,7 @@ async fn test_worktree_add_rolls_back_populated_files_when_state_save_fails() {
 #[cfg(unix)]
 #[tokio::test]
 #[serial(cwd)]
-/// Cross-filesystem moves should fail cleanly and keep registry/state unchanged when test env provides separate devices.
+/// Cross-filesystem moves should complete through the copy fallback when test env provides separate devices.
 async fn test_worktree_move_across_filesystems_rolls_back_when_supported() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -1242,24 +1263,26 @@ async fn test_worktree_move_across_filesystems_rolls_back_when_supported() {
 
     let dest_path = other_fs_dir.path().join("wt_cross_dest");
     let dest_str = dest_path.to_string_lossy().to_string();
-    let before_paths = worktree_paths();
-
     exec_worktree(&["move", "wt_cross_src", dest_str.as_str()])
         .await
-        .expect("worktree move command itself should not fail");
+        .expect("worktree move command should complete across filesystems");
 
     let after_paths = worktree_paths();
     assert_eq!(
-        before_paths, after_paths,
-        "failed cross-filesystem move should keep worktree registry unchanged"
+        vec![
+            repo_dir.path().to_string_lossy().to_string(),
+            dest_path.to_string_lossy().to_string(),
+        ],
+        after_paths,
+        "cross-filesystem move should update the worktree registry"
     );
     assert!(
-        src_path.exists(),
-        "source directory should remain after failed cross-filesystem move"
+        !src_path.exists(),
+        "source directory should be removed after a successful cross-filesystem move"
     );
     assert!(
-        !dest_path.exists(),
-        "destination directory should not be created by failed cross-filesystem move"
+        dest_path.exists(),
+        "destination directory should exist after a successful cross-filesystem move"
     );
 }
 

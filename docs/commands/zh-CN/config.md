@@ -45,6 +45,16 @@ libra config --rename-section <old-name> <new-name>
 
 **与 Git 的有意差异**：对**受保护 key**——即 Libra 判定为机密的 key（`vault.env.*`、`auth.token.*`、`*.privkey`，或末段包含 `secret`、`token`、`password`、`credential`、`apikey`、`accesskey`、`privatekey`、`secretkey`）——裸读形式保留 Libra 的交互式安全赋值路径：它会**无回显地提示输入新值**，而不是打印已存储的值。没有终端时报 `missing value for protected key '<key>' (non-interactive environment)` 并以 2 退出。要读取受保护 key 请用 `libra config get <key>`，它返回 `<REDACTED>`。该差异已登记在 `COMPATIBILITY.md`。
 
+## 配置 schema 兼容性
+
+GlobalConfig 与 SystemConfig 使用独立的配置 ledger `configuration_schema_versions`。当前 manifest 已知的 Repository-only receipt（包括 `2026090801`）不会使配置库被误判为 future。未知或名称不匹配的 receipt、真正的配置 future schema 仍不受支持；remote/cloud 命令需要该作用域时，以 `LBR-CONFIG-001` fail-closed。
+
+显式的 global/system 配置修改会把 configuration-owned legacy-reader barrier 与配置数据放在同一个事务内。该标记是 legacy ledger 中的保留 receipt，使固定旧版 `0.22.16` 等旧 binary 在写入前拒绝此库；本 build 只有在精确匹配标记且存在有效 configuration base receipt 时才承认它。事务失败时，标记和本次配置修改一起回滚，原有 legacy receipt 不会被覆盖或删除。
+
+scoped get/list、默认值级联与 remote preflight 不写入 barrier；配置级联以只读方式查询，不创建缺失的库。此兼容性迁移只能前滚，旧 binary 必须升级；禁止通过删除 receipt 或手工编辑 SQLite 强行降级。识别受支持的 Repository receipt 不等于允许自动 repair；本版本对未知／不支持的状态仅提供升级路径。
+
+全局路径为 `LIBRA_CONFIG_GLOBAL_DB` 或 `~/.libra/config.db`，系统路径为 `LIBRA_CONFIG_SYSTEM_DB` 或 `/etc/libra/config.db`。完整的进程环境／repo-local 存储配置可以证明无需 GlobalConfig，但不能绕过 remote/cloud 对 SystemConfig 默认值的兼容性检查。只有在明确需要本地对象访问时才使用 `--offline` 或 `LIBRA_READ_POLICY=offline|local`，不能借此绕过远端同步安全检查。
+
 ## 选项
 
 ### 子命令

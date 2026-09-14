@@ -1,4 +1,12 @@
 test_fn	lane	reason
+config_cascade_uses_explicit_role	lane:cwd+env	uses isolated global/system configuration paths and cwd to prove read-only role routing
+global_config_create_uses_global_role	lane:env	uses the shared configuration fixture and validates global writer cache isolation
+system_config_create_uses_system_role	lane:env	uses the shared configuration fixture and validates system writer cache isolation
+configuration_ledger_has_independent_version_namespace	lane:env	uses the shared config database fixture to isolate process configuration paths
+global_and_system_bootstrap_create_no_repository_shape	lane:env	uses the shared config database fixture to isolate process configuration paths
+repository_only_upgrade_preserves_config_receipt_and_values	lane:env	uses isolated global/system paths to prove repository upgrades preserve ambient configuration
+role_schema_up_fault_rolls_back_ledger	lane:env	injects schema failures only in databases owned by the shared config fixture
+role_scoped_schema_writer_keeps_ledgers_disjoint	lane:env	uses the shared config database fixture for the absent/old/current/future role matrix
 <site:tests/code_ui_remote_approval_matrix.rs:macro:approval_case#1>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
 <site:tests/code_ui_remote_generation_matrix.rs:macro:generation_case#1>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
 <site:tests/code_ui_remote_lease_matrix.rs:macro:lease_case#1>	global	mutates process-wide environment (set_var/remove_var), or is an attribute inside a macro_rules! body that cannot be attributed to one function; fail-closed
@@ -51,6 +59,10 @@ commit_create_refuses_on_head_drift	lane:cloud_live+cwd+env+hash_kind+workspace_
 commit_create_waits_for_a_deletion_phase_before_publishing	lane:cloud_live+cwd+env+hash_kind+workspace_failpoints	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03 to the FULL named key set — an unkeyed #[serial] locks only the empty-string key, so global exclusion strength requires every resource key: cloud_live+cwd+env+hash_kind+workspace_failpoints
 config_bare_read_encrypted_is_redacted	lane:env	mutates or depends on the process environment (set_var/remove_var/EnvVarGuard, or spawns without env_clear so children inherit the racing env — directly or via an expanded helper)
 config_bare_read_protected_key_interactive_pty	lane:cloud_live+cwd+env+hash_kind+workspace_failpoints	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03 to the FULL named key set — an unkeyed #[serial] locks only the empty-string key, so global exclusion strength requires every resource key: cloud_live+cwd+env+hash_kind+workspace_failpoints
+config_db_fixture_creates_sqlite_only_beneath_its_root	lane:env	mutates config-path environment through the shared scoped fixture
+config_db_fixture_restores_caller_values_after_drop_and_early_return	lane:env	mutates config-path environment through the shared scoped fixture
+config_db_fixture_restores_caller_values_after_panic	lane:env	mutates config-path environment through the shared scoped fixture
+config_scope_uses_isolated_db	lane:cwd+env	mutates config-path environment and changes the process working directory through scoped guards
 content_hash_format_and_recompute	lane:cloud_live+cwd+env+hash_kind+workspace_failpoints	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03 to the FULL named key set — an unkeyed #[serial] locks only the empty-string key, so global exclusion strength requires every resource key: cloud_live+cwd+env+hash_kind+workspace_failpoints
 d1_batch	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests
 d1_connection	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests
@@ -284,10 +296,10 @@ test_clean_requires_flag	lane:cwd	changes the process working directory (ChangeD
 test_clean_x_and_x_together_returns_error	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_clean_x_flag_removes_ignored_files	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_clean_x_flag_removes_only_ignored_files	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_cli_config_global_without_repo	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_cli_config_list_global_without_repo	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_cli_config_global_without_repo	lane:cwd+env	mutates config-path environment and changes the process working directory through scoped guards
+test_cli_config_list_global_without_repo	lane:cwd+env	mutates config-path environment and changes the process working directory through scoped guards
 test_cli_config_local_requires_repo	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_cli_config_system_read_write	lane:env+cwd	mutates or depends on the process environment (set_var/remove_var/EnvVarGuard, or spawns without env_clear so children inherit the racing env — directly or via an expanded helper); changes or depends on the process working directory (ChangeDirGuard/set_current_dir, or cwd-resolved APIs like ConfigKv/Head::current_commit, directly or via an expanded helper)
+test_cli_config_system_read_write	lane:cwd+env	mutates or depends on the process environment (set_var/remove_var/EnvVarGuard, or spawns without env_clear so children inherit the racing env — directly or via an expanded helper); changes or depends on the process working directory (ChangeDirGuard/set_current_dir, or cwd-resolved APIs like ConfigKv/Head::current_commit, directly or via an expanded helper)
 test_clone_bare_repository	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_clone_branch	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_clone_branch_single_branch	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -330,8 +342,8 @@ test_config_generate_ssh_key_rejects_unknown_remote_with_invalid_target_code	lan
 test_config_generate_ssh_key_replaces_vault_generate_ssh_key_flow	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_get	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_get_all	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_config_get_all_with_default	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_config_get_cascaded_global_read_failure_returns_error	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_config_get_all_with_default	lane:cwd+env	mutates config-path environment and changes the process working directory through scoped guards
+test_config_get_cascaded_global_read_failure_returns_error	lane:cwd+env	mutates config-path environment and changes the process working directory through scoped guards
 test_config_get_failed	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_get_reveal_decrypt_failure_returns_error	lane:env+cwd	mutates or depends on the process environment (set_var/remove_var/EnvVarGuard, or spawns without env_clear so children inherit the racing env — directly or via an expanded helper); changes or depends on the process working directory (ChangeDirGuard/set_current_dir, or cwd-resolved APIs like ConfigKv/Head::current_commit, directly or via an expanded helper)
 test_config_get_with_default	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -346,19 +358,19 @@ test_config_null_terminated_output	lane:cwd	changes the process working director
 test_config_remove_and_rename_section	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_rename_section_preserves_multivalue_order	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_scope_explicit_local	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_config_scope_global	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_config_scope_isolation	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_config_scope_global	lane:cwd+env	mutates config-path environment and changes the process working directory through scoped guards
+test_config_scope_isolation	lane:cwd+env	mutates config-path environment and changes the process working directory through scoped guards
 test_config_scope_local_default	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_scope_path_logic	lane:env+cloud_live+cwd+hash_kind+workspace_failpoints	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03 to the FULL named key set — an unkeyed #[serial] locks only the empty-string key, so global exclusion strength requires every resource key: cloud_live+cwd+env+hash_kind+workspace_failpoints
-test_config_scope_system_errors	lane:env+cwd	mutates or depends on the process environment (set_var/remove_var/EnvVarGuard, or spawns without env_clear so children inherit the racing env — directly or via an expanded helper); changes or depends on the process working directory (ChangeDirGuard/set_current_dir, or cwd-resolved APIs like ConfigKv/Head::current_commit, directly or via an expanded helper)
+test_config_scope_system_errors	lane:cwd+env	mutates or depends on the process environment (set_var/remove_var/EnvVarGuard, or spawns without env_clear so children inherit the racing env — directly or via an expanded helper); changes or depends on the process working directory (ChangeDirGuard/set_current_dir, or cwd-resolved APIs like ConfigKv/Head::current_commit, directly or via an expanded helper)
 test_config_section_ops_exact_git_semantics	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_set_encrypt_plaintext_mutex_is_command_usage_error	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_set_missing_value_uses_protected_input_when_existing_key_is_encrypted	lane:env+cwd	mutates or depends on the process environment (set_var/remove_var/EnvVarGuard, or spawns without env_clear so children inherit the racing env — directly or via an expanded helper); changes or depends on the process working directory (ChangeDirGuard/set_current_dir, or cwd-resolved APIs like ConfigKv/Head::current_commit, directly or via an expanded helper)
 test_config_set_plaintext_on_vault_internal_key_is_failure	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_set_read_failure_does_not_silently_skip_existing_state_check	lane:env+cwd	mutates or depends on the process environment (set_var/remove_var/EnvVarGuard, or spawns without env_clear so children inherit the racing env — directly or via an expanded helper); changes or depends on the process working directory (ChangeDirGuard/set_current_dir, or cwd-resolved APIs like ConfigKv/Head::current_commit, directly or via an expanded helper)
 test_config_set_stdin_with_positional_value_is_command_usage_error	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_config_system_rejected_vault_write_does_not_create_db	lane:env+cwd	mutates or depends on the process environment (set_var/remove_var/EnvVarGuard, or spawns without env_clear so children inherit the racing env — directly or via an expanded helper); changes or depends on the process working directory (ChangeDirGuard/set_current_dir, or cwd-resolved APIs like ConfigKv/Head::current_commit, directly or via an expanded helper)
-test_config_system_rename_into_vault_namespace_rejected	lane:env+cwd	mutates or depends on the process environment (set_var/remove_var/EnvVarGuard, or spawns without env_clear so children inherit the racing env — directly or via an expanded helper); changes or depends on the process working directory (ChangeDirGuard/set_current_dir, or cwd-resolved APIs like ConfigKv/Head::current_commit, directly or via an expanded helper)
+test_config_system_rejected_vault_write_does_not_create_db	lane:cwd+env	mutates or depends on the process environment (set_var/remove_var/EnvVarGuard, or spawns without env_clear so children inherit the racing env — directly or via an expanded helper); changes or depends on the process working directory (ChangeDirGuard/set_current_dir, or cwd-resolved APIs like ConfigKv/Head::current_commit, directly or via an expanded helper)
+test_config_system_rename_into_vault_namespace_rejected	lane:cwd+env	mutates or depends on the process environment (set_var/remove_var/EnvVarGuard, or spawns without env_clear so children inherit the racing env — directly or via an expanded helper); changes or depends on the process working directory (ChangeDirGuard/set_current_dir, or cwd-resolved APIs like ConfigKv/Head::current_commit, directly or via an expanded helper)
 test_config_system_scope_roundtrip_and_vault_rejection	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_system_set_rejected_when_existing_row_is_encrypted	lane:env+cwd	mutates or depends on the process environment (set_var/remove_var/EnvVarGuard, or spawns without env_clear so children inherit the racing env — directly or via an expanded helper); changes or depends on the process working directory (ChangeDirGuard/set_current_dir, or cwd-resolved APIs like ConfigKv/Head::current_commit, directly or via an expanded helper)
 test_config_typed_get	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)

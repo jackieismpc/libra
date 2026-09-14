@@ -2227,30 +2227,34 @@ fn apply_global_runtime_flags(args: &Cli) -> CliResult<()> {
 }
 
 async fn enforce_global_config_schema_policy(command: &Commands) -> CliResult<()> {
-    let Some(future) = utils::client_storage::inspect_global_config_schema_future().await else {
+    let issues = utils::client_storage::inspect_configuration_schema_issues().await;
+    let Some(first_issue) = issues.first() else {
         return Ok(());
     };
 
     if utils::read_policy::read_policy() == utils::read_policy::ReadPolicy::LocalOnly {
         utils::client_storage::emit_global_config_schema_future_warning(
-            &future,
-            "--offline or LIBRA_READ_POLICY=offline/local requested; ignoring global storage config and continuing with local storage",
+            first_issue,
+            "--offline or LIBRA_READ_POLICY=offline/local requested; ignoring unsupported config defaults and continuing with local storage",
         );
         return Ok(());
     }
 
-    if command_requires_global_storage_config(command)
-        && command_may_read_global_config(command).await
-    {
-        return Err(global_config_schema_future_error(command, &future));
+    if command_requires_global_storage_config(command) {
+        let may_read_global = command_may_read_global_config(command).await;
+        if let Some(issue) = issues.iter().find(|issue| {
+            issue.issue.role == crate::internal::db::DatabaseRole::SystemConfig || may_read_global
+        }) {
+            return Err(global_config_schema_future_error(command, issue));
+        }
     }
 
     let action = if command_requires_global_storage_config(command) {
         "process or repo-local configuration makes global storage config unnecessary; ignoring global config and continuing"
     } else {
-        "command does not require global storage config; ignoring global config and continuing"
+        "command does not require remote config defaults; ignoring unsupported config and continuing"
     };
-    utils::client_storage::emit_global_config_schema_future_warning(&future, action);
+    utils::client_storage::emit_global_config_schema_future_warning(first_issue, action);
     Ok(())
 }
 
@@ -2295,8 +2299,13 @@ fn global_config_schema_future_error(
     future: &utils::client_storage::GlobalConfigSchemaFuture,
 ) -> CliError {
     let command_name = command_name(command);
+    let required_config = if future.scope_name() == "global" {
+        "global storage config"
+    } else {
+        "system config"
+    };
     CliError::fatal(future.diagnostic_message(&format!(
-        "`libra {command_name}` requires global storage config to be trusted and was stopped before using local fallback"
+        "`libra {command_name}` requires {required_config} to be trusted and was stopped before using local fallback"
     )))
     .with_stable_code(utils::error::StableErrorCode::ConfigSchemaFuture)
     .with_hint(format!(
@@ -2312,6 +2321,9 @@ fn global_config_schema_future_error(
     .with_detail("binary_version", env!("CARGO_PKG_VERSION"))
     .with_detail("config_database", future.db_path.display().to_string())
     .with_detail("config_schema_version", future.current_version)
+    .with_detail("config_scope", future.scope_name())
+    .with_detail("schema_ledger", future.issue.ledger.table_name())
+    .with_detail("schema_reason", future.issue.reason())
     .with_detail(
         "latest_supported_schema_version",
         future.latest_supported_display(),

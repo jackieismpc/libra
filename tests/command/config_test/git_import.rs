@@ -16,19 +16,10 @@ pub(super) async fn import_global_from_git_fixture() {
             let temp_dir = tempdir().unwrap();
             let _guard = test::ChangeDirGuard::new(temp_dir.path());
 
-            let global_db_dir = tempdir().unwrap();
-            let _scoped =
-                ScopedConfigPathGuard::new(&global_db_dir.path().join("global_config_import.db"));
-
-            let fake_home = tempdir().unwrap();
-            let _home_guard = EnvVarGuard::set("HOME", fake_home.path().as_os_str());
-            let _xdg_guard = EnvVarGuard::set(
-                "XDG_CONFIG_HOME",
-                fake_home.path().join(".config").as_os_str(),
-            );
+            let config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
             let _git_global_guard = EnvVarGuard::set(
                 "GIT_CONFIG_GLOBAL",
-                fake_home.path().join(".gitconfig").as_os_str(),
+                config_fixture.home().join(".gitconfig").as_os_str(),
             );
 
             let set_name = Command::new("git")

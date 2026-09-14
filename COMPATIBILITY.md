@@ -84,24 +84,39 @@ behind after a partial multi-path restore.
 
 ## Cross-command global config schema behavior
 
-Remote/cloud commands that may rely on global tiered-storage configuration
-(`clone`, `fetch`, `pull`, `push`, and `cloud`) fail closed with
-`LBR-CONFIG-001` when `~/.libra/config.db` (or `LIBRA_CONFIG_GLOBAL_DB`) has a
-schema version newer than this Libra binary supports. This prevents an older
-binary from silently ignoring global storage config and falling back to local
-objects. `--offline` and `LIBRA_READ_POLICY=offline|local` are the explicit
-local-only escape hatch and emit a warning instead. If process environment or
-repo-local `vault.env.LIBRA_STORAGE_*` entries fully supply the values that
-storage initialization would query, the global config DB is unnecessary and the
-command continues with a warning rather than `LBR-CONFIG-001`. The
-compatibility guard is pinned by `compat_global_config_schema_future`.
+Remote/cloud commands (`clone`, `fetch`, `pull`, `push`, and `cloud`) inspect
+GlobalConfig and SystemConfig metadata read-only before trusting defaults.
+`configuration_schema_versions` is independent of the Repository ledger:
+known Repository-only receipts, including `2026090801`, do not make Config
+future. A true Config future or an unregistered/mismatched receipt fails closed
+with `LBR-CONFIG-001` when the command requires that scope. Diagnostics preserve
+the existing version/path fields and add `config_scope`, `schema_ledger`, and
+`schema_reason`, without config values or untrusted receipt names.
+
+Explicit Global/System mutations append a configuration-owned legacy-reader
+barrier to `schema_versions` in the same transaction as the setting mutation.
+The current build recognizes its exact marker plus the valid configuration
+base receipt; v0.22.16 refuses it before writing. Readers, constructors and
+preflight do not write the marker; existing legacy receipts are preserved.
+This is forward-only: upgrade the binary, never manually edit SQLite receipts.
+Support for a legacy receipt does not authorize repair.
+
+`--offline` and `LIBRA_READ_POLICY=offline|local` intentionally allow local-only
+object access with a warning, not remote synchronization. Complete process or
+repo-local `vault.env.LIBRA_STORAGE_*` values can make Global storage config
+unnecessary (`cloud` also needs D1 values); this never bypasses System future
+defaults. Unreadable System stores retain their existing skip behavior, while
+an unsupported System schema blocks remote dispatch. The policy is pinned by
+`compat_global_config_schema_future` and the opt-in `old_reader_oracle_test`.
 
 ## Current-branch operation-v2 convergence (unreleased)
 
-The `2026090801` convergence migration is implemented in this unreleased branch
-and has passed focused migration validation, including a controlled old-binary
-repository upgrade. Capture hardening and full integration/release acceptance
-remain pending. The forward-only transition must preserve the original `2026090101`/`2026090601`
+The historical heading and linked implementation notes describe the original
+unreleased validation phase. The current Repository manifest supports
+`2026090801`, shipped in v0.22.19; this support does not attest arbitrary legacy
+configuration files for repair. The original focused validation included a
+controlled old-binary repository upgrade, with broader capture/integration
+acceptance tracked separately. The forward-only transition must preserve the original `2026090101`/`2026090601`
 receipts, legacy operation data, and #472 configuration preservation. After
 the barrier commits, binaries supporting schemas only through `2026090601`
 must refuse the newer repository schema; a consistent pre-upgrade backup is

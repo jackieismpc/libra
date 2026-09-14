@@ -196,6 +196,81 @@ impl Drop for ScopedEnvVar {
     }
 }
 
+/// Process-environment sandbox for tests that can open global or system config.
+///
+/// The fixture owns its temporary root instead of accepting a caller-provided
+/// path, so ambient user and system configuration paths cannot be selected by
+/// mistake. Callers must use the `serial(env)` lane because environment
+/// variables are process-global.
+pub struct ConfigDbFixture {
+    // Drop the guards before TempDir removes the paths they reference.
+    _env: [ScopedEnvVar; 5],
+    home: PathBuf,
+    xdg_config_home: PathBuf,
+    global_db: PathBuf,
+    system_db: PathBuf,
+    root: tempfile::TempDir,
+}
+
+impl ConfigDbFixture {
+    pub fn new() -> std::io::Result<Self> {
+        let root = tempfile::tempdir()?;
+        let home = root.path().join("home");
+        let xdg_config_home = root.path().join("xdg");
+        let global_db = root.path().join("global").join("config.db");
+        let system_db = root.path().join("system").join("config.db");
+        fs::create_dir_all(&home)?;
+        fs::create_dir_all(&xdg_config_home)?;
+        if let Some(parent) = global_db.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if let Some(parent) = system_db.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let env = [
+            ScopedEnvVar::set("LIBRA_CONFIG_GLOBAL_DB", &global_db),
+            ScopedEnvVar::set("LIBRA_CONFIG_SYSTEM_DB", &system_db),
+            ScopedEnvVar::set("HOME", &home),
+            ScopedEnvVar::set("USERPROFILE", &home),
+            ScopedEnvVar::set("XDG_CONFIG_HOME", &xdg_config_home),
+        ];
+
+        Ok(Self {
+            _env: env,
+            home,
+            xdg_config_home,
+            global_db,
+            system_db,
+            root,
+        })
+    }
+
+    pub fn root(&self) -> &Path {
+        self.root.path()
+    }
+
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+
+    pub fn xdg_config_home(&self) -> &Path {
+        &self.xdg_config_home
+    }
+
+    pub fn global_db(&self) -> &Path {
+        &self.global_db
+    }
+
+    pub fn system_db(&self) -> &Path {
+        &self.system_db
+    }
+
+    pub fn contains(&self, path: impl AsRef<Path>) -> bool {
+        path.as_ref().starts_with(self.root())
+    }
+}
+
 pub struct ChangeDirGuard {
     old_dir: PathBuf,
     _cwd_lock: CwdLockGuard,

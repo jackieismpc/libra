@@ -1184,6 +1184,11 @@ async fn apply_down_migration(
 /// `establish_connection`) makes it trivial to test the wiring against an
 /// isolated runner.
 pub fn builtin_migrations() -> Vec<Migration> {
+    super::schema::migrations_for_role(super::DatabaseRole::Repository)
+}
+
+/// Historical repository namespace, consumed only by the role manifest.
+pub(crate) fn repository_migrations() -> Vec<Migration> {
     vec![
         sql_migration(
             2026050301,
@@ -2027,14 +2032,17 @@ pub fn builtin_runner() -> Result<MigrationRunner, MigrationError> {
 
 /// Highest schema version this Libra build knows how to create.
 pub fn latest_builtin_schema_version() -> Result<Option<i64>, MigrationError> {
-    Ok(builtin_runner()?.max_registered_version())
+    super::schema::latest_schema_version_for_role(super::DatabaseRole::Repository)
+        .map_err(|error| MigrationError::Other(error.into()))
 }
 
 /// Read the current built-in schema version without mutating the database.
 pub async fn current_builtin_schema_version_readonly(
     conn: &DatabaseConnection,
 ) -> Result<Option<i64>, MigrationError> {
-    builtin_runner()?.current_version_readonly(conn).await
+    super::schema::current_schema_version_for_role(conn, super::DatabaseRole::Repository)
+        .await
+        .map_err(|error| MigrationError::Other(error.into()))
 }
 
 /// The later of the two sequencer re-key migrations. A database at or past it
@@ -2176,8 +2184,18 @@ pub async fn run_builtin_migrations(conn: &DatabaseConnection) -> Result<Vec<i64
         .await
         .with_context(|| "failed to read the current schema version")?;
     if applied.unwrap_or(0) < BISECT_STATE_SCOPE_MIGRATION {
-        normalize_rebase_state_shape(conn).await?;
-        normalize_bisect_state_shape(conn).await?;
+        for top_up in super::schema::top_ups_for_role(super::DatabaseRole::Repository) {
+            match top_up {
+                super::schema::SchemaTopUp::RebaseShape => {
+                    normalize_rebase_state_shape(conn).await?
+                }
+                super::schema::SchemaTopUp::BisectShape => {
+                    normalize_bisect_state_shape(conn).await?
+                }
+                // The DB bootstrap layer owns the other top-ups.
+                _ => {}
+            }
+        }
     }
     runner
         .run_pending(conn)

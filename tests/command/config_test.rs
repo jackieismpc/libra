@@ -13,6 +13,121 @@ use super::*;
 
 mod git_import;
 
+async fn assert_configuration_role_writer(scope: config::ConfigScope, flag: &str) {
+    use libra::internal::{
+        config::ConfigKv,
+        db::{DatabaseRole, schema::latest_schema_version_for_role},
+    };
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let fixture = ConfigDbFixture::new().expect("isolate configuration paths");
+    let role = scope.database_role();
+    assert_eq!(
+        role,
+        if scope == config::ConfigScope::Global {
+            DatabaseRole::GlobalConfig
+        } else {
+            DatabaseRole::SystemConfig
+        }
+    );
+    let path = scope.get_config_path().expect("scoped path");
+    assert!(fixture.contains(&path));
+    assert!(!path.exists());
+    exec_config(vec!["config", "set", flag, "test.role", "preserved"])
+        .await
+        .expect("create through actual scoped command");
+    scope
+        .ensure_config_exists()
+        .await
+        .expect("idempotent ensure");
+    let conn = config::ScopedConfig::get_connection(scope)
+        .await
+        .expect("cached writer");
+    let tables: Vec<String> = conn.query_all_raw(Statement::from_string(conn.get_database_backend(),
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"))
+        .await.expect("inspect table names").into_iter().map(|row| row.try_get_by_index(0).expect("table name")).collect();
+    assert_eq!(
+        tables,
+        [
+            "config",
+            "config_kv",
+            "configuration_schema_versions",
+            "schema_versions"
+        ]
+    );
+    config::ScopedConfig::set(scope, "test.cached", "yes", false)
+        .await
+        .expect("cached write");
+    let configuration_future = latest_schema_version_for_role(role)
+        .expect("config manifest")
+        .expect("config latest")
+        + 1;
+    let repository_future = latest_schema_version_for_role(DatabaseRole::Repository)
+        .expect("repo manifest")
+        .expect("repo latest")
+        + 1;
+    for (table, future) in [
+        ("configuration_schema_versions", configuration_future),
+        ("schema_versions", repository_future),
+    ] {
+        if table == "schema_versions" {
+            conn.execute_unprepared("CREATE TABLE IF NOT EXISTS schema_versions (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)")
+                .await.expect("legacy ledger fixture");
+        }
+        conn.execute_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            format!("INSERT INTO {table} VALUES (?, 'future', 'fixture')"),
+            [future.into()],
+        ))
+        .await
+        .expect("inject future receipt");
+        let before = std::fs::read(&path).expect("snapshot before rejection");
+        let error = config::ScopedConfig::set(scope, "test.role", "must-not-write", false)
+            .await
+            .expect_err("cache hits must revalidate both future fences");
+        assert!(
+            error.contains(if table == "schema_versions" {
+                "unsupported"
+            } else {
+                "newer"
+            }),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("snapshot after rejection"),
+            before
+        );
+        assert_eq!(
+            ConfigKv::get_with_conn(&conn, "test.role")
+                .await
+                .expect("read fixture value")
+                .expect("preserved row")
+                .value,
+            "preserved"
+        );
+        conn.execute_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            format!("DELETE FROM {table} WHERE version = ?"),
+            [future.into()],
+        ))
+        .await
+        .expect("restore fixture receipt");
+    }
+    conn.close().await.expect("close fixture writer");
+}
+
+#[tokio::test]
+#[serial(env)]
+async fn global_config_create_uses_global_role() {
+    assert_configuration_role_writer(config::ConfigScope::Global, "--global").await;
+}
+
+#[tokio::test]
+#[serial(env)]
+async fn system_config_create_uses_system_role() {
+    assert_configuration_role_writer(config::ConfigScope::System, "--system").await;
+}
+
 /// Guard for temporarily setting an environment variable during a test and restoring it on drop.
 ///
 /// # Safety
@@ -33,13 +148,12 @@ async fn exec_config(args: Vec<&str>) -> CliResult<()> {
 }
 
 #[tokio::test]
-#[serial(cwd)]
+#[serial(env, cwd)]
 async fn test_cli_config_global_without_repo() {
     let temp_dir = tempdir().unwrap();
     let _guard = test::ChangeDirGuard::new(temp_dir.path());
 
-    let global_db_dir = tempdir().unwrap();
-    let _scoped = ScopedConfigPathGuard::new(&global_db_dir.path().join("global_config_cli.db"));
+    let _config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
 
     let result = exec_config(vec!["config", "--global", "user.name", "cli_global_user"]).await;
     assert!(result.is_ok());
@@ -49,14 +163,12 @@ async fn test_cli_config_global_without_repo() {
 }
 
 #[tokio::test]
-#[serial(cwd)]
+#[serial(env, cwd)]
 async fn test_cli_config_list_global_without_repo() {
     let temp_dir = tempdir().unwrap();
     let _guard = test::ChangeDirGuard::new(temp_dir.path());
 
-    let global_db_dir = tempdir().unwrap();
-    let _scoped =
-        ScopedConfigPathGuard::new(&global_db_dir.path().join("global_config_cli_list.db"));
+    let _config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
 
     let result = exec_config(vec!["config", "--list", "--global"]).await;
     assert!(result.is_ok());
@@ -68,15 +180,7 @@ async fn test_cli_config_system_read_write() {
     let temp_dir = tempdir().unwrap();
     let _guard = test::ChangeDirGuard::new(temp_dir.path());
 
-    // Point the system scope at a temp DB so the test never touches /etc/libra.
-    let system_db_dir = tempdir().unwrap();
-    let _system = EnvVarGuard::set(
-        "LIBRA_CONFIG_SYSTEM_DB",
-        system_db_dir
-            .path()
-            .join("system_config_cli.db")
-            .as_os_str(),
-    );
+    let _config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
 
     // --system writes and reads back (no repository required, like --global).
     let result = exec_config(vec!["config", "--system", "user.name", "cli_system_user"]).await;
@@ -87,6 +191,33 @@ async fn test_cli_config_system_read_write() {
 
     let list_result = exec_config(vec!["config", "--list", "--system"]).await;
     assert!(list_result.is_ok(), "--system --list should succeed");
+}
+
+#[tokio::test]
+#[serial(env, cwd)]
+async fn config_scope_uses_isolated_db() {
+    let cwd = tempdir().expect("create command cwd");
+    let _cwd = test::ChangeDirGuard::new(cwd.path());
+    let config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
+
+    assert!(!config_fixture.global_db().exists());
+    assert!(!config_fixture.system_db().exists());
+
+    exec_config(vec!["config", "--global", "test.fixture", "global"])
+        .await
+        .expect("write isolated global config");
+    exec_config(vec!["config", "--system", "test.fixture", "system"])
+        .await
+        .expect("write isolated system config");
+
+    for path in [config_fixture.global_db(), config_fixture.system_db()] {
+        assert!(path.is_file(), "expected SQLite file at {}", path.display());
+        assert!(
+            config_fixture.contains(path),
+            "config DB escaped fixture root: {}",
+            path.display()
+        );
+    }
 }
 
 #[tokio::test]
@@ -312,20 +443,6 @@ impl Drop for EnvVarGuard {
     }
 }
 
-/// Sets `LIBRA_CONFIG_GLOBAL_DB` to point at a temp file for isolation.
-///
-/// This prevents tests from touching real host paths like `~/.libra/config.db`.
-struct ScopedConfigPathGuard {
-    _global: EnvVarGuard,
-}
-
-impl ScopedConfigPathGuard {
-    fn new(global_db_path: &std::path::Path) -> Self {
-        let _global = EnvVarGuard::set("LIBRA_CONFIG_GLOBAL_DB", global_db_path.as_os_str());
-        Self { _global }
-    }
-}
-
 #[tokio::test]
 #[serial(cwd)]
 async fn test_config_get_failed() {
@@ -366,15 +483,10 @@ async fn test_config_get_all() {
 }
 
 #[tokio::test]
-#[serial(cwd)]
+#[serial(env, cwd)]
 async fn test_config_get_all_with_default() {
     let temp_path = tempdir().unwrap();
-    let global_db_dir = tempdir().unwrap();
-    let _scoped = ScopedConfigPathGuard::new(
-        &global_db_dir
-            .path()
-            .join("global_config_get_all_default.db"),
-    );
+    let _config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
 
     // start a new libra repository in a temporary directory
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -491,15 +603,13 @@ async fn test_config_scope_local_default() {
 }
 
 #[tokio::test]
-#[serial(cwd)]
+#[serial(env, cwd)]
 async fn test_config_scope_global() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
     let _guard = test::ChangeDirGuard::new(temp_path.path());
 
-    // Isolate global DB paths to temp files (no host pollution).
-    let global_db_dir = tempdir().unwrap();
-    let _scoped = ScopedConfigPathGuard::new(&global_db_dir.path().join("global_config.db"));
+    let _config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
 
     // Set a value in global scope
     let result = exec_config(vec![
@@ -535,12 +645,7 @@ async fn test_config_scope_system_errors() {
     test::setup_with_new_libra_in(temp_path.path()).await;
     let _guard = test::ChangeDirGuard::new(temp_path.path());
 
-    // Redirect the system scope to a temp DB so nothing touches /etc/libra.
-    let system_db_dir = tempdir().unwrap();
-    let _system = EnvVarGuard::set(
-        "LIBRA_CONFIG_SYSTEM_DB",
-        system_db_dir.path().join("system_vault.db").as_os_str(),
-    );
+    let _config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
 
     // Plain `--system` writes succeed, but vault-encrypted secrets are rejected.
     let ok = exec_config(vec!["config", "--system", "user.name", "system_user"]).await;
@@ -602,10 +707,9 @@ async fn test_config_system_rejected_vault_write_does_not_create_db() {
     test::setup_with_new_libra_in(temp_path.path()).await;
     let _guard = test::ChangeDirGuard::new(temp_path.path());
 
-    // Point the system scope at a path that does NOT yet exist.
-    let fresh_dir = tempdir().unwrap();
-    let sys_db = fresh_dir.path().join("never").join("config.db");
-    let _system = EnvVarGuard::set("LIBRA_CONFIG_SYSTEM_DB", sys_db.as_os_str());
+    // The fixture path does not exist until an accepted write creates it.
+    let config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
+    let sys_db = config_fixture.system_db();
 
     // A rejected `--system --encrypt` write must short-circuit before touching
     // the DB, so the system config path is never created.
@@ -632,11 +736,7 @@ async fn test_config_system_rename_into_vault_namespace_rejected() {
     test::setup_with_new_libra_in(temp_path.path()).await;
     let _guard = test::ChangeDirGuard::new(temp_path.path());
 
-    let system_db_dir = tempdir().unwrap();
-    let _system = EnvVarGuard::set(
-        "LIBRA_CONFIG_SYSTEM_DB",
-        system_db_dir.path().join("system_rename.db").as_os_str(),
-    );
+    let _config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
 
     // Seed a plain (non-sensitive) system key, then try to rename its section
     // into the vault namespace — which would smuggle a secret key past the
@@ -672,12 +772,10 @@ async fn test_config_system_set_rejected_when_existing_row_is_encrypted() {
     test::setup_with_new_libra_in(temp_path.path()).await;
     let _guard = test::ChangeDirGuard::new(temp_path.path());
 
-    // Isolate HOME so the global vault key lands in the temp dir, then build an
-    // encrypted row in a shared DB via the (vault-capable) global scope.
-    let home = tempdir().unwrap();
-    let _home = EnvVarGuard::set("HOME", home.path().as_os_str());
-    let shared_db = temp_path.path().join("shared.db");
-    let _global = EnvVarGuard::set("LIBRA_CONFIG_GLOBAL_DB", shared_db.as_os_str());
+    // Build an encrypted row in the fixture's global DB, then deliberately
+    // reuse that same isolated file through the system scope.
+    let config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
+    let shared_db = config_fixture.global_db();
 
     let seed = exec_config(vec![
         "config",
@@ -739,15 +837,13 @@ async fn test_config_scope_explicit_local() {
 }
 
 #[tokio::test]
-#[serial(cwd)]
+#[serial(env, cwd)]
 async fn test_config_scope_isolation() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
     let _guard = test::ChangeDirGuard::new(temp_path.path());
 
-    // Isolate global DB paths to temp files (no host pollution).
-    let global_db_dir = tempdir().unwrap();
-    let _scoped = ScopedConfigPathGuard::new(&global_db_dir.path().join("global_config.db"));
+    let _config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
 
     // Set the same key with different values in different scopes
     let result = exec_config(vec!["config", "--local", "test.isolation", "local_value"]).await;
@@ -794,15 +890,15 @@ async fn test_config_get_reveal_decrypt_failure_returns_error() {
 }
 
 #[tokio::test]
-#[serial(cwd)]
+#[serial(env, cwd)]
 async fn test_config_get_cascaded_global_read_failure_returns_error() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
     let _guard = test::ChangeDirGuard::new(temp_path.path());
 
-    let bad_global_db = temp_path.path().join("bad-global.db");
-    std::fs::write(&bad_global_db, "definitely-not-a-sqlite-database").unwrap();
-    let _scoped = ScopedConfigPathGuard::new(&bad_global_db);
+    let config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
+    let bad_global_db = config_fixture.global_db();
+    std::fs::write(bad_global_db, "definitely-not-a-sqlite-database").unwrap();
 
     let result = exec_config(vec!["config", "get", "user.missing"]).await;
     let err = result.expect_err("broken cascaded scope should not be ignored");
@@ -955,14 +1051,9 @@ async fn test_config_set_read_failure_does_not_silently_skip_existing_state_chec
     // Prevent any interactive prompts from blocking the test.
     let _test_env = EnvVarGuard::set("LIBRA_TEST", std::ffi::OsStr::new("1"));
 
-    let bad_global_dir = tempdir().unwrap();
-    let bad_global_db = bad_global_dir.path().join("bad-global.db");
-    std::fs::write(&bad_global_db, "definitely-not-a-sqlite-database").unwrap();
-    let _scoped = ScopedConfigPathGuard::new(&bad_global_db);
-
-    let fake_home = tempdir().unwrap();
-    let _home_guard = EnvVarGuard::set("HOME", fake_home.path().as_os_str());
-    let _userprofile_guard = EnvVarGuard::set("USERPROFILE", fake_home.path().as_os_str());
+    let config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
+    let bad_global_db = config_fixture.global_db();
+    std::fs::write(bad_global_db, "definitely-not-a-sqlite-database").unwrap();
 
     let result = exec_config(vec![
         "config",
@@ -983,8 +1074,8 @@ async fn test_config_set_read_failure_does_not_silently_skip_existing_state_chec
     );
 
     assert!(
-        !fake_home
-            .path()
+        !config_fixture
+            .home()
             .join(".libra")
             .join("vault-unseal-key")
             .exists(),
@@ -1510,13 +1601,11 @@ async fn test_config_cross_platform_paths() {
 async fn resolve_user_identity_sources_tolerates_corrupt_global_db() {
     use libra::internal::config::{LocalIdentityTarget, resolve_user_identity_sources};
 
-    let temp_dir = tempdir().unwrap();
-    let global_db_path = temp_dir.path().join("corrupt_config.db");
+    let config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
+    let global_db_path = config_fixture.global_db();
     // A non-SQLite payload: opening this file as a sea-orm SQLite connection
     // (or running the schema-compat check on it) is guaranteed to fail.
-    std::fs::write(&global_db_path, b"this is not a sqlite database").unwrap();
-
-    let _global = EnvVarGuard::set("LIBRA_CONFIG_GLOBAL_DB", global_db_path.as_os_str());
+    std::fs::write(global_db_path, b"this is not a sqlite database").unwrap();
 
     // Ensure env-var fallbacks are empty so we can attribute the result to
     // config-read tolerance, not env shadowing.
@@ -1564,10 +1653,7 @@ async fn resolve_env_for_target_process_env_overrides_local_vault() {
         "LIBRA_RESOLVE_ENV_PRIORITY_KEY",
         std::ffi::OsStr::new("env-value"),
     );
-    let _global = EnvVarGuard::set(
-        "LIBRA_CONFIG_GLOBAL_DB",
-        std::ffi::OsStr::new("/nonexistent/resolve-env-priority-local.db"),
-    );
+    let _config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
 
     ConfigKv::set(
         "vault.env.LIBRA_RESOLVE_ENV_PRIORITY_KEY",
@@ -1612,9 +1698,8 @@ async fn resolve_env_for_target_process_env_overrides_global_vault() {
         "LIBRA_RESOLVE_ENV_GLOBAL_PRIORITY_KEY",
         std::ffi::OsStr::new("env-value"),
     );
-    let global_dir = tempdir().unwrap();
-    let global_db_path = global_dir.path().join("global-config.db");
-    let _global = EnvVarGuard::set("LIBRA_CONFIG_GLOBAL_DB", global_db_path.as_os_str());
+    let config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
+    let global_db_path = config_fixture.global_db();
     let global_conn = db::create_database(global_db_path.to_string_lossy().as_ref())
         .await
         .unwrap();
@@ -1658,10 +1743,7 @@ async fn resolve_env_sync_falls_back_to_process_env_when_vault_missing() {
         "LIBRA_RESOLVE_ENV_SYNC_TEST_KEY",
         std::ffi::OsStr::new("env-fallback"),
     );
-    let _global = EnvVarGuard::set(
-        "LIBRA_CONFIG_GLOBAL_DB",
-        std::ffi::OsStr::new("/nonexistent/resolve-env-sync-fallback-path.db"),
-    );
+    let _config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
 
     let value = resolve_env_sync("LIBRA_RESOLVE_ENV_SYNC_TEST_KEY").unwrap();
     assert_eq!(value.as_deref(), Some("env-fallback"));
@@ -1678,10 +1760,7 @@ async fn resolve_env_sync_returns_none_when_no_layer_supplies_value() {
     use libra::internal::config::resolve_env_sync;
 
     let _guard = EnvVarGuard::unset("LIBRA_RESOLVE_ENV_SYNC_ABSENT_KEY");
-    let _global = EnvVarGuard::set(
-        "LIBRA_CONFIG_GLOBAL_DB",
-        std::ffi::OsStr::new("/nonexistent/resolve-env-sync-absent-path.db"),
-    );
+    let _config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
 
     let value = resolve_env_sync("LIBRA_RESOLVE_ENV_SYNC_ABSENT_KEY").unwrap();
     assert!(
@@ -2641,14 +2720,18 @@ async fn test_config_upgrade_mode_isolated_by_global_db_override() {
     // the upgrade settings instead of touching the real user's home.
     let temp_dir = tempdir().unwrap();
     let _guard = test::ChangeDirGuard::new(temp_dir.path());
-    let store = tempdir().unwrap();
     let _libra_home = EnvVarGuard::unset("LIBRA_HOME");
-    let _scoped = ScopedConfigPathGuard::new(&store.path().join("config.db"));
+    let config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
 
     let result = exec_config(vec!["config", "set", "--global", "upgrade.mode", "manual"]).await;
     assert!(result.is_ok(), "{result:?}");
 
-    let isolated = store.path().join("upgrade").join("settings.json");
+    let isolated = config_fixture
+        .global_db()
+        .parent()
+        .expect("global DB parent")
+        .join("upgrade")
+        .join("settings.json");
     assert!(
         isolated.exists(),
         "settings must be written next to the isolated global DB: {}",
@@ -3133,6 +3216,10 @@ fn run_config_in_pty(args: &[&str], cwd: &std::path::Path, input: &str) -> (bool
     cmd.env(
         "LIBRA_CONFIG_GLOBAL_DB",
         home.join(".libra").join("config.db"),
+    );
+    cmd.env(
+        "LIBRA_CONFIG_SYSTEM_DB",
+        home.join(".libra").join("system-config.db"),
     );
     cmd.env("LANG", "C");
     cmd.env("LC_ALL", "C");

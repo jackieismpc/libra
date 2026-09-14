@@ -52,12 +52,12 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    command::load_object,
+    command::{config::ConfigScope, load_object},
     internal::{
         branch::Branch,
         config::{ConfigKv, decrypt_value},
         db,
-        db::establish_connection_with_busy_timeout,
+        db::{DatabaseRole, establish_connection_with_busy_timeout, schema},
         head::Head,
         model::object_index,
     },
@@ -798,12 +798,14 @@ const REMOTE_STORAGE_ENV_KEYS_AFTER_TYPE: &[&str] = &[
     "LIBRA_STORAGE_CACHE_SIZE",
 ];
 
-/// Typed description of a global config DB that this binary cannot safely read.
+/// Typed configuration-schema diagnostic. The historical type name and
+/// version fields remain stable; role/ledger/reason distinguish policy cases.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlobalConfigSchemaFuture {
     pub db_path: PathBuf,
     pub current_version: i64,
     pub latest_version: Option<i64>,
+    pub issue: schema::ConfigurationSchemaIssue,
 }
 
 impl GlobalConfigSchemaFuture {
@@ -821,7 +823,10 @@ impl GlobalConfigSchemaFuture {
 
     pub fn diagnostic_message(&self, action: &str) -> String {
         format!(
-            "global config database schema is newer than this Libra binary supports; binary: {}; version: {}; config database: {}; config schema version: {}; latest supported schema version: {}; {action}; update with: {INSTALL_NEWER_LIBRA_COMMAND}",
+            "{} config database {}; ledger: {}; binary: {}; version: {}; config database: {}; config schema version: {}; latest supported schema version: {}; {action}; update with: {INSTALL_NEWER_LIBRA_COMMAND}",
+            self.scope_name(),
+            self.issue.reason(),
+            self.issue.ledger.table_name(),
             Self::binary_path_display(),
             env!("CARGO_PKG_VERSION"),
             self.db_path.display(),
@@ -829,14 +834,26 @@ impl GlobalConfigSchemaFuture {
             self.latest_supported_display(),
         )
     }
+
+    pub fn scope_name(&self) -> &'static str {
+        match self.issue.role {
+            DatabaseRole::GlobalConfig => "global",
+            DatabaseRole::SystemConfig => "system",
+            DatabaseRole::Repository => "repository",
+            DatabaseRole::Derived => "derived",
+        }
+    }
 }
 
 impl std::fmt::Display for GlobalConfigSchemaFuture {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "global config database '{}' schema version {} is newer than this Libra binary supports (latest supported: {})",
+            "{} config database '{}' {} (ledger: {}, version: {}, latest supported: {})",
+            self.scope_name(),
             self.db_path.display(),
+            self.issue.reason(),
+            self.issue.ledger.table_name(),
             self.current_version,
             self.latest_supported_display()
         )
@@ -858,8 +875,8 @@ impl std::fmt::Display for StorageConfigResolutionError {
     }
 }
 
-/// Warn once when the global config DB is too new but the current command may
-/// continue in an explicit local/offline or config-irrelevant mode.
+/// Warn once per invocation about unsupported Global/System metadata when
+/// the command may continue in a local/offline or config-irrelevant mode.
 pub fn emit_global_config_schema_future_warning(future: &GlobalConfigSchemaFuture, action: &str) {
     if GLOBAL_CONFIG_SCHEMA_FUTURE_WARNING_EMITTED
         .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
@@ -2347,9 +2364,14 @@ async fn resolve_env_for_storage_init_typed(
         if let Some(future) = inspect_global_config_schema_future_at_path(&global_db_path).await {
             return Err(StorageConfigResolutionError::GlobalSchemaFuture(future));
         }
-        match read_config_env_value(name, &vault_key, &global_db_path, "global")
-            .await
-            .map_err(StorageConfigResolutionError::Other)
+        match read_config_env_value(
+            name,
+            &vault_key,
+            &global_db_path,
+            DatabaseRole::GlobalConfig,
+        )
+        .await
+        .map_err(StorageConfigResolutionError::Other)
         {
             Ok(Some(value)) => return Ok(Some(value)),
             Ok(None) => {}
@@ -2372,9 +2394,10 @@ async fn resolve_env_for_storage_init_without_global(
     if let Ok(storage_path) = try_get_storage_path(None) {
         let local_db_path = storage_path.join(DATABASE);
         if local_db_path.exists()
-            && let Some(value) = read_config_env_value(name, &vault_key, &local_db_path, "local")
-                .await
-                .map_err(StorageConfigResolutionError::Other)?
+            && let Some(value) =
+                read_config_env_value(name, &vault_key, &local_db_path, DatabaseRole::Repository)
+                    .await
+                    .map_err(StorageConfigResolutionError::Other)?
         {
             return Ok(Some(value));
         }
@@ -2383,8 +2406,8 @@ async fn resolve_env_for_storage_init_without_global(
     Ok(None)
 }
 
-/// Inspect the configured global config DB and return only the too-new-schema
-/// case. Other config errors are left to the normal resolver path so commands
+/// Inspect the configured global DB for future or unregistered receipts.
+/// Other config errors are left to the normal resolver path so commands
 /// that never touch global storage config keep their historical behavior.
 pub async fn inspect_global_config_schema_future() -> Option<GlobalConfigSchemaFuture> {
     let global_db_path = storage_global_config_path()?;
@@ -2397,17 +2420,42 @@ pub async fn inspect_global_config_schema_future() -> Option<GlobalConfigSchemaF
 pub(crate) async fn inspect_global_config_schema_future_at_path(
     global_db_path: &Path,
 ) -> Option<GlobalConfigSchemaFuture> {
-    match db::inspect_database_schema(global_db_path).await {
-        Ok(db::SchemaCompatibility::UnsupportedFuture {
-            current_version,
-            latest_version,
-        }) => Some(GlobalConfigSchemaFuture {
-            db_path: global_db_path.to_path_buf(),
-            current_version,
-            latest_version,
-        }),
-        Ok(_) | Err(_) => None,
+    inspect_configuration_schema_issue_at_path(global_db_path, DatabaseRole::GlobalConfig).await
+}
+
+async fn inspect_configuration_schema_issue_at_path(
+    db_path: &Path,
+    role: DatabaseRole,
+) -> Option<GlobalConfigSchemaFuture> {
+    // Physically read-only, literal path, no creation or migration. Malformed
+    // and unreadable databases retain the normal resolver's error policy.
+    let conn = schema::open_readonly_connection_for_role(db_path, Duration::from_millis(200), role)
+        .await
+        .ok()?;
+    let inspection = schema::inspect_configuration_schema(&conn, role).await;
+    let _ = conn.close().await;
+    let issue = inspection.ok()?.issue?;
+    Some(GlobalConfigSchemaFuture {
+        db_path: db_path.to_path_buf(),
+        current_version: issue.current_version,
+        latest_version: issue.latest_version,
+        issue,
+    })
+}
+
+/// Inspect both scopes before dispatch makes any global-credential bypass
+/// decision. Environment credentials cannot prove System defaults irrelevant.
+pub async fn inspect_configuration_schema_issues() -> Vec<GlobalConfigSchemaFuture> {
+    let mut issues = Vec::new();
+    for scope in [ConfigScope::Global, ConfigScope::System] {
+        if let Some(path) = scope.get_config_path()
+            && let Some(issue) =
+                inspect_configuration_schema_issue_at_path(&path, scope.database_role()).await
+        {
+            issues.push(issue);
+        }
     }
+    issues
 }
 
 /// Read a single `vault.env.*` entry from a config database, decrypting if needed.
@@ -2419,36 +2467,68 @@ pub(crate) async fn inspect_global_config_schema_future_at_path(
 ///   or global key).
 ///
 /// Boundary conditions:
-/// - Returns `Err` when the database path is not valid UTF-8 (sea-orm needs a
-///   string-typed URL).
+/// - Global configuration opens a literal filename read-only with no creation
+///   or migration. Local repository reads retain their existing upgrade path.
 /// - Returns `Err` when decryption fails — the user sees the raw vault error, not a
 ///   silent fall-back to plaintext.
 async fn read_config_env_value(
     env_name: &str,
     vault_key: &str,
     db_path: &Path,
-    scope: &str,
+    role: DatabaseRole,
 ) -> Result<Option<String>, String> {
-    let db_path_str = db_path.to_str().ok_or_else(|| {
-        format!(
-            "database path is not valid UTF-8 for {scope} config: {}",
-            db_path.display()
-        )
-    })?;
-    let conn = establish_connection_with_busy_timeout(db_path_str, Duration::from_millis(200))
-        .await
-        .map_err(|err| match scope {
-            "global" => format!(
-                "failed to connect to global config '{}': {}",
-                db_path.display(),
-                err
-            ),
-            _ => format!(
-                "failed to connect to local config '{}': {}",
-                db_path.display(),
-                err
-            ),
-        })?;
+    let (conn, scope) = match role {
+        DatabaseRole::GlobalConfig => {
+            let conn = schema::open_readonly_connection_for_role(
+                db_path,
+                Duration::from_millis(200),
+                role,
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to connect to global config '{}': {error}",
+                    db_path.display()
+                )
+            })?;
+            schema::check_configuration_schema(&conn, role)
+                .await
+                .map_err(|error| error.to_string())?;
+            if !schema::configuration_has_kv(&conn, role)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                return Ok(None);
+            }
+            (conn, "global")
+        }
+        DatabaseRole::Repository => {
+            let path = db_path.to_str().ok_or_else(|| {
+                format!(
+                    "database path is not valid UTF-8 for local config: {}",
+                    db_path.display()
+                )
+            })?;
+            let conn = schema::establish_connection_with_busy_timeout_for_role(
+                path,
+                Duration::from_millis(200),
+                role,
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to connect to local config '{}': {error}",
+                    db_path.display()
+                )
+            })?;
+            (conn, "local")
+        }
+        DatabaseRole::SystemConfig | DatabaseRole::Derived => {
+            return Err(format!(
+                "{role} cannot supply storage credentials; use local or global configuration"
+            ));
+        }
+    };
 
     let entry = ConfigKv::get_with_conn(&conn, vault_key)
         .await

@@ -22,6 +22,7 @@
 //! `reference` model and `branch`/`tag` modules.
 
 pub mod migration;
+pub mod schema;
 
 use std::{
     io,
@@ -30,6 +31,11 @@ use std::{
     time::Duration,
 };
 
+pub use schema::{
+    DatabaseRole, create_database_for_role, establish_connection_for_role,
+    establish_connection_with_busy_timeout_for_role, inspect_database_schema_for_role,
+    upgrade_database_schema_for_role,
+};
 use sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbConn, DbErr, Statement,
     TransactionError, TransactionTrait,
@@ -102,7 +108,7 @@ fn normalize_path_for_sqlite(db_path: &str) -> String {
 ///
 /// Functional scope: opens the file and brings its schema up to date,
 /// automatically applying any pending built-in migrations (see
-/// [`ensure_database_schema_is_current`]). Opening the database is therefore
+/// [`schema::upgrade_connection_for_role`]). Opening the database is therefore
 /// sufficient to upgrade it — there is no separate explicit upgrade step.
 ///
 /// Boundary conditions:
@@ -125,9 +131,8 @@ pub async fn establish_connection_with_busy_timeout(
     db_path: &str,
     busy_timeout: Duration,
 ) -> Result<DatabaseConnection, IOError> {
-    let conn = open_connection_without_schema_management(db_path, busy_timeout).await?;
-    ensure_database_schema_is_current(&conn).await?;
-    Ok(conn)
+    establish_connection_with_busy_timeout_for_role(db_path, busy_timeout, DatabaseRole::Repository)
+        .await
 }
 
 /// Open a SQLite connection WITHOUT inspecting or migrating the schema.
@@ -361,6 +366,61 @@ pub async fn begin_write_transaction<
     Ok(txn)
 }
 
+/// The sole writer of the configuration-owned legacy reader barrier. The
+/// caller owns commit/rollback so its setting mutation and the marker are one
+/// atomic unit. Even callers using a deferred transaction acquire the writer
+/// lock here before inspecting any receipts.
+pub async fn write_configuration_barrier(
+    txn: &sea_orm::DatabaseTransaction,
+    role: DatabaseRole,
+) -> io::Result<()> {
+    let barrier = schema::schema_manifest().configuration_barrier;
+    if !barrier.roles.contains(&role) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("cannot write a configuration compatibility barrier for {role}"),
+        ));
+    }
+    txn.execute_unprepared(ACQUIRE_WRITE_LOCK_SQL)
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "failed to lock {role} before updating configuration: {error}"
+            ))
+        })?;
+    let inspection = schema::inspect_configuration_schema(txn, role).await?;
+    if let Some(issue) = inspection.issue {
+        return Err(io::Error::other(issue.to_string()));
+    }
+    if !inspection.base_receipt_present {
+        return Err(io::Error::other(format!(
+            "{role} is missing its configuration base receipt; reopen it with a compatible Libra binary before writing"
+        )));
+    }
+    if inspection.barrier_present {
+        return Ok(());
+    }
+    txn.execute_unprepared(barrier.legacy_ledger_sql)
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "failed to prepare the {role} compatibility ledger: {error}"
+            ))
+        })?;
+    txn.execute_raw(Statement::from_sql_and_values(
+        txn.get_database_backend(),
+        "INSERT INTO schema_versions (version, name, applied_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+        [barrier.version.into(), barrier.name.into()],
+    ))
+    .await
+    .map_err(|error| {
+        io::Error::other(format!(
+            "failed to protect {role} from older Libra writers: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
 /// `ConnectionTrait::transaction` with the write lock taken up front.
 ///
 /// Same shape and same `TransactionError` mapping as sea-orm's own, so a call
@@ -480,80 +540,19 @@ pub async fn open_database_without_migrations(db_path: &Path) -> io::Result<Data
 /// This function is intentionally read-only. It does not create
 /// `schema_versions`, run idempotent DDL, or apply pending migrations.
 pub async fn inspect_database_schema(db_path: &Path) -> io::Result<SchemaCompatibility> {
-    let conn = open_database_without_migrations(db_path).await?;
-    inspect_database_schema_for_connection(&conn).await
+    inspect_database_schema_for_role(db_path, DatabaseRole::Repository).await
 }
 
 /// Explicitly upgrade an existing repository database to the schema known by this
 /// Libra build.
 pub async fn upgrade_database_schema(db_path: &Path) -> io::Result<SchemaUpgradeReport> {
-    let conn = open_database_without_migrations(db_path).await?;
-    apply_database_schema_upgrades(&conn).await
+    upgrade_database_schema_for_role(db_path, DatabaseRole::Repository).await
 }
 
 async fn inspect_database_schema_for_connection(
     conn: &DatabaseConnection,
 ) -> io::Result<SchemaCompatibility> {
-    let current = migration::current_builtin_schema_version_readonly(conn)
-        .await
-        .map_err(|err| IOError::other(format!("Failed to read schema version: {err}")))?;
-    let latest = migration::latest_builtin_schema_version()
-        .map_err(|err| IOError::other(format!("Failed to inspect built-in migrations: {err}")))?;
-
-    match (current, latest) {
-        (_, None) => Ok(SchemaCompatibility::Compatible {
-            current_version: current,
-            latest_version: latest,
-        }),
-        (Some(current), Some(latest)) if current == latest => Ok(SchemaCompatibility::Compatible {
-            current_version: Some(current),
-            latest_version: Some(latest),
-        }),
-        (Some(current), Some(latest)) if current > latest => {
-            Ok(SchemaCompatibility::UnsupportedFuture {
-                current_version: current,
-                latest_version: Some(latest),
-            })
-        }
-        (current, Some(latest)) => Ok(SchemaCompatibility::UpgradeRequired {
-            current_version: current,
-            latest_version: latest,
-        }),
-    }
-}
-
-/// Bring the connected database's schema up to date, applying any pending
-/// built-in migrations automatically.
-///
-/// This is the single point where an older repository is migrated forward:
-/// every pooled connection passes through here, so simply opening the database
-/// for any command upgrades it in place (there is no separate `libra db
-/// upgrade` step). A schema that is *newer* than this binary understands cannot
-/// be migrated down and remains a hard error directing the user to install a
-/// newer Libra.
-async fn ensure_database_schema_is_current(conn: &DatabaseConnection) -> io::Result<()> {
-    match inspect_database_schema_for_connection(conn).await? {
-        SchemaCompatibility::Compatible { .. } => Ok(()),
-        SchemaCompatibility::UpgradeRequired {
-            current_version,
-            latest_version,
-        } => {
-            tracing::info!(
-                current = ?current_version,
-                latest = latest_version,
-                "repository database schema is out of date; applying pending migrations"
-            );
-            apply_database_schema_upgrades(conn).await?;
-            Ok(())
-        }
-        SchemaCompatibility::UnsupportedFuture {
-            current_version,
-            latest_version,
-        } => Err(IOError::other(format!(
-            "repository database schema version {current_version} is newer than this Libra binary supports (latest supported: {})",
-            format_schema_version(latest_version)
-        ))),
-    }
+    schema::inspect_schema_for_connection(conn, DatabaseRole::Repository).await
 }
 
 fn format_schema_version(version: Option<i64>) -> String {
@@ -581,8 +580,10 @@ async fn setup_database_sql(conn: &DatabaseConnection) -> Result<(), Transaction
             let backend = txn.get_database_backend();
 
             // `include_str!` will expand the file while compiling, so `.sql` is not needed after that
-            txn.execute_raw(Statement::from_string(backend, BOOTSTRAP_SQL))
-                .await?;
+            for bootstrap in schema::bootstraps_for_role(DatabaseRole::Repository) {
+                txn.execute_raw(Statement::from_string(backend, bootstrap.sql))
+                    .await?;
+            }
             Ok(())
         })
     })
@@ -653,16 +654,7 @@ async fn ensure_config_kv_schema(conn: &DatabaseConnection) -> Result<(), IOErro
     }
 
     let backend = conn.get_database_backend();
-    let ddl = r#"
- CREATE TABLE IF NOT EXISTS `config_kv` (
-     `id` INTEGER PRIMARY KEY AUTOINCREMENT,
-     `key` TEXT NOT NULL,
-     `value` TEXT NOT NULL,
-     `encrypted` INTEGER NOT NULL DEFAULT 0
- );
- CREATE INDEX IF NOT EXISTS idx_config_kv_key ON config_kv(`key`);
- "#;
-    conn.execute_raw(Statement::from_string(backend, ddl))
+    conn.execute_raw(Statement::from_string(backend, schema::CONFIG_KV_SQL))
         .await
         .map_err(|err| IOError::other(format!("Failed to create config_kv table: {err}")))?;
     Ok(())
@@ -733,19 +725,17 @@ async fn apply_database_schema_upgrades(
     let latest_version = migration::latest_builtin_schema_version()
         .map_err(|err| IOError::other(format!("Failed to inspect built-in migrations: {err}")))?;
 
-    ensure_config_kv_schema(conn)
-        .await
-        .map_err(|err| IOError::other(format!("Failed to ensure config_kv schema: {err}")))?;
-    ensure_ai_projection_schema(conn)
-        .await
-        .map_err(|err| IOError::other(format!("Failed to ensure AI projection schema: {err}")))?;
-    ensure_ai_runtime_contract_schema(conn)
-        .await
-        .map_err(|err| {
-            IOError::other(format!(
-                "Failed to ensure AI runtime contract schema: {err}"
-            ))
-        })?;
+    for top_up in schema::top_ups_for_role(DatabaseRole::Repository) {
+        match top_up {
+            schema::SchemaTopUp::ConfigKv => ensure_config_kv_schema(conn).await?,
+            schema::SchemaTopUp::AiProjection => ensure_ai_projection_schema(conn).await?,
+            schema::SchemaTopUp::AiRuntimeContract => {
+                ensure_ai_runtime_contract_schema(conn).await?
+            }
+            // These two retain their version guards in the repository runner.
+            schema::SchemaTopUp::RebaseShape | schema::SchemaTopUp::BisectShape => {}
+        }
+    }
     // CEX-12.5: apply every migration registered in
     // `migration::builtin_migrations`. The runner is idempotent — on a
     // fresh DB or a legacy DB it ensures the `schema_versions` tracking
@@ -775,40 +765,7 @@ async fn apply_database_schema_upgrades(
 /// - Returns an `IOError` if the database file already exists, or if there was an error creating the file or setting up the schema.
 #[allow(dead_code)]
 pub async fn create_database(db_path: &str) -> io::Result<DatabaseConnection> {
-    if Path::new(db_path).exists() {
-        return Err(IOError::new(
-            ErrorKind::AlreadyExists,
-            "Database file already exists.",
-        ));
-    }
-
-    std::fs::File::create(db_path)
-        .map_err(|err| IOError::other(format!("Failed to create database file: {err:?}")))?;
-
-    // Connect to the new database and set up the schema.
-    match connect_database(db_path).await {
-        Ok(conn) => {
-            setup_database_sql(&conn)
-                .await
-                .map_err(|err| IOError::other(format!("Failed to setup database: {err:?}")))?;
-            // CEX-12.5 P1#2 fix (Codex r3): the fresh-init path must run
-            // the migration runner so freshly created databases have the
-            // `schema_versions` bookkeeping table and any registered
-            // built-in migrations applied. Without this call, callers like
-            // `libra init` would create a DB whose schema diverges from a
-            // reconnected DB until the first `establish_connection` ran
-            // the migrations belatedly. The acceptance criterion in
-            // `docs/development/tracing/agent.md` line 313 requires fresh and
-            // existing repos to converge to the same schema after init.
-            apply_database_schema_upgrades(&conn).await.map_err(|err| {
-                IOError::other(format!(
-                    "Failed to run schema migrations on fresh database: {err}"
-                ))
-            })?;
-            Ok(conn)
-        }
-        _ => Err(IOError::other("Failed to connect to new database.")),
-    }
+    create_database_for_role(db_path, DatabaseRole::Repository).await
 }
 
 #[cfg(test)]

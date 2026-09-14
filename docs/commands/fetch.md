@@ -27,17 +27,28 @@ are loaded automatically when configured via `vault.ssh.<remote>.privkey`.
 
 ## Global Config Schema Guard
 
-`libra fetch` reads the global storage configuration (`~/.libra/config.db`, or
-`LIBRA_CONFIG_GLOBAL_DB`) before trusting remote/tiered object storage settings. If that
-database has a schema version newer than this binary supports, fetch fails closed with
-`LBR-CONFIG-001` instead of silently ignoring global storage config and falling back to
-local objects. The diagnostic includes the binary path and version, config DB path,
-schema versions, and the update command:
-`curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh | sh`.
+Configuration schema compatibility is role-scoped. Before `libra fetch` trusts
+configuration, it inspects GlobalConfig and SystemConfig metadata read-only. A
+future configuration schema or an unregistered/mismatched migration receipt
+fails closed with `LBR-CONFIG-001` when that scope is required. Known
+Repository-only receipts, including `2026090801` in the current manifest, do
+not make a configuration store future; its supported values remain readable.
+The configuration-owned legacy-reader barrier is recognized by this build;
+see [configuration compatibility](config.md#configuration-schema-compatibility).
 
-Use `libra --offline fetch ...` or `LIBRA_READ_POLICY=offline|local libra fetch ...` only when
-you intentionally want local-only object access. Libra will warn once and ignore the
-global storage config for that run.
+Global configuration uses `LIBRA_CONFIG_GLOBAL_DB` or `~/.libra/config.db`;
+system configuration uses `LIBRA_CONFIG_SYSTEM_DB` or `/etc/libra/config.db`.
+Complete process/repo-local storage settings can make GlobalConfig unnecessary
+(`cloud` must also satisfy its D1 settings). They do not prove that SystemConfig
+defaults are unnecessary. Diagnostics identify the affected scope, ledger and
+version without printing configuration values or untrusted receipt names.
+
+Unknown or unsupported state is upgrade-only here, not automatically repaired.
+Install a compatible newer Libra binary:
+`curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh | sh`.
+Do not delete or edit SQLite receipts manually. Use `--offline` or
+`LIBRA_READ_POLICY=offline|local` only for intentional local-only object access;
+these modes warn and are not authorization for remote synchronization.
 
 ### Prune config defaults (`fetch.prune`, `remote.<name>.prune`)
 
@@ -45,7 +56,7 @@ When neither `--prune`/`-p` nor `--no-prune` is given, Libra resolves the prune
 behavior from Git-compatible config defaults, per remote: `remote.<name>.prune`
 first, then `fetch.prune`, each read through the local → global → system cascade
 (case-insensitive keys; encrypted local/global values are decrypted; legacy rows
-are honored; an unreadable or unsupported system scope is skipped). When neither
+are honored; an unreadable system scope is skipped). When neither
 key is set the built-in default is `false` — the same shipped default as Git.
 CLI flags always win over config.
 
@@ -53,11 +64,12 @@ An invalid value fails closed with `LBR-CLI-002` and an unreadable local/global
 scope with `LBR-IO-001`, in both cases **before the fetch touches the network**
 (with `--all`, every remote's prune mode is validated before the first fetch),
 so a bad config can never produce a fetch whose prune semantics silently
-diverge from what was configured. Exception: a global config store whose
-schema is newer than this Libra binary is skipped for these defaults with a
-one-time deduplicated warning; the dispatch-level guard still fails `fetch`
-closed with `LBR-CONFIG-001` when the command genuinely needs global storage
-config.
+diverge from what was configured. An unsupported global schema is skipped for
+these defaults with one deduplicated warning only when dispatch proves Global
+storage config unnecessary. The dispatch guard fails `fetch` closed with
+`LBR-CONFIG-001` when it requires unsupported Global config, or when System
+has a future/unregistered receipt; Global credential overrides do not bypass
+System defaults. Known Repository receipts and valid barriers remain readable.
 
 ### Fetch refspecs
 

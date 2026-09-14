@@ -2,9 +2,9 @@
 
 ## 文档职责与维护协议
 
-本文是 Libra 不绑定具体发布日期和版本号的长期能力组合路线图。它回答「哪些能力值得长期投资、为什么、依赖什么、何时具备进入日期计划的条件」，不是 release 承诺、owner 清单或逐项实施任务表。具体设计、迁移、拆分、发布和回滚只进入按日期计划或后续 RFC/ADR。
+本文是 Libra 不绑定具体发布日期和版本号的长期能力组合路线图。它回答「哪些能力值得长期投资、为什么、依赖什么、何时具备进入日期计划的条件」，不是 release 承诺、owner 清单或逐项实施任务表。具体设计、迁移、拆分、发布和回滚只进入按日期计划或后续 RFC/ADR。上次审计基线为 2026-09-03（第十次）；本轮只更新允许的审计快照与路线图状态。
 
-**本次改版：2026-09-03（第十次）竞品审计。** 审计机已从 macOS（`/Volumes/Data`，第九次）切换至 Linux（Arch）；旧路径口径作废，以审计机 `$COMP_ROOT` 为准——这是全文唯一允许出现旧路径的位置。核心变化：快照按迁移后路径与仓库集合重写（36 仓，集合变动 12 行）；UP-01/RT-01 推进「已实现」，LR-02/SB-02/SB-04 推进「实施中」；SB 表新增状态列；日期计划索引补 `plan-20260827/0830` 并规范化状态；竞品安全修复全部归入既有 SB 判据，本轮无新增编号、无优先级升降。
+**本次改版：2026-09-14（第十一次）竞品审计。** 审计机为 Linux（Omarchy），本轮以实际 `$LIBRA_REPO` / `$COMP_ROOT` 与 `SCRATCH=/tmp/libra-competitor-audit-2026-09-14` 为准；旧路径口径只保留在第十次历史记录。核心变化：快照更新为 41 个 Git 仓库，新增 `crabbuild/*` 五仓，14 个 fast-forward、21 个 up-to-date、6 个 `blocked-forced-update`；Libra 已推进至 `v0.22.19`，merge 主线与 operation v2 foundation 已由代码、测试、文档和发布提交缩小差距。本轮竞品证据仍归入既有编号；SB-01/SB-02/SB-03/SB-04 与 LR-02 的优先级不变，新增 FastCDC 仅作为 LR-09 的已合入相邻基础，不新增编号。
 
 状态定义：
 
@@ -37,7 +37,8 @@
 
 ## 本次竞品审计快照
 
-审计时间：**2026-09-03（第十次）**。审计机：Linux（Arch/Omarchy），`git 2.55.0`，`libra 0.22.10`；Libra 主仓 `/run/media/genedna/data/libra`（HEAD `b800de7`），竞品根 `/run/media/genedna/data/competition`（第九次在 macOS 执行，旧路径口径作废）。范围严格限定为竞品根下直接两层仓库（36 个 Git + 0 Libra；`cursor/` 为空目录）。Git 仓库在 `git status --porcelain` 为空且有 upstream 时 `git fetch --prune` + `git merge --ff-only @{u}` 两步更新。本轮 9 个 fast-forward、25 个已是最新、2 个 `blocked-forced-update`（`git/git`、`jj`：远端非检出分支 forced update，本地 HEAD 未证明远端最新）。`blocked-*` 只表示本地 revision 可读，**不**表示已更新到远端最新。仓库身份按规范化 remote 键匹配、目录名只作展示；集合变动见下附表（本地缺失 5、目录改名 4、首次纳入 1、基线重置 1、类型变化 1、空目录 1）。
+审计时间：**2026-09-14（第十一次）**。审计机：Linux（Omarchy），`git 2.55.0`，`libra 0.22.19`；Libra 主仓 `/run/media/genedna/data/libra`（HEAD `1524ecab726a5eb663b8de09a37082ffa601d073`，最新 tag `v0.22.19`），竞品根 `/run/media/genedna/data/competition`。范围严格限定为竞品根下直接两层仓库（41 个 Git + 0 Libra；`cursor/` 为空目录）。Git 仓库在 `git status --porcelain` 为空且有 upstream 时按本轮执行 `git fetch --prune` + `git merge --ff-only @{u}` 两步更新。本轮 14 个 fast-forward、21 个已是最新、6 个 `blocked-forced-update`（`dolthub/dolt`、`git-ai-project/git-ai`、`git/git`、`gitbutlerapp/gitbutler`、`go-git/go-billy`、`jj-vcs/jj`：远端非检出分支 forced update，本地 HEAD 未证明远端最新）。`blocked-*` 只表示本地 revision 可读，**不**表示已更新到远端最新。仓库身份按规范化 remote 键匹配、目录名只作展示；集合变动见下附表（本轮新增 5 个 `crabbuild/*`，其余历史缺失/改名记录沿用并复核）。scratch 目录为 `/tmp/libra-competitor-audit-2026-09-14`。
+上次快照：2026-09-03（第十次）；本轮对照其 revision 增量，并以当前 checkout 的 Libra 代码、测试、文档与发布 tag 为事实源。
 
 | 竞品（目录） | remote | 类型 | 归类 | 分支 | 上次 revision | 审计 revision | 更新结果 | 增量/覆盖 | 证据入口（≤80 字） |
 |---|---|---|---|---|---|---|---|---|---|
@@ -77,6 +78,11 @@
 | `sachinsharma9780/memweave` | sachinsharma9780/memweave | Git | Memory | `main` | `2ff82df` | `2ff82df` | up-to-date | +0 / 沿用 | Markdown+SQLite 索引 |
 | `sl4m3/ledgermind` | sl4m3/ledgermind | Git | Memory（反例） | `main` | 99220d1（不在本地历史） | `4d7d35621` | **fast-forward**（基线重置） | +14 since / 100% | 源码已移除，全部为文档/品牌，本轮只当宣传材料 |
 | `sqliteai/sqlite-memory` | sqliteai/sqlite-memory | Git | Memory | `main` | `0f0aede` | `0f0aede` | up-to-date | +0 / 沿用 | submodule 未更新；SQLite 混合检索 |
+| `crabbuild/compass` | crabbuild/compass | Git | 版本管理（相邻，首次纳入） | `main` | —（首次纳入） | `5a9081f931ebb11e8c6556eea29ccea1d063a503` | up-to-date | 1151 条 / 层 3，主题 100% | 首次纳入；未形成可提升既有编号的 E2+结论 |
+| `crabbuild/crab` | crabbuild/crab | Git | 版本管理（相邻，首次纳入） | `main` | —（首次纳入） | `77a9dc8682724f4e431b0d1ca57aaab8dfae64ba` | **fast-forward** | 212 条 / 层 3，主题 100% | 首次纳入；chunk/object storage 参考，未改变差距判断 |
+| `crabbuild/prolly` | crabbuild/prolly | Git | 版本管理（相邻，首次纳入） | `main` | —（首次纳入） | `6ee959eaed2625bf086ae0c4d1a2b5934f7e3872` | up-to-date | 637 条 / 层 3，主题 100% | 首次纳入；内容寻址数据结构参考，未形成新编号 |
+| `crabbuild/silo` | crabbuild/silo | Git | 版本管理（相邻，首次纳入） | `main` | —（首次纳入） | `7f71a06b0560fb1ef85c3aa57bcac365dbe9d7be` | up-to-date | 117 条 / 层 2，主题 100% | 首次纳入；存储服务参考，未形成新编号 |
+| `crabbuild/trail` | crabbuild/trail | Git | 版本管理（相邻，首次纳入） | `main` | —（首次纳入） | `9823ed7551a1c53bb1a2c1dc329d9faf30e6f460` | up-to-date | 370 条 / 层 3，主题 100% | 首次纳入；轨迹／审计参考，未形成新编号 |
 
 | 变动类型 | 仓库（目录） | 上次 revision / 当前 HEAD | 说明 |
 |---|---|---|---|
@@ -93,6 +99,7 @@
 | 基线重置 | `sl4m3/ledgermind` | 99220d1 / 4d7d35621 | 基线重置（上次 99220d1 不在本地历史；上游改写或重克隆，未验证）；增量以 `--since=2026-08-25` 兜底（+14，全为文档/品牌） |
 | 类型变化 | `StepzeroLab/research-git` | 62bcdf5 / 62bcdf5 | 类型 Libra→Git；revision 未变，仍可作增量基线 |
 | 空目录或普通目录 | `cursor/` | — | 不计入总数 |
+| 首次纳入 | `crabbuild/compass`、`crabbuild/crab`、`crabbuild/prolly`、`crabbuild/silo`、`crabbuild/trail` | — / 当前 HEAD | 本轮实际发现并纳入；按层级完成主题覆盖，未复制源码或测试资产 |
 
 待验证账本索引（E1；全量在 `$SCRATCH/pending.tsv`）：
 
@@ -107,6 +114,7 @@
 
 | 审计日期 | 仓库数 | 更新摘要 | 路线图结论 |
 |---|---:|---|---|
+| 2026-09-14（第十一次） | 41（41 Git + 0 Libra） | 14 个 fast-forward、21 个 up-to-date、6 个 `blocked-forced-update`（dolt、git-ai、git/git、gitbutler、go-billy、jj）；首次纳入 `crabbuild/*` 五仓 | Libra 已发布 `v0.22.19`；merge 主线、operation v2 foundation 与 FastCDC 相关差距缩小；竞品新增证据继续补强既有 SB-01..04、MEM-01 与 AG-ATTR，不新增编号、不改变优先级 |
 | 2026-09-03（第十次） | 36（36 Git + 0 Libra） | 9 个 fast-forward（sapling、gitbutler、lore、go-git、dolt、git-ai、grok-build、letta-code、letta-agent-sdk、memorax-code、Memoria、ledgermind 中 9 个达 fast-forward，其余 up-to-date）、25 个已是最新、2 个 `blocked-forced-update`（git/git、jj）；集合变动 12 行（本地缺失 5、目录改名 4、首次纳入 walgit、基线重置 ledgermind、类型变化 research-git、空目录 cursor/） | **UP-01、RT-01 推进为「已实现」（Libra 自身证据驱动）；LR-02、SB-02、SB-04 推进为「实施中」；SB 表新增状态列。** 竞品侧安全/可靠性证据面加厚（jj 并发写丢失、dolt 带 GC 数据丢失、git/git UAF、letta shell 解析绕过、git-ai 迁移原子化、walgit 授权缺口）全部映射到既有 SB-01/SB-02/SB-03/SB-04/MEM-01 补充判据，无新增编号、无优先级升降 |
 | 2026-08-25（第九次） | 40（35 Git + 5 Libra） | 15 个 fast-forward（13 Git：sapling、jj、gitbutler、lore、git/git、go-git、dolt、git-ai、grok-build、letta-code、letta-agent-sdk、memorax-code、agentmemory；2 Libra：entireio/cli、git-sync）、23 个已是最新、2 个 blocked（agenta `blocked-timeout`、agent-trace `blocked-network` 远端仍 404）；无新增/删除仓库 | 竞品侧无优先级变化（安全/可靠性证据面加厚：go-git 循环 delta 栈溢出、grok-build shell 写权限 fail-closed、lore 内容尺寸上限、git/git 溢出与 unchecked-returns 加固、entireio redaction fail-closed、memorax 数据隔离与 lineage）——全部为既有 SB/MEM/LR 的补充完成判据或竞品证据，无新增编号。**Libra 自身进展为主**：CT4-01 发布卡执行、FIX-05 B 段 waves 发布；`plan-20260715`（RT-01）关闭；新增 `plan-20260821`（UP-01）、`plan-20260822`（LR-02/LR-03）、`plan-20260825`（B Code provider）；**LR-02/LR-03 由已验证推进为已排期**；更正上版把 `plan-20260822` 误标为 UP-01 的链接 |
 | 2026-08-22（第八次） | 40（35 Git + 5 Libra） | 1 个 fast-forward（letta-code）、38 个 up-to-date、1 个 `blocked-network`（agent-trace 远端 404）；新纳入 10 仓库（deepseek-harness、ctx-open、dolt、lorevcs/lore、memorax-code、Lit、rekal-cli、git-ai、lakeFS、cursor/cursor） | **RT-01 推进为实施中、UP-01 改判已排期、MEM-01/02 推进已排期**（均为 Libra 自身进展驱动）；竞品侧 rekal-cli 与 letta-code shared-memory skills 加强 MEM-* 证据；无优先级降级或新增编号 |
@@ -115,17 +123,46 @@
 | 2026-08-07（第五次） | 26 | 1 个 fast-forward（Lore）、24 个已是最新、1 个 `blocked-dirty`（agenta）；首次按三类重组；新纳入 `letta-ai/*`（5）与 `rohitg00/agentmemory` | **结构重组。** Memory 升格为第一类长期能力（`MEM-*`）；CT-01 仍是版本管理类下一个执行任务；MEM-01 为 Memory 类首个验证任务。 |
 | 2026-08-02（第四次） | 20 | 9 个 fast-forward、10 个已是最新、1 个 blocked-dirty | 无优先级变化 |
 
-**本次结论：** 本轮最重要的路线图变化来自 **Libra 自身**：UP-01 四证据齐备（`895589d` 手动升级命令 + `upgrade_auto_test` 31 fn + `docs/commands/upgrade.md`/`LBR-UPGRADE-001` + tags 至 `v0.22.10`）推进「已实现」；RT-01 经 DF-05..08（SSE v1 物理移除 `a643dfb`，v0.21.28/v0.21.29/v0.22.0 发布）规范化为「已实现」；LR-02 的 OL-01 worktree I/O 已合入（`dad35f2`）推进「实施中」。竞品侧没有推翻既有优先级的新能力：安全/可靠性修复（jj `0a9b86970` 并发写丢失、dolt `01dea76505` 带 GC 数据丢失、go-git `2ef9e4b0` 静默损坏、git/git `0bb83c5f47` UAF、letta-code `3785e254` shell 解析绕过、git-ai `1bc9d49e2` 迁移原子化、sapling `bf0537023d6` 死锁、walgit `527c7d1` 授权缺口）全部作为既有 **SB-01/SB-02/SB-03/SB-04/MEM-01** 的补充完成判据或竞品证据吸收；不适用项（git-ai token_usage 遥测、memorax 无验签自动更新、deepseek ApiProxy 删除形态）只进快照与「不进入本长期优先队列的项」。Libra 自身进展比竞品更新更影响优先级：下一个执行任务顺延为 CT-01 收尾与 LR-02/LR-03（`plan-20260822`）。
+**本次结论：** 本轮判断主要由 Libra 自身推进驱动：`041d91e7b`、`810bae165`、`61bb21d`、`30c3367a` 等 merge／mergetool／消息面提交及 `plan-20260903` 的测试、文档和发布证据使 LR-05 差距缩小；`3650680`、`2620df0` 等 operation 提交使 LR-02 继续实施中；FastCDC 计划与实现证据使 LR-09 的相邻基础扩大但不改变其长期状态。竞品侧本轮没有足够 E3+证据推翻优先级；新增 `crabbuild/*` 五仓完成首次纳入审计但未形成新编号。SB-01..04、MEM-01 与 AG-ATTR 只吸收可复核的安全／可靠性／归因判据；无验签自动更新、遥测重摄取、删除 ApiProxy 形态和 UI／宣传性仓库不纳入长期优先队列。本轮无优先级变化。
 
 Top-5 最重要差距（两榜合成）：
 
 | 排名 | 榜 | 关联编号 | 差距一句话 | S/D/X/U/C/E | 分 | 竞品证据 | Libra 证据 | 动作 |
 |---|---|---|---|---|---:|---|---|---|
-| 1 | A | SB-01 | 网络协议路径仍可被畸形输入触发 panic：`read_pkt_line` 生产 `expect/panic!`，三处 pkt-line 读取无 `len<4` 下界 | 2/2/2/2/2/E3 | 10 | jj@0a9b86970（E2）、dolt@01dea76505（E2）、go-git@2ef9e4b0（E2） | `src/git_protocol.rs:90,92`；`src/command/fetch.rs:3677`、`src/internal/protocol/git_client.rs:151`、`src/internal/protocol/ssh_client.rs:243` | 补充完成判据 |
-| 2 | A | SB-02 | MCP authorizer 生产未安装（默认 None=不鉴权），shell 写重定向为 `needs_human` 非 fail-closed | 2/1/2/2/2/E3 | 8 | letta-code@3785e254（E2）、walgit@527c7d1（E2）、memorax-code（request.ts 现状反例） | `src/internal/ai/mcp/server.rs:42`、`src/internal/ai/tools/utils.rs:130` | 更新状态（已验证→实施中）+补充完成判据 |
-| 3 | A | SB-03 | D1 迁移逐语句执行、无事务、无账本，且 publish 路径并存 wrangler 第二套 runner | 1/2/1/1/2/E2 | 7 | git-ai@1bc9d49e2（E2：每脚本事务 + UNIQUE 去重 + durable reconcile flag） | `src/utils/d1_client.rs:3286`、`src/command/publish.rs:627` | 补充完成判据 |
-| 4 | B | MEM-01 | VCS-native Memory 存储与隐私基线无任何实现（模块/命令/FTS5 全缺失） | 1/1/3/3/1/E4 | 7 | letta-code@9047f71c（E2：可配置 memory 限额 pre-commit 强制） | `ls src/internal/ai/memory` 不存在；`src/cli.rs` 无 memory 子命令 | 保持已排期 +补充完成判据 |
-| 5 | B | LR-02 | op v1 已发布（`dad35f2` OL-01），但 v2 snapshot/restore 引擎未开始，mutation 覆盖不完整 | 0/1/3/3/1/E3 | 7 | jj@0a9b86970（E2，oplog 并发写丢失同类）+ gitbutler undo/switch 快照（E1） | `src/command/op.rs:41`；`ls src/internal/operation` 不存在 | 更新状态（已排期→实施中）+补充完成判据 |
+| 1 | A | SB-01 | 网络协议路径仍可被畸形输入触发 panic：`read_pkt_line` 生产 `expect/panic!`，三处 pkt-line 读取无 `len<4` 下界 | 2/2/2/2/2/E3 | 10 | `git/git@47ce80527c`（E2，ODB 错误分类／解析修复）；`go-git/go-git@29c4ef62`（E2，父引用缺失显式报错） | `src/git_protocol.rs:90,92`；`src/command/fetch.rs:3677`、`src/internal/protocol/git_client.rs:151`、`src/internal/protocol/ssh_client.rs:243` | 更新完成判据；已排期 `plan-20260901` |
+| 2 | A | SB-02 | MCP authorizer 生产未安装（默认 None=不鉴权），shell 写重定向为 `needs_human` 非 fail-closed | 2/1/2/2/2/E3 | 8 | `letta-ai/letta-code@1d506973`（E2，权限／memory 相关收敛）；`tobi/walgit@80e9a20`（E2，服务端授权与 session 加固） | `src/internal/ai/mcp/server.rs:42`、`src/internal/ai/tools/utils.rs:130` | 保持实施中；补充完成判据 |
+| 3 | A | SB-03 | D1 迁移逐语句执行、无事务、无账本，且 publish 路径并存 wrangler 第二套 runner | 1/2/1/1/2/E2 | 7 | `git-ai-project/git-ai@f8e39c2`（E2，迁移／唯一约束安全证据） | `src/utils/d1_client.rs:3286`、`src/command/publish.rs:627` | 补充完成判据 |
+| 4 | B | MEM-01 | VCS-native Memory 存储与隐私基线无任何实现（模块/命令/FTS5 全缺失） | 1/1/3/3/1/E4 | 7 | `letta-ai/letta-code@1d506973`（E2，memory 写入限制与布局验证） | `ls src/internal/ai/memory` 不存在；`src/cli.rs` 无 memory 子命令 | 保持已排期 +补充完成判据 |
+| 5 | B | LR-02 | operation v1 已发布，v2 snapshot/restore 与 mutation 覆盖仍在收敛 | 0/1/3/3/1/E4 | 7 | `jj-vcs/jj@c09b0c337`（E2，本轮状态／并发主题增量） | `src/command/op.rs:41`；`src/internal/operation.rs:208`；`3650680`、`2620df0` | 保持实施中 +补充完成判据 |
+
+能力差距矩阵（本轮完整覆盖 `ids.old` 的 24 个编号）：
+
+| 编号 | 类别 A/B/C/SB | 状态（旧→新） | 最佳竞品参照 repo@sha path:line + 参照来源 | Libra 现状 file:line / test / 可复算命令 | 差距一句话 | 本轮变化 + 驱动方（Libra/竞品/双方） | 动作 | E |
+|---|---|---|---|---|---|---|---|---|
+| CT-01 | A | 实施中→实施中 | `gitbutlerapp/grit@dfb0799` `TESTING.md`（沿用） | `tests/command/t4_port_test.rs`；`compat_ledger_schema` | 部分 wave 已合入，S2/S4 仍未收口 | 不变 | 保持 | E4 |
+| UP-01 | A | 已实现→已实现 | `memorax-ai/memorax-code@1525c20` update path（E2反例） | `src/internal/upgrade/manifest.rs:194`；`upgrade_auto_test`；`v0.22.19` | 签名升级链已完成，文档债仍存在 | 缩小（Libra） | 保持 | E4 |
+| LR-01 | A | 实施中→实施中 | `facebook/sapling@85572b5` worktree／dirstate（E2） | `src/command/worktree.rs:87`；`worktree_isolation_test` | worktree 隔离基础存在，parallel／崩溃 ownership 仍不完整 | 不变 | 保持 | E4 |
+| LR-02 | A | 实施中→实施中 | `jj-vcs/jj@c09b0c337` operation／并发主题（E2） | `src/internal/operation.rs:208`；`3650680`、`2620df0`；`op_test` | v2 snapshot／restore 尚未形成完整可恢复闭环 | 缩小（Libra） | 补充完成判据 | E4 |
+| LR-03 | A | 已排期→已排期 | `gitbutlerapp/gitbutler@32dd134` ID breaking（E2） | `grep -rn 'ChangeId\|change_id' src`；`plan-20260822.md` | 稳定 Change ID 仍只有计划／spike，未进入生产 | 不变 | 保持 | E4 |
+| LR-04 | A | 已验证→已验证 | `gitbutlerapp/gitbutler@32dd134` hunk mutation（E2） | `src/command/apply.rs`；`apply_patch` 单测 | 有只读 hunk 基础，非交互 assignment／stack mutation 缺失 | 不变 | 保持 | E4 |
+| LR-05 | A | 已验证→实施中 | `EpicGames/lore@074eb0b` `lore-revision/src/merge`（E2，沿用） | `src/command/merge.rs`；`plan-20260903.md` MG-01..MG-21；`command_test` merge cases | merge 主路径、rename、octopus、mergetool 与签名已大量交付，剩余计划收口与 deferred 差异仍在 | 缩小（Libra） | 更新状态 | E4 |
+| LR-06 | A | 已验证→已验证 | `letta-ai/letta-agent-sdk@f45ddfe` repository commit pin（E2） | `src/internal/ai/intentspec/`；`grep -rn 'seal\|intent_pin'` | intent／checkpoint 有基础，但 seal、pin 与 publication 边界缺失 | 不变 | 保持 | E4 |
+| LR-07 | A | 已验证→已验证 | `mainline-org/mainline@5704305` preflight／intent seal（E2） | `src/internal/ai/intentspec/scope.rs:12`；无 overlap receipt | 缺确定性 pre-edit overlap gate | 不变 | 保持 | E4 |
+| LR-08 | A | 已验证→已验证 | `tobi/walgit@80e9a20` hosting／admin boundary（E2） | `grep -rn 'trait Forge\|pull_request\|check_runs' src` | 无 Forge／PR／CI 机器接口 | 不变 | 保持 | E4 |
+| LR-09 | A | 已验证→已验证 | `crabbuild/crab@77a9dc8` chunk/object storage（E2，首次纳入） | `src/internal/sparse/mod.rs:26`；`src/utils/media/transfer.rs`；`media_fastcdc_test` | sparse／whole-object hydrate 与 FastCDC Media 已有基础，partial clone／VFS 仍缺 | 缩小（Libra） | 保持 | E4 |
+| LR-10 | B | 已验证→已验证 | `StepzeroLab/research-git@62bcdf5` capsule／provenance（E2，沿用） | `src/internal/ai/capability_package/manifest.rs:62`；`src/command/package.rs` 未注册 | artifact／skill 有基础，capsule lifecycle／ablation 缺失 | 不变 | 保持 | E4 |
+| RT-01 | B | 已实现→已实现 | `deepseek-ai/deepseek-harness@c291e79` session event surface（E2） | `src/internal/ai/runtime/worker.rs:1359`；`a643dfb`；v0.22.0 | Web-only runtime 与 SSE v2 已发布 | 缩小（Libra） | 保持 | E4 |
+| AG-ATTR | B | 候选→候选 | `letta-ai/trajectory@21ae92d` canonical adapters（E2，沿用） | `src/internal/ai/agent_import.rs`；`grep -rn ai_edit_trace src sql` | 原生 transcript 导入存在，归一化行级归因仍缺 | 不变 | 保持 | E4 |
+| MEM-01 | C | 已排期→已排期 | `letta-ai/letta-code@1d50697` memory limits（E2） | `ls src/internal/ai/memory`；`src/cli.rs` 无 memory 命令 | VCS-native storage／privacy baseline 未实现 | 不变 | 补充完成判据 | E4 |
+| MEM-02 | C | 已排期→已排期 | `rohitg00/agentmemory@e04ba88` hybrid retrieval（E2，沿用） | `grep -rn 'fts5\|bm25' src sql Cargo.toml` | 无本地 FTS/BM25 与有界 SessionStart 注入 | 不变 | 保持 | E4 |
+| MEM-03 | C | 已验证→已验证 | `memorax-ai/memorax-code@1525c20` turn conflict handling（E2） | `src/internal/ai/history.rs:3487`；tombstone tests | erase/tombstone 基础存在，consolidation／Trust Gate 未完成 | 不变 | 保持 | E4 |
+| MEM-04 | C | 已验证→已验证 | `tobi/walgit@80e9a20` auth/admin boundary（E2） | `src/internal/ai/mcp/authz.rs:96`；`server.rs:42` | Memory MCP 生产 authorizer 尚未接线 | 不变 | 保持 | E4 |
+| MEM-05 | C | 候选→候选 | `letta-ai/agent-file@78212eb` `.af` format（E2，沿用） | `src/command/agent/skill.rs:37`；无 portable Memory export | portable export／skill projection 尚缺 | 不变 | 保持 | E4 |
+| MEM-06 | C | 候选→候选 | `MachineWisdomAI/fava-trails@10f689f` coordination／Trust Gate（E2） | `src/internal/workspace.rs:211`；`capture_scope.rs:21` | lease 基础存在，Memory coordination channel 未实现 | 不变 | 保持 | E4 |
+| SB-01 | SB | 部分基础→实施中 | `git/git@47ce805` ODB error classification（E2） | `src/git_protocol.rs:90,92`；`plan-20260901.md` | pkt-line malformed input 的 panic／下界门已有计划但尚未收口 | 缩小（Libra） | 保持实施中 | E4 |
+| SB-02 | SB | 实施中→实施中 | `letta-ai/letta-code@1d50697` permission／memory hardening（E2） | `src/internal/ai/mcp/server.rs:42`；`src/internal/ai/tools/utils.rs:130` | sandbox 基础已增强，但 MCP authz 与 shell fail-closed 仍缺 | 不变 | 保持实施中 | E4 |
+| SB-03 | SB | 已验证→已验证 | `git-ai-project/git-ai@f8e39c2` migration transaction（E2） | `src/utils/d1_client.rs:3286`；`src/command/publish.rs:627` | D1 runner 仍缺事务账本与单一迁移事实源 | 不变 | 补充完成判据 | E2 |
+| SB-04 | SB | 实施中→实施中 | `facebook/sapling@85572b5` process／disconnect reliability（E2） | `src/internal/process_terminate.rs:12`；`tests/SERIAL_REGISTRY.tsv` | 测试隔离已改善，统一 child scope／PID reuse 防护仍缺 | 不变 | 保持实施中 | E4 |
 
 不做 Top-3（按 (S+D+X) 从「不采纳/延后」候选中取）：
 
@@ -133,7 +170,7 @@ Top-5 最重要差距（两榜合成）：
 |---|---|---|---|---|
 | 1 | 不采纳（git-ai） | token_usage / daemon 遥测与计费重摄取（本轮 +107 中 70 文件在 `src/token_usage`、45 在 `src/daemon`） | 与 VCS 长期能力无关；Libra `usage` 统计已覆盖需求 | E1 |
 | 2 | 不采纳（memorax-code） | 8h 轮询 npm 自动更新并替换进程（`ca6c46d`/`fed82ea`/`073c006`） | 无验签证据的供应链形态；Libra 升级必须走 UP-01 签名通道 | E2 |
-| 3 | — | **不足**：第三条候选（deepseek ApiProxy 删除形态、walgit 服务端 hosting 形态）仅 E1，不足 E≥2 门槛 | 本轮证据深度未达不做列表门槛，留待验证账本 | — |
+| 3 | 不采纳（deepseek-harness） | 删除 SQLite persistence backend、改用 handle-based seam 的产品形态 | Libra operation log 已明确以 SQLite 为状态真源；该变化与规划原则 1/5 冲突，handle seam 只作为接口参考 | E2 |
 
 本轮竞品要点（更新增量审计）——6 类 × {发现数, 值得借鉴数, 进入 plan-long 数}：
 
@@ -161,19 +198,20 @@ Top-5 最重要差距（两榜合成）：
 - **security** memorax-code `request.ts`（现状复核）：token 可来自 query string（E2 反例）——认证 token 不得进入 URL。
 - **reliability** git-ai `1bc9d49e2`（同 SB-03 行）与 lore `03dbc5f`（目录遍历逐组件检查，E2）归并记录，避免重复计数。
 
-Libra 自身（HEAD `b800de7`，`Cargo.toml` version `0.22.10`，审计日期 2026-09-03；自上次审计 `dadc5a4e6` 起 +200 提交，已发布版本 = `v0.22.10`，未发布提交 = `libra log --oneline v0.22.10..HEAD` 共 5 条）：
+Libra 自身（HEAD `1524ecab726a5eb663b8de09a37082ffa601d073`，`Cargo.toml` version `0.22.19`，审计日期 2026-09-14；自上次审计基线 `b800de73` 起 `libra log --oneline b800de73..HEAD` 共 95 条，已发布版本 = `v0.22.19`，未发布提交 = `libra log --oneline v0.22.19..HEAD` 共 3 条）：
 
 - **CT-01 / plan-20260729**：仍「实施中」。本轮增量：测试并行度与序列注册（`a8218ac` nextest CI、`315132a` 串行键转换、`b6959e5` TA-01 fail-closed 分类器）；**DEFER-09 已由 plan-20260825 TA-01/02 + plan-20260827 NP-00 承接关闭**（非「转 blocked」，更正上版表述）；剩余 S4 族 waves 与 S2 离线发现器（DEP-01 + SB-04 前置）。
 - **UP-01 / plan-20260821**：**已实现（四证据齐备）**——代码 `895589d`（手动 `libra upgrade`）+ 全部 C-T1..C-T4 修复轮（`2ea10cc` fail-closed Ed25519、`a0cb725` OIDC publish、`4bb5672` generation floor、`fc9c203` trust root）；测试 `upgrade_auto_test`（31 fn）等；文档 `docs/commands/upgrade.md`、`COMPATIBILITY.md:118`、`docs/error-codes.md LBR-UPGRADE-001`、`release-signing-auto-upgrade.md`（D1–D10）；已发布 tags v0.22.1/v0.22.2/v0.22.6..v0.22.10（D10 首签随 v0.22.7，closeout `00bc815`）。文档债：CHANGELOG 缺 0.22.1..0.22.10 条目（不阻断「已实现」，登记为文档债）；残留 DEFER-02/03/04/05/06。
 - **RT-01 / plan-20260715**：状态规范化「已完成→已实现」。DF-05..08 全部落地：SSE v2 默认（`0cd2cf2`）、skill activation provider 消费（`e8c6947`）、SSE v1 物理移除（`a643dfb`，breaking）、自动化消费者迁移（`b598734`）；发布 v0.21.28（`2fbbb5a`）/ v0.21.29（`0e20719`）/ v0.22.0；`web/sse_wire.rs` 已移除、Cargo.toml 无 ratatui/crossterm。残留 DEFER-02（独立 `libra mcp --stdio`）、DEFER-03（MCP 授权门→SB-02）、DEFER-04（非 loopback 远程写面）。
-- **LR-02/LR-03 / plan-20260822**：**LR-02 推进为「实施中」**——v1 已发布：`src/command/op.rs:41 OpCommand{Log,Show,Restore}`、`operation_wrapper.rs` with_operation_log、五表 schema、`command_test::op_test`（22 test）；OL-01 worktree I/O 已合入（PR #460 merge `dad35f2`，`src/internal/worktree_io/`）。v2 未开始：`ls src/internal/operation` 不存在、`RepoViewV2`/`WorkspaceSnapshotV2`/`RestoreEngine` 零命中、OL-02..OL-15 pending。LR-03：`[OL-00]` spike 状态为 `in-progress / remote-pending`（`plan-20260822.md:650`，**非「已冻结」**，更正）；`grep -rn 'ChangeId\|change_id' src` 除 `log/trailer.rs` 外 = 0。
+ - **LR-02/LR-03 / plan-20260822**：LR-02 仍为「实施中」——operation v1、workspace snapshot foundation 与 mutation classification 已随 `3650680`、`8fe1ad8`、`2620df0` 等提交合入，`src/internal/operation.rs:208` 与 `src/command/op.rs:41` 可核对；完整 restore／undo／redo 仍未收口。LR-03 仍「已排期」，Change ID 生产实现未开始；`plan-20260822.md` 的 OL-00 spike 状态仍需按其卡内证据核对。
 - **SB-02 / plan-20260830**：SBX-01..05 已合入并收口（`edd9eba` macOS scratch bind、`c35210d` seatbelt OpenCode export、`08466e0` transform、`088ee14` seam fields、`0e6ab63` capture 验证；closeout 见计划修订史 2026-09-01，DEFER-SBX-06 发布步延后）——**SB-02 推进为「实施中」**；authorizer 生产仍未安装（`server.rs:42` None=allow-all、`set_authz` 仅测试调用）。
 - **SB-04 / plan-20260827**：NP-00..05 全部 done（nextest CI `a8218ac`、串行注册 `315132a`/`b6959e5`、`process_terminate.rs` ProcessTerminateGate、`kill_on_drop`）——**SB-04 推进为「实施中」**；child scope 抽象（ProcessScope 同类）仍缺失（`grep -rn ProcessScope src tests` = 0）。
 - **B 类 / plan-20260825**：PS-00..PS-06 全部落地（`--provider` 显式解析 `0069902` breaking、`code.defaultProvider` `0eae7bb`、凭据三态 `042476b`、provenance `17bbe2b`）；TA-04..07 并行度杠杆落地。
-- **LR-09**：FastCDC media transport 已合入（PR #461 merge `1a590b6`，feat `ca997dd`，feature `fastcdc` 默认 OFF，`src/utils/media/transfer.rs`，`compat_fastcdc_feature_gate_guard`，`COMPATIBILITY.md:116 media`）——本轮此前未记录，已补录。
+ - **LR-05 / plan-20260903**：merge 主线已由 `041d91e7b`、`810bae165`、`61bb21d`、`30c3367a` 等提交覆盖 AUTO_MERGE、消息／quit、签名、mergetool 与策略面；`tests/command/merge_test.rs`、`src/command/merge.rs` 与 `plan-20260903.md` 提供代码、测试、文档和发布证据。长期仍保留 versioned conflict object／modeless sequencer 缺口，故状态为「实施中」。
+ - **LR-09**：FastCDC media transport 已合入（`1a590b6`、`ca997dd`，feature `fastcdc` 默认 OFF），本轮 `823cb628` 撤销文件容量硬上限、`8c77f9c` 对齐双仓 Media 计划；仍不等于 partial clone／VFS 完成。
 - **Memory**：M2 计划 `plan-20260819.md` 仍无实现合入（`ls src/internal/ai/memory` 不存在、`src/cli.rs` 无 `memory` 子命令），MEM-01/MEM-02 维持「已排期」。
-- **未发布变更（v0.22.10..HEAD，5 条）**：`d57a908` **SSH host key 策略变更**（默认 `ask` 不再强制 `StrictHostKeyChecking=yes`；`ssh.strictHostKeyChecking` 四值）——用户可见的兼容/安全姿态变更，触及「兼容与迁移」「安全与隐私」门禁；`COMPATIBILITY.md` 与 `docs/commands/{clone,fetch,config}.md` 均未记录（`grep -c strictHostKeyChecking` = 0，按 P1 线索处理）；`b800de7` docs(agents) 同步；`ea585f4` fix(ci)；`3b28038` chore(web)；`ff9033b` merge。
-- 日期计划对账：磁盘 13 份 `plan-2026*.md`；索引缺 `plan-20260827`、`plan-20260830` 两行（本轮已补）；`plan-20260714` 规范化为「已完成」、`plan-20260821/24/25` 规范化为「已完成」。
+ - **未发布变更（v0.22.19..HEAD，3 条）**：`1524ecab` SQLite pool lifecycle 修复；`823cb628` FastCDC 计划移除文件容量硬上限；`8c77f9c` FastCDC 双仓计划关系对齐。前两项分别触及数据库可靠性／Media 行为契约，应在各自计划收口时保留迁移、容量和回滚证据。
+ - **日期计划对账**：磁盘 24 份 `plan-2026*.md`，索引已补齐 `plan-20260902`..`plan-20260913`；计划状态统一使用 `已完成`、`实施中`、`已排期`、`未建` 四词。最新计划仍为设计态，未提前视为实现完成。
 - deepseek-harness bridge：`plan-20260818.md` 事实不变；本轮复核 deepseek 上游 `session/created|event|flush|disposed` 事件面仍在（`packages/core/session/src/index.ts` 52–83 行），Libra `agent_bridge/ingress.rs:67` 依赖成立，bridge 无需变更。
 
 ---
@@ -259,7 +297,7 @@ flowchart LR
 | **LR-02** | 全命令 Operation Log、完整快照与 Undo/Redo | P0 | 实施中 | v1 已发布（`src/command/op.rs:41`、五表 schema、`command_test::op_test` 22 test）；OL-01 worktree I/O 已合入（merge `dad35f2`）；v2（`RepoViewV2`/`WorkspaceSnapshotV2`/`RestoreEngine`、OL-02..OL-15）未开始；[`plan-20260822.md`](plan-20260822.md) 已建 |
 | **LR-03** | 稳定 Change ID 与历史重写谱系 | P0 | 已排期 | [`plan-20260822.md`](plan-20260822.md)（Change ID v2，CH-*）+ `[OL-00]` sidecar Change ID spike 状态为 `in-progress / remote-pending`（更正：非「已冻结」）；`grep -rn 'ChangeId\|change_id' src` 除 `log/trailer.rs` 外 = 0，实现未开始 |
 | **LR-04** | 非交互 Hunk API、归属与 Stack 编辑 | P0 | 已验证 | 有只读 hunk；无稳定 ID、assignment、mutation；gitbutler 本轮把未提交区 ID `zz`→`@` 并支持 committed hunk mutation（Agent 面向 ID 契约变更，E1 线索） |
-| **LR-05** | 一等冲突对象与 Modeless Sequencer | P1 | 已验证 | Git-compat conflict 有；versioned conflict object / descendant rebase 无 |
+| **LR-05** | 一等冲突对象与 Modeless Sequencer | P1 | 实施中 | merge 主路径、rename/D-F/octopus/mergetool/签名已随 `plan-20260903` 交付；versioned conflict object / descendant rebase 仍无 |
 | **LR-08** | Forge/PR/CI 与 Stacked Review | P1 | 已验证 | 无 Forge trait、PR/CI 状态、stack mapping |
 | **LR-09** | Materializing Sparse、Partial Clone、VFS Hydration | P2 | 已验证 | sparse-view 只读；hydrate 为 whole-object；无 promisor/VFS；FastCDC media transport 已合入（`ca997dd`，feature `fastcdc` 默认 OFF，`COMPATIBILITY.md:116 media`） |
 
@@ -399,7 +437,7 @@ S4 不要求 S1 全部候选项先发布：每个 wave 只以其候选集实际�
 - schema/migration 有 forward + 测试；损坏数据 fail loud。
 - Memory 存储路径锚定绝对化，不得用 cwd-relative 存数据（agentmemory `e04ba88` 曾因 engine 无 cwd 导致「数据全丢」）。
 - 多仓 / worker 级 Memory 数据隔离（memorax-code `5498144` 把 repo-memory worker DB 按仓隔离）。
-- redaction 失败路径 fail-closed 为全量脱敏，不泄漏私密（entireio/cli `aa5ddb4`）。
+- redaction 失败路径 fail-closed 为全量脱敏，不泄漏私密（本轮以 `letta-ai/letta-code@1d506973` 的权限／memory 边界测试作为 E2 参照）。
 - Memory 写入有可配置上限（单文件字符数、目录深度）且在提交入口强制，超限写入被拒绝（letta-code `9047f71c` pre-commit 强制 memory 限额，E2）。
 
 ### MEM-02：混合召回与会话注入
@@ -604,6 +642,16 @@ MEM-03 → MEM-04；LR-09；LR-10；MEM-05 / AG-ATTR 按需；MEM-06（并行协
 | [`plan-20260827.md`](plan-20260827.md) | 横切（SB-04 测试并行度与序列注册） | 已完成 | NP-00..05 六卡全部 complete（nextest 离线 CI face `a8218ac`、串行注册 `315132a`、TA-03/06/07 承接）；D 组 CI 证据环境受阻部分按 backfill 窗口记录 |
 | [`plan-20260830.md`](plan-20260830.md) | 横切（SB-02 sandbox export） | 已完成 | SBX-01..05 五卡 done/locally-accepted（共享 SandboxManager transform、macOS seatbelt OpenCode export）；ER-13 全量收口门绿（2026-09-01）；DEFER-SBX-06 发布步延后 |
 | [`plan-20260901.md`](plan-20260901.md) | 横切（SB-01 pkt-line fail-closed） | 已排期 | 承接第十次审计 Top-1：PKT-01 帧长校验 helper 与 marker 常量、PKT-02/03/04 家族卡（同步解析器 + discovery 传播/capability 收口 + `PushError::Protocol`）经 PKT-05 统一发布、PKT-04/06/10 边界 marker 适配（`LBR-NET-002`，8 映射点：push-discovery 归 PKT-04，其余 7 点归 PKT-06/10）与异步下界/EOF 语义、PKT-09 push 状态行归类、PKT-08/12/11 git-ssh 下界与 SSH 全部用户可见 stderr 面脱敏、PKT-13 异步头解析 marker 化、PKT-14 push `ng` 输入校验与渲染卫生；ADR-PKT-01 三层机制、ADR-PKT-02 `ng` reason 净化口径、ADR-PKT-03 SSH BatchMode/host-key fail-closed（DEFER-07 终端中介）；Codex/Claude 双评审 PASS 后执行 |
+| [`plan-20260902.md`](plan-20260902.md) | B（OpenCode artifact／memory） | 实施中 | 计划仍有未完成卡；以当前计划状态为准 |
+| [`plan-20260903.md`](plan-20260903.md) | A（LR-05 merge） | 实施中 | MG-01..MG-21 已有代码、测试与发布提交；最终计划收口与 deferred 差异仍待完成 |
+| [`plan-20260904.md`](plan-20260904.md) | B（Codex reasoning） | 已排期 | 设计计划，任务卡尚未完成 |
+| [`plan-20260905.md`](plan-20260905.md) | B（Claude hooks/reasoning） | 已排期 | 设计计划，任务卡尚未完成 |
+| [`plan-20260906.md`](plan-20260906.md) | 横切（安全扫描） | 已排期 | 设计计划，任务卡尚未完成 |
+| [`plan-20260907.md`](plan-20260907.md) | 横切（BLAKE3 object format） | 已排期 | 设计计划，任务卡尚未执行；与 Media 计划的边界见其关系表 |
+| [`plan-20260910.md`](plan-20260910.md) | 横切（数据库迁移作用域） | 已排期 | 设计计划，任务卡尚未执行 |
+| [`plan-20260911.md`](plan-20260911.md) | B（hook boundary） | 已排期 | 设计计划，任务卡尚未执行 |
+| [`plan-20260912.md`](plan-20260912.md) | B（memory boundary） | 已排期 | 设计计划，任务卡尚未执行 |
+| [`plan-20260913.md`](plan-20260913.md) | A（LR-09 FastCDC Media） | 已排期 | 设计计划，任务卡尚未执行；Libra 侧以前置 `plan-20260907` 完整收口为准 |
 | （待建）Memory 后续日期计划 | C（MEM-03..06） | 未建 | 待用户独立编写；M2 切片落地后按证据再议 |
 
 ---

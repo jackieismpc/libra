@@ -40,7 +40,7 @@ use libra::{
     internal::{branch::Branch, head::Head},
     utils::{
         pager::LIBRA_TEST_ENV,
-        test::{self, ChangeDirGuard},
+        test::{self, ChangeDirGuard, ConfigDbFixture},
     },
 };
 use serde::Deserialize;
@@ -68,6 +68,7 @@ fn base_libra_command(args: &[&str], cwd: &Path) -> Command {
     let home = cwd.join(".libra-test-home");
     let config_home = home.join(".config");
     let global_db = home.join(".libra").join("config.db");
+    let system_db = home.join(".libra").join("system-config.db");
     let llvm_profile_file = std::env::var_os("LLVM_PROFILE_FILE");
     fs::create_dir_all(&config_home).expect("failed to create isolated config directory");
 
@@ -81,6 +82,7 @@ fn base_libra_command(args: &[&str], cwd: &Path) -> Command {
         .env("USERPROFILE", &home)
         .env("XDG_CONFIG_HOME", &config_home)
         .env("LIBRA_CONFIG_GLOBAL_DB", &global_db)
+        .env("LIBRA_CONFIG_SYSTEM_DB", &system_db)
         .env("LANG", "C")
         .env("LC_ALL", "C")
         .env(LIBRA_TEST_ENV, "1");

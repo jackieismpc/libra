@@ -36,7 +36,7 @@ use sea_orm::{
 
 use crate::{
     internal::{
-        db::{get_db_conn_instance, get_db_conn_instance_for_path},
+        db::{DatabaseRole, get_db_conn_instance, get_db_conn_instance_for_path, schema},
         head::Head,
         model::{
             config::{self, ActiveModel, Model},
@@ -1383,7 +1383,13 @@ pub async fn read_cascaded_config_value_strict(
     }
 
     if let Some(path) = global_config_path() {
-        match read_config_entry_from_db_path_case_insensitive(&path, key).await {
+        match read_config_entry_from_db_path_case_insensitive(
+            &path,
+            key,
+            DatabaseRole::GlobalConfig,
+        )
+        .await
+        {
             Ok(Some(entry)) => {
                 return Ok(Some(
                     decrypt_strict_config_entry(entry, StrictConfigScope::Global).await?,
@@ -1395,7 +1401,13 @@ pub async fn read_cascaded_config_value_strict(
     }
 
     if let Some(path) = system_config_path() {
-        match read_config_entry_from_db_path_case_insensitive(&path, key).await {
+        match read_config_entry_from_db_path_case_insensitive(
+            &path,
+            key,
+            DatabaseRole::SystemConfig,
+        )
+        .await
+        {
             Ok(Some(entry)) => {
                 match decrypt_strict_config_entry(entry, StrictConfigScope::System).await {
                     Ok(value) => return Ok(Some(value)),
@@ -1448,18 +1460,25 @@ pub(crate) async fn read_cascaded_config_keys_by_prefix_strict(
         LocalIdentityTarget::None => None,
     };
     if let Some(path) = local_path {
-        keys.extend(read_config_keys_by_prefix_from_db_path(&path, prefix).await?);
+        keys.extend(
+            read_config_keys_by_prefix_from_db_path(&path, prefix, DatabaseRole::Repository)
+                .await?,
+        );
     }
 
     if let Some(path) = global_config_path() {
-        match read_config_keys_by_prefix_from_db_path(&path, prefix).await {
+        match read_config_keys_by_prefix_from_db_path(&path, prefix, DatabaseRole::GlobalConfig)
+            .await
+        {
             Ok(scope_keys) => keys.extend(scope_keys),
             Err(error) => skip_global_scope_if_schema_future(&path, error).await?,
         }
     }
 
     if let Some(path) = system_config_path() {
-        match read_config_keys_by_prefix_from_db_path(&path, prefix).await {
+        match read_config_keys_by_prefix_from_db_path(&path, prefix, DatabaseRole::SystemConfig)
+            .await
+        {
             Ok(scope_keys) => keys.extend(scope_keys),
             Err(error) => {
                 tracing::debug!(
@@ -1478,6 +1497,7 @@ pub(crate) async fn read_cascaded_config_keys_by_prefix_strict(
 async fn read_config_keys_by_prefix_from_db_path(
     db_path: &Path,
     prefix: &str,
+    role: DatabaseRole,
 ) -> Result<BTreeSet<String>> {
     let exists = db_path
         .try_exists()
@@ -1486,18 +1506,20 @@ async fn read_config_keys_by_prefix_from_db_path(
         return Ok(BTreeSet::new());
     }
 
-    let conn = get_db_conn_instance_for_path(db_path)
+    let conn = open_scoped_config_reader(db_path, role)
         .await
         .with_context(|| format!("failed to open config database '{}'", db_path.display()))?;
     let mut keys = BTreeSet::new();
-    for row in config_kv::Entity::find()
-        .order_by_asc(config_kv::Column::Key)
-        .all(&conn)
-        .await
-        .with_context(|| format!("failed to query config keys in '{}'", db_path.display()))?
-    {
-        if config_key_has_prefix(&row.key, prefix) {
-            keys.insert(row.key);
+    if scoped_config_has_kv(&conn, role).await? {
+        for row in config_kv::Entity::find()
+            .order_by_asc(config_kv::Column::Key)
+            .all(&conn)
+            .await
+            .with_context(|| format!("failed to query config keys in '{}'", db_path.display()))?
+        {
+            if config_key_has_prefix(&row.key, prefix) {
+                keys.insert(row.key);
+            }
         }
     }
 
@@ -1559,7 +1581,8 @@ pub(crate) async fn read_cascaded_subsection_values_strict(
     };
     if let Some(path) = local_path {
         for (subsection, entry) in
-            read_subsection_entries_from_db_path(&path, section, variable).await?
+            read_subsection_entries_from_db_path(&path, section, variable, DatabaseRole::Repository)
+                .await?
         {
             let value =
                 decrypt_strict_config_entry(entry, StrictConfigScope::Local(local_target)).await?;
@@ -1568,7 +1591,14 @@ pub(crate) async fn read_cascaded_subsection_values_strict(
     }
 
     if let Some(path) = global_config_path() {
-        match read_subsection_entries_from_db_path(&path, section, variable).await {
+        match read_subsection_entries_from_db_path(
+            &path,
+            section,
+            variable,
+            DatabaseRole::GlobalConfig,
+        )
+        .await
+        {
             Ok(entries) => {
                 for (subsection, entry) in entries {
                     let value =
@@ -1581,7 +1611,14 @@ pub(crate) async fn read_cascaded_subsection_values_strict(
     }
 
     if let Some(path) = system_config_path() {
-        match read_subsection_entries_from_db_path(&path, section, variable).await {
+        match read_subsection_entries_from_db_path(
+            &path,
+            section,
+            variable,
+            DatabaseRole::SystemConfig,
+        )
+        .await
+        {
             Ok(entries) => {
                 for (subsection, entry) in entries {
                     match decrypt_strict_config_entry(entry, StrictConfigScope::System).await {
@@ -1625,6 +1662,7 @@ async fn read_subsection_entries_from_db_path(
     db_path: &Path,
     section: &str,
     variable: &str,
+    role: DatabaseRole,
 ) -> Result<Vec<(String, ConfigKvEntry)>> {
     let exists = db_path
         .try_exists()
@@ -1633,19 +1671,23 @@ async fn read_subsection_entries_from_db_path(
         return Ok(Vec::new());
     }
 
-    let conn = get_db_conn_instance_for_path(db_path)
+    let conn = open_scoped_config_reader(db_path, role)
         .await
         .with_context(|| format!("failed to open config database '{}'", db_path.display()))?;
-    let rows = config_kv::Entity::find()
-        .order_by_desc(config_kv::Column::Id)
-        .all(&conn)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to query {section}.*.{variable} from config database '{}'",
-                db_path.display()
-            )
-        })?;
+    let rows = if scoped_config_has_kv(&conn, role).await? {
+        config_kv::Entity::find()
+            .order_by_desc(config_kv::Column::Id)
+            .all(&conn)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to query {section}.*.{variable} from config database '{}'",
+                    db_path.display()
+                )
+            })?
+    } else {
+        Vec::new()
+    };
     let mut seen = HashSet::new();
     let mut entries = Vec::new();
     for row in &rows {
@@ -1768,7 +1810,9 @@ async fn global_config_decrypted_value(key: &str) -> Result<Option<String>> {
         return Ok(None);
     }
 
-    let Some(entry) = read_config_entry_from_db_path(&db_path, key).await? else {
+    let Some(entry) =
+        read_config_entry_from_db_path(&db_path, key, DatabaseRole::GlobalConfig).await?
+    else {
         return Ok(None);
     };
     let value = if entry.encrypted {
@@ -1877,10 +1921,10 @@ async fn local_config_entry_for_target(
                 }
             };
             let db_path = storage.join(crate::utils::util::DATABASE);
-            read_config_entry_from_db_path(&db_path, key).await
+            read_config_entry_from_db_path(&db_path, key, DatabaseRole::Repository).await
         }
         LocalIdentityTarget::ExplicitDb(db_path) => {
-            read_config_entry_from_db_path(db_path, key).await
+            read_config_entry_from_db_path(db_path, key, DatabaseRole::Repository).await
         }
         LocalIdentityTarget::None => Ok(None),
     }
@@ -1900,10 +1944,12 @@ async fn local_config_entry_for_target_case_insensitive(
                 }
             };
             let db_path = storage.join(crate::utils::util::DATABASE);
-            read_config_entry_from_db_path_case_insensitive(&db_path, key).await
+            read_config_entry_from_db_path_case_insensitive(&db_path, key, DatabaseRole::Repository)
+                .await
         }
         LocalIdentityTarget::ExplicitDb(db_path) => {
-            read_config_entry_from_db_path_case_insensitive(db_path, key).await
+            read_config_entry_from_db_path_case_insensitive(db_path, key, DatabaseRole::Repository)
+                .await
         }
         LocalIdentityTarget::None => Ok(None),
     }
@@ -1922,7 +1968,9 @@ async fn global_env_value(name: &str, vault_key: &str) -> Result<Option<String>>
         return Ok(None);
     }
 
-    let Some(entry) = read_config_entry_from_db_path(&global_path, vault_key).await? else {
+    let Some(entry) =
+        read_config_entry_from_db_path(&global_path, vault_key, DatabaseRole::GlobalConfig).await?
+    else {
         return Ok(None);
     };
 
@@ -1957,10 +2005,10 @@ async fn local_config_value_for_target(
                 }
             };
             let db_path = storage.join(DATABASE);
-            read_config_value_from_db_path(&db_path, key).await
+            read_config_value_from_db_path(&db_path, key, DatabaseRole::Repository).await
         }
         LocalIdentityTarget::ExplicitDb(db_path) => {
-            read_config_value_from_db_path(db_path, key).await
+            read_config_value_from_db_path(db_path, key, DatabaseRole::Repository).await
         }
         LocalIdentityTarget::None => Ok(None),
     }
@@ -1981,7 +2029,7 @@ async fn global_config_value(key: &str) -> Result<Option<String>> {
 /// Path-parameterised body of [`global_config_value`] so the P0-12
 /// future-schema carve-out is unit-testable without mutating process env.
 async fn global_config_value_at(db_path: &Path, key: &str) -> Result<Option<String>> {
-    match read_config_value_from_db_path(db_path, key).await {
+    match read_config_value_from_db_path(db_path, key, DatabaseRole::GlobalConfig).await {
         Ok(value) => Ok(value),
         Err(error) => {
             skip_global_scope_if_schema_future(db_path, error).await?;
@@ -2068,7 +2116,7 @@ async fn read_cascaded_fresh_conn_at(
         Unusable,
     }
 
-    async fn fresh_conn_read(db_path: &Path, key: &str) -> ScopeRead {
+    async fn fresh_conn_read(db_path: &Path, key: &str, role: DatabaseRole) -> ScopeRead {
         // `try_exists`, not `exists` (Codex r13): `exists()` answers false
         // for metadata/access ERRORS too, which would misclassify an
         // unreadable store as Absent and let global answer for it. Only a
@@ -2079,16 +2127,14 @@ async fn read_cascaded_fresh_conn_at(
             Ok(false) => return ScopeRead::Absent,
             Err(_) => return ScopeRead::Unusable,
         }
-        let Some(db_str) = db_path.to_str() else {
-            return ScopeRead::Unusable;
-        };
         // No schema inspection/migration on open: this best-effort READ
         // path must never mutate the store it reads (a 200 ms busy timeout
         // against a concurrent writer could half-apply migrations). An
         // incompatible schema surfaces as a query error → Unusable.
-        let conn = match crate::internal::db::open_connection_without_schema_management(
-            db_str,
+        let conn = match schema::open_readonly_connection_for_role(
+            db_path,
             std::time::Duration::from_millis(200),
+            role,
         )
         .await
         {
@@ -2111,23 +2157,63 @@ async fn read_cascaded_fresh_conn_at(
     }
 
     if let Some(local) = local_db {
-        match fresh_conn_read(local, key).await {
+        match fresh_conn_read(local, key, DatabaseRole::Repository).await {
             ScopeRead::Value(value) => return Some(value),
             ScopeRead::Absent => {}
             ScopeRead::Unusable => return None,
         }
     }
-    match fresh_conn_read(global_db?, key).await {
+    match fresh_conn_read(global_db?, key, DatabaseRole::GlobalConfig).await {
         ScopeRead::Value(value) => Some(value),
         ScopeRead::Absent | ScopeRead::Unusable => None,
     }
 }
 
+/// Local repository reads retain their existing cache/upgrade behavior.
+/// Global and system reads have no creation or migration authority.
+async fn open_scoped_config_reader(
+    db_path: &Path,
+    role: DatabaseRole,
+) -> Result<DatabaseConnection> {
+    match role {
+        DatabaseRole::Repository => get_db_conn_instance_for_path(db_path)
+            .await
+            .map_err(Into::into),
+        DatabaseRole::GlobalConfig | DatabaseRole::SystemConfig => {
+            let conn = schema::open_readonly_connection_for_role(
+                db_path,
+                std::time::Duration::from_secs(30),
+                role,
+            )
+            .await?;
+            schema::check_configuration_schema(&conn, role).await?;
+            Ok(conn)
+        }
+        DatabaseRole::Derived => Err(anyhow!(
+            "derived databases cannot supply configuration defaults; select the owning configuration scope"
+        )),
+    }
+}
+
+async fn scoped_config_has_kv(conn: &DatabaseConnection, role: DatabaseRole) -> Result<bool> {
+    if role == DatabaseRole::Repository {
+        // Do not hide a broken repository table behind configuration fallback.
+        return Ok(true);
+    }
+    schema::configuration_has_kv(conn, role)
+        .await
+        .map_err(Into::into)
+}
+
 /// Read a config value from `db_path`, trimming whitespace and treating empty
 /// strings as missing. Used for non-vault keys where surrounding whitespace
 /// is almost certainly a typo.
-async fn read_config_value_from_db_path(db_path: &Path, key: &str) -> Result<Option<String>> {
-    let entry = read_config_entry_from_db_path(db_path, key).await?;
+async fn read_config_value_from_db_path(
+    db_path: &Path,
+    key: &str,
+    role: DatabaseRole,
+) -> Result<Option<String>> {
+    let entry = read_config_entry_from_db_path(db_path, key, role).await?;
     Ok(entry.and_then(|entry| {
         let trimmed = entry.value.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
@@ -2142,14 +2228,21 @@ async fn read_config_value_from_db_path(db_path: &Path, key: &str) -> Result<Opt
 async fn read_config_entry_from_db_path(
     db_path: &Path,
     key: &str,
+    role: DatabaseRole,
 ) -> Result<Option<ConfigKvEntry>> {
-    if !db_path.exists() {
+    if !db_path
+        .try_exists()
+        .with_context(|| format!("failed to inspect config database '{}'", db_path.display()))?
+    {
         return Ok(None);
     }
 
-    let conn = get_db_conn_instance_for_path(db_path)
+    let conn = open_scoped_config_reader(db_path, role)
         .await
         .with_context(|| format!("failed to open config database '{}'", db_path.display()))?;
+    if !scoped_config_has_kv(&conn, role).await? {
+        return Ok(None);
+    }
     ConfigKv::get_with_conn(&conn, key).await.with_context(|| {
         format!(
             "failed to query '{key}' from config database '{}'",
@@ -2161,6 +2254,7 @@ async fn read_config_entry_from_db_path(
 async fn read_config_entry_from_db_path_case_insensitive(
     db_path: &Path,
     key: &str,
+    role: DatabaseRole,
 ) -> Result<Option<ConfigKvEntry>> {
     let exists = db_path
         .try_exists()
@@ -2172,20 +2266,24 @@ async fn read_config_entry_from_db_path_case_insensitive(
     let Some((section, subsection, variable)) = split_git_config_key(key) else {
         return Ok(None);
     };
-    let conn = get_db_conn_instance_for_path(db_path)
+    let conn = open_scoped_config_reader(db_path, role)
         .await
         .with_context(|| format!("failed to open config database '{}'", db_path.display()))?;
 
-    let entries = config_kv::Entity::find()
-        .order_by_desc(config_kv::Column::Id)
-        .all(&conn)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to query '{key}' from config database '{}'",
-                db_path.display()
-            )
-        })?;
+    let entries = if scoped_config_has_kv(&conn, role).await? {
+        config_kv::Entity::find()
+            .order_by_desc(config_kv::Column::Id)
+            .all(&conn)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to query '{key}' from config database '{}'",
+                    db_path.display()
+                )
+            })?
+    } else {
+        Vec::new()
+    };
     if let Some(entry) = entries
         .iter()
         .find(|entry| git_config_key_matches(&entry.key, key))
@@ -2968,7 +3066,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(env)]
     async fn locate_env_reports_the_hit_layer_and_resolver_delegates() {
-        use crate::utils::test::ScopedEnvVar;
+        use crate::utils::test::{ConfigDbFixture, ScopedEnvVar};
 
         let name = "LIBRA_PS06_LOCATE_TEST_KEY";
         let _process_probe = ScopedEnvVar::set(name, "layer-probe");
@@ -2987,8 +3085,8 @@ mod tests {
         let _missing_probe = ScopedEnvVar::unset(name);
 
         let tmp = tempfile::tempdir().expect("tempdir");
-        let db = tmp.path().join("isolated-global.db");
-        let _global_db = ScopedEnvVar::set("LIBRA_CONFIG_GLOBAL_DB", &db);
+        let config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
+        let db = config_fixture.global_db().to_path_buf();
         let missing = locate_env_for_target(name, LocalIdentityTarget::None)
             .await
             .expect("miss path");
@@ -3051,15 +3149,12 @@ mod tests {
     #[test]
     #[serial_test::serial(env)]
     fn resolve_env_sync_for_dir_reads_the_target_repos_vault() {
-        use crate::utils::test::ScopedEnvVar;
+        use crate::utils::test::{ConfigDbFixture, ScopedEnvVar};
 
         let name = "LIBRA_PS06_AB_FACTORY_KEY";
         let _probe = ScopedEnvVar::unset(name);
         let tmp = tempfile::tempdir().expect("tempdir");
-        let _global_db = ScopedEnvVar::set(
-            "LIBRA_CONFIG_GLOBAL_DB",
-            tmp.path().join("isolated-global.db"),
-        );
+        let _config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         for (repo, value) in [("a", "from-repo-a"), ("b", "from-repo-b")] {
             let storage = tmp.path().join(repo).join(".libra");
@@ -3209,6 +3304,7 @@ mod tests {
         let entry = read_config_entry_from_db_path_case_insensitive(
             &missing_table_db,
             "init.defaultBranch",
+            DatabaseRole::Repository,
         )
         .await
         .expect("a missing legacy table means no legacy rows, not a lookup failure");
@@ -3231,10 +3327,13 @@ mod tests {
             conn.close().await.expect("close config db");
         }
 
-        let entry =
-            read_config_entry_from_db_path_case_insensitive(&legacy_db, "init.defaultBranch")
-                .await
-                .expect("legacy rows remain readable");
+        let entry = read_config_entry_from_db_path_case_insensitive(
+            &legacy_db,
+            "init.defaultBranch",
+            DatabaseRole::Repository,
+        )
+        .await
+        .expect("legacy rows remain readable");
         assert_eq!(entry.map(|entry| entry.value), Some("legacy-main".into()));
     }
 
@@ -3275,21 +3374,18 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(env)]
     async fn strict_subsection_snapshot_cascades_each_case_sensitive_name() {
-        use crate::utils::test::ScopedEnvVar;
+        use crate::utils::test::ConfigDbFixture;
 
-        let temp = tempfile::tempdir().expect("create tempdir");
-        let local_db = temp.path().join("local.db");
-        let global_db = temp.path().join("global.db");
-        let system_db = temp.path().join("system.db");
+        let config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
+        let local_db = config_fixture.root().join("local.db");
+        let global_db = config_fixture.global_db().to_path_buf();
+        let system_db = config_fixture.system_db().to_path_buf();
         write_config_db(&local_db, "Merge.Shared.Driver", "local-shared", false).await;
         append_plain_config(&local_db, "merge.Local.driver", "local-only").await;
         write_config_db(&global_db, "merge.Shared.driver", "global-shadowed", false).await;
         append_plain_config(&global_db, "MERGE.Global.DRIVER", "global-only").await;
         append_plain_config(&global_db, "merge.local.driver", "lowercase-subsection").await;
         write_config_db(&system_db, "merge.System.driver", "system-only", false).await;
-        let _global = ScopedEnvVar::set("LIBRA_CONFIG_GLOBAL_DB", &global_db);
-        let _system = ScopedEnvVar::set("LIBRA_CONFIG_SYSTEM_DB", &system_db);
-
         let values = read_cascaded_subsection_values_strict(
             LocalIdentityTarget::ExplicitDb(&local_db),
             "merge",
@@ -3313,12 +3409,12 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(env)]
     async fn strict_prefix_key_snapshot_includes_all_scopes_and_legacy_rows() {
-        use crate::utils::test::ScopedEnvVar;
+        use crate::utils::test::ConfigDbFixture;
 
-        let temp = tempfile::tempdir().expect("create tempdir");
-        let local_db = temp.path().join("local.db");
-        let global_db = temp.path().join("global.db");
-        let system_db = temp.path().join("system.db");
+        let config_fixture = ConfigDbFixture::new().expect("create config DB fixture");
+        let local_db = config_fixture.root().join("local.db");
+        let global_db = config_fixture.global_db().to_path_buf();
+        let system_db = config_fixture.system_db().to_path_buf();
         write_config_db(&local_db, "MERGETOOL.local.cmd", "local-tool", false).await;
         write_config_db(
             &global_db,
@@ -3343,9 +3439,6 @@ mod tests {
             .expect("insert legacy mergetool key");
             conn.close().await.expect("close system db");
         }
-        let _global = ScopedEnvVar::set("LIBRA_CONFIG_GLOBAL_DB", &global_db);
-        let _system = ScopedEnvVar::set("LIBRA_CONFIG_SYSTEM_DB", &system_db);
-
         let keys = read_cascaded_config_keys_by_prefix_strict(
             LocalIdentityTarget::ExplicitDb(&local_db),
             "mergetool.",

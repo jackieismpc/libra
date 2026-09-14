@@ -46,6 +46,38 @@ A single positional argument with no value is a **read**, matching `git config <
 
 **Intentional difference from Git:** for a *protected* key — one Libra classifies as a secret (`vault.env.*`, `auth.token.*`, `*.privkey`, or a last segment containing `secret`, `token`, `password`, `credential`, `apikey`, `accesskey`, `privatekey` or `secretkey`) — the bare form keeps Libra's interactive secure-assignment path: it prompts for a **new** value with echo off instead of printing the stored one. With no terminal available it reports `missing value for protected key '<key>' (non-interactive environment)` and exits 2. Read a protected key with `libra config get <key>`, which returns `<REDACTED>`. This divergence is registered in `COMPATIBILITY.md`.
 
+## Configuration schema compatibility
+
+GlobalConfig and SystemConfig use the configuration-owned
+`configuration_schema_versions` ledger, separate from Repository migrations.
+Known Repository-only receipts (including `2026090801` in the current manifest)
+do not make a configuration store future. Unknown or mismatched receipts and
+true configuration future schemas remain unsupported; remote/cloud commands
+that need the affected scope fail closed with `LBR-CONFIG-001`.
+
+An explicit global/system configuration mutation writes the
+configuration-owned legacy-reader barrier and its configuration changes in the
+same transaction. The barrier is a reserved receipt in the legacy ledger so
+older binaries, including the pinned `0.22.16` reader, refuse to write this
+store. This build recognizes the exact barrier together with a valid
+configuration base receipt. A failed transaction rolls back both the barrier
+and the configuration change. Existing legacy receipts are retained.
+
+Scoped get/list, default-value cascades and remote preflight never write the
+barrier. Cascaded configuration reads are read-only and do not bootstrap a
+missing store. The compatibility transition is forward-only: older binaries
+must upgrade; never delete receipts or edit SQLite to force a downgrade.
+Recognizing a supported Repository receipt is not permission for automatic
+repair. Unknown/unsupported state is upgrade-only in this release.
+
+GlobalConfig uses `LIBRA_CONFIG_GLOBAL_DB` or `~/.libra/config.db`;
+SystemConfig uses `LIBRA_CONFIG_SYSTEM_DB` or `/etc/libra/config.db`.
+Complete process/repo-local storage configuration may make GlobalConfig
+unnecessary, but does not bypass SystemConfig compatibility for remote/cloud
+defaults. Use `--offline` or `LIBRA_READ_POLICY=offline|local` only for
+intentional local-only object access, not to bypass remote synchronization
+safety checks.
+
 ## Options
 
 ### Subcommands

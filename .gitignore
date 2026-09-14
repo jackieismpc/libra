@@ -38,6 +38,7 @@ target-codex-review/
 
 # Test credentials (never commit)
 .env.test
+.env.live-test
 .env
 
 # Frontend

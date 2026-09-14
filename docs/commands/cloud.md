@@ -22,17 +22,28 @@ Restore can target a repository by UUID (`--repo-id`) or project name (`--name`)
 
 ## Global Config Schema Guard
 
-`libra cloud` reads the global storage configuration (`~/.libra/config.db`, or
-`LIBRA_CONFIG_GLOBAL_DB`) before trusting remote/tiered object storage settings. If that
-database has a schema version newer than this binary supports, cloud commands fail closed
-with `LBR-CONFIG-001` instead of silently ignoring global storage config and falling back
-to local objects. The diagnostic includes the binary path and version, config DB path,
-schema versions, and the update command:
-`curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh | sh`.
+Configuration schema compatibility is role-scoped. Before `libra cloud` trusts
+configuration, it inspects GlobalConfig and SystemConfig metadata read-only. A
+future configuration schema or an unregistered/mismatched migration receipt
+fails closed with `LBR-CONFIG-001` when that scope is required. Known
+Repository-only receipts, including `2026090801` in the current manifest, do
+not make a configuration store future; its supported values remain readable.
+The configuration-owned legacy-reader barrier is recognized by this build;
+see [configuration compatibility](config.md#configuration-schema-compatibility).
 
-Use `libra --offline cloud ...` or `LIBRA_READ_POLICY=offline|local libra cloud ...` only when
-you intentionally want local-only object access. Libra will warn once and ignore the
-global storage config for that run.
+Global configuration uses `LIBRA_CONFIG_GLOBAL_DB` or `~/.libra/config.db`;
+system configuration uses `LIBRA_CONFIG_SYSTEM_DB` or `/etc/libra/config.db`.
+Complete process/repo-local storage settings can make GlobalConfig unnecessary
+(`cloud` must also satisfy its D1 settings). They do not prove that SystemConfig
+defaults are unnecessary. Diagnostics identify the affected scope, ledger and
+version without printing configuration values or untrusted receipt names.
+
+Unknown or unsupported state is upgrade-only here, not automatically repaired.
+Install a compatible newer Libra binary:
+`curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh | sh`.
+Do not delete or edit SQLite receipts manually. Use `--offline` or
+`LIBRA_READ_POLICY=offline|local` only for intentional local-only object access;
+these modes warn and are not authorization for remote synchronization.
 
 ## Options
 

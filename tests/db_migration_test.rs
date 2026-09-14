@@ -4,21 +4,131 @@
 //! `tempfile::tempdir()` so the cases neither pollute each other nor
 //! depend on the embedded canonical bootstrap path.
 
-use std::path::PathBuf;
+use std::{ffi::OsStr, panic::AssertUnwindSafe, path::PathBuf};
 
-use libra::internal::db::migration::{
-    Migration, MigrationError, MigrationRunner, builtin_migrations,
-    builtin_runner as all_builtin_runner, run_builtin_migrations as run_all_builtin_migrations,
+use libra::{
+    internal::db::migration::{
+        Migration, MigrationError, MigrationRunner, builtin_migrations,
+        builtin_runner as all_builtin_runner, run_builtin_migrations as run_all_builtin_migrations,
+    },
+    utils::test::{ConfigDbFixture, ScopedEnvVar},
 };
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement};
+use serial_test::serial;
 use tempfile::TempDir;
+
+const CONFIG_ENV: [&str; 5] = [
+    "LIBRA_CONFIG_GLOBAL_DB",
+    "LIBRA_CONFIG_SYSTEM_DB",
+    "HOME",
+    "USERPROFILE",
+    "XDG_CONFIG_HOME",
+];
+
+fn assert_config_db_fixture_env(fixture: &ConfigDbFixture) {
+    assert_eq!(
+        std::env::var_os(CONFIG_ENV[0]).as_deref(),
+        Some(fixture.global_db().as_os_str())
+    );
+    assert_eq!(
+        std::env::var_os(CONFIG_ENV[1]).as_deref(),
+        Some(fixture.system_db().as_os_str())
+    );
+    assert_eq!(
+        std::env::var_os(CONFIG_ENV[2]).as_deref(),
+        Some(fixture.home().as_os_str())
+    );
+    assert_eq!(
+        std::env::var_os(CONFIG_ENV[3]).as_deref(),
+        Some(fixture.home().as_os_str())
+    );
+    assert_eq!(
+        std::env::var_os(CONFIG_ENV[4]).as_deref(),
+        Some(fixture.xdg_config_home().as_os_str())
+    );
+    assert!(fixture.contains(fixture.global_db()));
+    assert!(fixture.contains(fixture.system_db()));
+}
+
+fn config_db_fixture_return_early() {
+    let fixture = ConfigDbFixture::new().expect("create config DB fixture");
+    assert_config_db_fixture_env(&fixture);
+}
+
+#[test]
+#[serial(env)]
+fn config_db_fixture_restores_caller_values_after_drop_and_early_return() {
+    let sentinels = CONFIG_ENV.map(|key| ScopedEnvVar::set(key, format!("caller-{key}")));
+    let expected = CONFIG_ENV.map(std::env::var_os);
+
+    {
+        let fixture = ConfigDbFixture::new().expect("create config DB fixture");
+        assert_config_db_fixture_env(&fixture);
+    }
+    for (key, value) in CONFIG_ENV.into_iter().zip(expected.iter()) {
+        assert_eq!(&std::env::var_os(key), value);
+    }
+
+    config_db_fixture_return_early();
+    for (key, value) in CONFIG_ENV.into_iter().zip(expected.iter()) {
+        assert_eq!(&std::env::var_os(key), value);
+    }
+    drop(sentinels);
+}
+
+#[test]
+#[serial(env)]
+fn config_db_fixture_restores_caller_values_after_panic() {
+    let sentinels = CONFIG_ENV.map(|key| ScopedEnvVar::set(key, OsStr::new("caller-value")));
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let fixture = ConfigDbFixture::new().expect("create config DB fixture");
+        assert_config_db_fixture_env(&fixture);
+        panic!("exercise fixture unwind");
+    }));
+    assert!(result.is_err());
+    for key in CONFIG_ENV {
+        assert_eq!(
+            std::env::var_os(key).as_deref(),
+            Some(OsStr::new("caller-value"))
+        );
+    }
+    drop(sentinels);
+}
+
+#[tokio::test]
+#[serial(env)]
+async fn config_db_fixture_creates_sqlite_only_beneath_its_root() {
+    let fixture = ConfigDbFixture::new().expect("create config DB fixture");
+    for path in [fixture.global_db(), fixture.system_db()] {
+        let conn = libra::internal::db::create_database(path.to_str().expect("UTF-8 DB path"))
+            .await
+            .expect("create isolated config database");
+        conn.close().await.expect("close isolated config database");
+        assert!(path.is_file(), "expected SQLite file at {}", path.display());
+        assert!(fixture.contains(path));
+    }
+}
 
 #[path = "db_migration/branch_convergence.rs"]
 mod branch_convergence;
+#[path = "db_migration/configuration_barrier.rs"]
+mod configuration_barrier;
 #[path = "db_migration/branch_convergence/historical_bootstrap.rs"]
 mod historical_bootstrap;
 #[path = "db_migration/legacy_config.rs"]
 mod legacy_config;
+#[path = "db_migration/role_scope.rs"]
+mod role_scope;
+
+#[tokio::test]
+async fn configuration_barrier_is_idempotent_and_atomic() {
+    configuration_barrier::atomic_barrier().await;
+}
+
+#[test]
+fn configuration_barrier_has_single_writer_callsite() {
+    configuration_barrier::sole_writer();
+}
 
 /// Path helper. Returns `(tempdir, sqlite-url)`. The TempDir is held by the
 /// caller for the lifetime of the test.

@@ -7,14 +7,21 @@ use std::{io::IsTerminal, path::PathBuf, process::Command};
 
 use clap::{Parser, Subcommand};
 use once_cell::sync::Lazy;
-use sea_orm::{DatabaseConnection, TransactionTrait};
+use sea_orm::{DatabaseConnection, DatabaseTransaction};
 use serde::Serialize;
 use tokio::sync::Mutex;
 
 use crate::{
     internal::{
         config::{ConfigKv, ConfigKvEntry, is_sensitive_key, is_vault_internal_key},
-        db::{create_database, establish_connection, get_db_conn_instance},
+        db::{
+            DatabaseRole, begin_write_transaction, get_db_conn_instance,
+            schema::{
+                create_configuration_database, ensure_configuration_schema_is_current,
+                open_configuration_database,
+            },
+            write_configuration_barrier,
+        },
         upgrade::settings::{
             UPGRADE_MODE_KEY, UpgradeMode, UpgradeSettingsError, read_mode as read_upgrade_mode,
             settings_path as upgrade_settings_path, write_mode as write_upgrade_mode,
@@ -75,6 +82,14 @@ pub enum ConfigScope {
 }
 
 impl ConfigScope {
+    pub fn database_role(self) -> DatabaseRole {
+        match self {
+            Self::Local => DatabaseRole::Repository,
+            Self::Global => DatabaseRole::GlobalConfig,
+            Self::System => DatabaseRole::SystemConfig,
+        }
+    }
+
     /// Cascade order for reads (highest to lowest precedence): local overrides
     /// global, which overrides system — matching Git.
     pub const CASCADE_ORDER: [ConfigScope; 3] =
@@ -100,40 +115,10 @@ impl ConfigScope {
     }
 
     pub async fn ensure_config_exists(&self) -> Result<(), String> {
-        match self {
-            ConfigScope::Local => Ok(()),
-            ConfigScope::Global | ConfigScope::System => {
-                let label = scope_name(*self);
-                if let Some(config_path) = self.get_config_path() {
-                    if let Some(parent_dir) = config_path.parent()
-                        && !parent_dir.exists()
-                    {
-                        std::fs::create_dir_all(parent_dir).map_err(|e| {
-                            format!(
-                                "Failed to create {label} config directory '{}': {e}{}",
-                                parent_dir.display(),
-                                if matches!(self, ConfigScope::System) {
-                                    " (writing system config usually requires elevated privileges)"
-                                } else {
-                                    ""
-                                }
-                            )
-                        })?;
-                    }
-                    if !config_path.exists() {
-                        let config_path_str = config_path.to_string_lossy();
-                        create_database(&config_path_str).await.map_err(|e| {
-                            format!("Failed to create {label} config database: {e}")
-                        })?;
-                    }
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "Could not determine {label} config path: home directory not available"
-                    ))
-                }
-            }
+        if *self != ConfigScope::Local {
+            ScopedConfig::get_connection(*self).await?;
         }
+        Ok(())
     }
 }
 
@@ -178,22 +163,78 @@ impl ScopedConfig {
             ));
         };
         let mut guard = cache.lock().await;
+        let role = scope.database_role();
         if let Some((cached_path, cached_conn)) = guard.as_ref() {
             if cached_path == &config_path {
+                ensure_configuration_schema_is_current(cached_conn, role)
+                    .await
+                    .map_err(|error| {
+                        format!("Failed to validate {scope_name} config database: {error}")
+                    })?;
                 return Ok(cached_conn.clone());
             }
             *guard = None;
         }
-        scope.ensure_config_exists().await?;
-        let config_path_str = config_path.to_string_lossy();
-        let conn = establish_connection(&config_path_str)
-            .await
-            .map_err(|e| format!("Failed to connect to {scope_name} config database: {e}"))?;
+        let exists = config_path.try_exists().map_err(|error| {
+            format!(
+                "Failed to inspect {scope_name} config database '{}': {error}",
+                config_path.display()
+            )
+        })?;
+        let conn = if exists {
+            open_configuration_database(&config_path, role).await
+        } else {
+            if let Some(parent) = config_path
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    format!(
+                        "Failed to create {scope_name} config directory '{}': {error}{}",
+                        parent.display(),
+                        if scope == ConfigScope::System {
+                            " (writing system config usually requires elevated privileges)"
+                        } else {
+                            ""
+                        }
+                    )
+                })?;
+            }
+            match create_configuration_database(&config_path, role).await {
+                // Another process may have created the file since the probe.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    open_configuration_database(&config_path, role).await
+                }
+                result => result,
+            }
+        }
+        .map_err(|error| format!("Failed to connect to {scope_name} config database: {error}"))?;
         *guard = Some((config_path, conn.clone()));
         Ok(conn)
     }
 
     // ── ConfigKv wrappers with scope ─────────────────────────────────
+
+    async fn begin_mutation(scope: ConfigScope) -> Result<DatabaseTransaction, String> {
+        let conn = Self::get_connection(scope).await?;
+        let txn = begin_write_transaction(&conn).await.map_err(|error| {
+            format!(
+                "failed to start {} config transaction: {error}",
+                scope_name(scope)
+            )
+        })?;
+        if scope != ConfigScope::Local {
+            write_configuration_barrier(&txn, scope.database_role())
+                .await
+                .map_err(|error| {
+                    format!(
+                        "failed to protect {} config before writing: {error}",
+                        scope_name(scope)
+                    )
+                })?;
+        }
+        Ok(txn)
+    }
 
     pub async fn get(scope: ConfigScope, key: &str) -> Result<Option<ConfigKvEntry>, String> {
         let conn = Self::get_connection(scope).await?;
@@ -215,10 +256,13 @@ impl ScopedConfig {
         value: &str,
         encrypted: bool,
     ) -> Result<(), String> {
-        let conn = Self::get_connection(scope).await?;
-        ConfigKv::set_with_conn(&conn, key, value, encrypted)
+        let txn = Self::begin_mutation(scope).await?;
+        ConfigKv::set_with_conn(&txn, key, value, encrypted)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| format!("failed to set config '{key}': {e}"))?;
+        txn.commit()
+            .await
+            .map_err(|e| format!("failed to commit config update: {e}"))
     }
 
     pub async fn add(
@@ -227,24 +271,35 @@ impl ScopedConfig {
         value: &str,
         encrypted: bool,
     ) -> Result<(), String> {
-        let conn = Self::get_connection(scope).await?;
-        ConfigKv::add_with_conn(&conn, key, value, encrypted)
+        let txn = Self::begin_mutation(scope).await?;
+        ConfigKv::add_with_conn(&txn, key, value, encrypted)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| format!("failed to add config '{key}': {e}"))?;
+        txn.commit()
+            .await
+            .map_err(|e| format!("failed to commit config update: {e}"))
     }
 
     pub async fn unset(scope: ConfigScope, key: &str) -> Result<usize, String> {
-        let conn = Self::get_connection(scope).await?;
-        ConfigKv::unset_with_conn(&conn, key)
+        let txn = Self::begin_mutation(scope).await?;
+        let removed = ConfigKv::unset_with_conn(&txn, key)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| format!("failed to unset config '{key}': {e}"))?;
+        txn.commit()
+            .await
+            .map_err(|e| format!("failed to commit config update: {e}"))?;
+        Ok(removed)
     }
 
     pub async fn unset_all(scope: ConfigScope, key: &str) -> Result<usize, String> {
-        let conn = Self::get_connection(scope).await?;
-        ConfigKv::unset_all_with_conn(&conn, key)
+        let txn = Self::begin_mutation(scope).await?;
+        let removed = ConfigKv::unset_all_with_conn(&txn, key)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| format!("failed to unset config '{key}': {e}"))?;
+        txn.commit()
+            .await
+            .map_err(|e| format!("failed to commit config update: {e}"))?;
+        Ok(removed)
     }
 
     pub async fn list_all(scope: ConfigScope) -> Result<Vec<ConfigKvEntry>, String> {
@@ -2531,12 +2586,8 @@ async fn handle_remove_section(
     scope: ConfigScope,
     output: &OutputConfig,
 ) -> CliResult<()> {
-    let conn = ScopedConfig::get_connection(scope)
-        .await
-        .map_err(config_read_cli_error)?;
-    // Begin first so the existence check and the deletes are one atomic unit.
-    let txn = conn
-        .begin()
+    // Lock before reading; the compatibility marker rolls back with deletes.
+    let txn = ScopedConfig::begin_mutation(scope)
         .await
         .map_err(|e| config_write_cli_error(format!("failed to start config transaction: {e}")))?;
 
@@ -2594,11 +2645,7 @@ async fn handle_rename_section(
         .with_exit_code(2));
     }
 
-    let conn = ScopedConfig::get_connection(scope)
-        .await
-        .map_err(config_read_cli_error)?;
-    let txn = conn
-        .begin()
+    let txn = ScopedConfig::begin_mutation(scope)
         .await
         .map_err(|e| config_write_cli_error(format!("failed to start config transaction: {e}")))?;
 
