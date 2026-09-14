@@ -546,7 +546,8 @@ WITH source_rows AS (
            COALESCE(description, kind) AS description,
            COALESCE(actor, '') AS actor, start_ts, end_ts, status,
            post_view_oid AS view_id, 'v2' AS source,
-           start_ts AS sort_start_ts_ms, end_ts AS sort_end_ts_ms,
+           CAST(start_ts / 1000 AS INTEGER) * 1000 AS sort_start_ts_ms,
+           CAST(end_ts / 1000 AS INTEGER) * 1000 AS sort_end_ts_ms,
            1 AS source_priority
       FROM operation
      WHERE repo_id = ?
@@ -569,8 +570,9 @@ const OPERATION_HISTORY_FIELDS: &str = "op_id, command_name, description, actor,
 
 /// Query the cross-version history in its canonical newest-first order.
 ///
-/// Legacy timestamps are seconds and v2 timestamps are milliseconds; the CTE
-/// normalizes both before sorting and assigns each row its unfiltered index.
+/// Legacy timestamps only carry one-second resolution, while v2 timestamps are
+/// milliseconds. The CTE rounds v2 values to the shared one-second precision,
+/// then uses the time-ordered operation id to break same-second ties consistently.
 async fn query_operation_log_page<C: ConnectionTrait>(
     db: &C,
     repo_id: &str,

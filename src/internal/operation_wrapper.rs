@@ -73,6 +73,13 @@ async fn acquire_repository_ref_lease(
     })
 }
 
+fn command_defers_repository_lease_until_control_claim(command_name: &str) -> bool {
+    matches!(
+        command_name.trim().split_ascii_whitespace().next(),
+        Some("merge" | "rebase" | "cherry-pick" | "revert" | "am" | "bisect")
+    )
+}
+
 pub(crate) async fn acquire_request_repository_ref_lease_wait(
     command_name: &str,
 ) -> Result<Option<ScopeLease>, OperationError> {
@@ -96,13 +103,6 @@ pub(crate) async fn acquire_request_repository_ref_lease_wait(
     let lease =
         acquire_repository_ref_lease(&db, &request_scope, &repo_id, command_name, true).await?;
     Ok(Some(lease))
-}
-
-fn command_defers_repository_lease_until_control_claim(command_name: &str) -> bool {
-    matches!(
-        command_name.trim().split_ascii_whitespace().next(),
-        Some("merge" | "rebase" | "cherry-pick" | "revert" | "am" | "bisect")
-    )
 }
 
 const PARENT_RESOLUTION_PAGE_SIZE: u64 = 200;
@@ -872,17 +872,38 @@ pub async fn begin_operation(
     begin_operation_with_conn(&db, meta, scope).await
 }
 
+/// Claim a sequencer control slot before acquiring the repository ref lease.
+pub(crate) async fn begin_sequencer_control_operation(
+    meta: OperationMeta,
+    scope: OperationScope,
+) -> Result<OperationBoundary, OperationError> {
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(OperationError::begin)?;
+    begin_operation_with_conn_policy(&db, meta, scope, true).await
+}
+
 /// [`begin_operation`] against a caller-provided connection.
 pub async fn begin_operation_with_conn(
     db: &DatabaseConnection,
     meta: OperationMeta,
     scope: OperationScope,
 ) -> Result<OperationBoundary, OperationError> {
+    begin_operation_with_conn_policy(db, meta, scope, false).await
+}
+
+async fn begin_operation_with_conn_policy(
+    db: &DatabaseConnection,
+    meta: OperationMeta,
+    scope: OperationScope,
+    defer_repository_lease_until_control_claim: bool,
+) -> Result<OperationBoundary, OperationError> {
     meta.validate()?;
     validate_parent_policy(scope.parent_policy)?;
 
     let repository_lease = if command_may_mutate_shared_refs(&meta.command_name)
-        && !command_defers_repository_lease_until_control_claim(&meta.command_name)
+        && !(defer_repository_lease_until_control_claim
+            && command_defers_repository_lease_until_control_claim(&meta.command_name))
         && !repository_ref_lease_is_held()
     {
         if let Some(request_scope) = crate::internal::worktree_scope::WorktreeScope::request_scope()

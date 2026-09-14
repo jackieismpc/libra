@@ -508,37 +508,35 @@ async fn test_op_indices_share_mixed_legacy_v2_history_through_transitions() {
     let rows = after_redo["data"]["operations"]
         .as_array()
         .expect("operation array after redo");
-    let add_entry = rows
+    let undo_entry = rows
         .iter()
-        .find(|entry| entry["op_id"] == add_entry["op_id"])
-        .expect("original add operation after redo");
-    let external_entry = rows
+        .find(|entry| entry["op_id"] == undo_id)
+        .expect("undo operation after redo");
+    let redo_entry = rows
         .iter()
-        .find(|entry| entry["op_id"] == external["op_id"])
-        .expect("external snapshot after redo");
-    let add_ref = format!(
+        .find(|entry| entry["op_id"] == redo_id)
+        .expect("redo operation after redo");
+    let redo_ref = format!(
         "@{{{}}}",
-        add_entry["index"].as_u64().expect("add index after redo")
+        redo_entry["index"].as_u64().expect("redo index after redo")
     );
-    let parent_ref = format!(
+    let undo_ref = format!(
         "@{{{}}}",
-        external_entry["index"]
-            .as_u64()
-            .expect("external index after redo")
+        undo_entry["index"].as_u64().expect("undo index after redo")
     );
     let reverted = run_json_op(
         repo.path(),
         &[
             "revert",
-            &add_ref,
+            &redo_ref,
             "--parent",
-            &parent_ref,
+            &undo_ref,
             "--force",
             "--dry-run",
         ],
     );
     assert_eq!(
-        reverted["data"]["receipt"]["target_op_id"], add_entry["op_id"],
+        reverted["data"]["receipt"]["target_op_id"], redo_id,
         "revert target must resolve through the unified history"
     );
 }
@@ -816,7 +814,9 @@ fn test_op_restore_dry_run_does_not_record_new_operation() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.starts_with("Would restore ") && stdout.contains(" path(s)"),
+        stdout.starts_with("Would restore to operation ")
+            && stdout.contains("HEAD would become:")
+            && stdout.contains("Refs that would be restored:"),
         "unexpected stdout: {stdout}"
     );
 
@@ -1045,7 +1045,9 @@ fn test_op_command_smoke_flow_covers_first_batch_chain() {
     assert_cli_success(&restore_output, "op restore --dry-run");
     let restore_stdout = String::from_utf8_lossy(&restore_output.stdout);
     assert!(
-        restore_stdout.starts_with("Would restore ") && restore_stdout.contains(" path(s)"),
+        restore_stdout.starts_with("Would restore to operation ")
+            && restore_stdout.contains("HEAD would become:")
+            && restore_stdout.contains("Refs that would be restored:"),
         "unexpected stdout: {restore_stdout}"
     );
 }

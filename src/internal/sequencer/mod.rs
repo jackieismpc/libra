@@ -483,7 +483,9 @@ pub(crate) async fn begin_control_operation(
     argv: &[String],
     repository_ref_lease_managed_by_command_boundary: bool,
 ) -> CliResult<Option<crate::internal::operation_wrapper::OperationBoundary>> {
-    use crate::internal::operation_wrapper::{OperationMeta, OperationScope, begin_operation};
+    use crate::internal::operation_wrapper::{
+        OperationMeta, OperationScope, begin_sequencer_control_operation,
+    };
 
     // The enumeration is the authority on what a control action IS: anything
     // entering the operation log must be one of the declared ones, or the
@@ -537,7 +539,7 @@ pub(crate) async fn begin_control_operation(
         duplicate_window: false,
         ..OperationScope::default()
     };
-    match begin_operation(meta, scope).await {
+    match begin_sequencer_control_operation(meta, scope).await {
         Ok(mut boundary) => {
             if !repository_ref_lease_managed_by_command_boundary
                 && control.mutation_scope().repository_refs
