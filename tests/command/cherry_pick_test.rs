@@ -16,6 +16,196 @@ use tempfile::tempdir;
 use super::*;
 
 #[test]
+fn cherry_pick_driver_union_resolves_overlapping_change() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    fs::write(root.join("driver.txt"), "top\nbase\nbottom\n").unwrap();
+    fs::write(root.join(".gitattributes"), "*.txt merge=union\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "driver.txt", ".gitattributes"], root),
+        "add driver fixture",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "driver base", "--no-verify"], root),
+        "commit driver fixture",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "pick-side"], root),
+        "create pick side",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "pick-side"], root),
+        "checkout pick side",
+    );
+    fs::write(root.join("driver.txt"), "top\ntheirs\nbottom\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "driver.txt"], root),
+        "add pick change",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "pick theirs", "--no-verify"], root),
+        "commit pick change",
+    );
+    let picked = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], root).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], root),
+        "checkout main",
+    );
+    fs::write(root.join("driver.txt"), "top\nours\nbottom\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "driver.txt"], root),
+        "add current change",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "current ours", "--no-verify"], root),
+        "commit current change",
+    );
+
+    let output = run_libra_command(&["cherry-pick", &picked], root);
+    assert_cli_success(&output, "union cherry-pick");
+    assert_eq!(
+        fs::read_to_string(root.join("driver.txt")).unwrap(),
+        "top\nours\ntheirs\nbottom\n"
+    );
+}
+
+#[test]
+fn cherry_pick_driver_default_union_resolves_add_add() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.default", "union"], root),
+        "configure default union driver",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "pick-side"], root),
+        "create pick side",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "pick-side"], root),
+        "checkout pick side",
+    );
+    fs::write(root.join("added.txt"), "theirs\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "added.txt"], root),
+        "add picked file",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "pick add", "--no-verify"], root),
+        "commit picked addition",
+    );
+    let picked = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], root).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], root),
+        "checkout main",
+    );
+    fs::write(root.join("added.txt"), "ours\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "added.txt"], root),
+        "add current file",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "current add", "--no-verify"], root),
+        "commit current addition",
+    );
+
+    let output = run_libra_command(&["cherry-pick", &picked], root);
+    assert_cli_success(&output, "default-union add/add cherry-pick");
+    assert_eq!(
+        fs::read_to_string(root.join("added.txt")).unwrap(),
+        "ours\ntheirs\n"
+    );
+}
+
+#[test]
+fn cherry_pick_driver_binary_preserves_surviving_modify_delete_side() {
+    for (attribute, default_driver, label) in [
+        (Some("*.txt -merge\n"), None, "binary attribute"),
+        (None, Some("binary"), "binary default"),
+    ] {
+        let repo = create_committed_repo_via_cli();
+        let root = repo.path();
+        fs::write(root.join("driver.txt"), "base\n").unwrap();
+        let mut paths = vec!["driver.txt"];
+        if let Some(attribute) = attribute {
+            fs::write(root.join(".gitattributes"), attribute).unwrap();
+            paths.push(".gitattributes");
+        }
+        assert_cli_success(
+            &run_libra_command(&["add", paths[0]], root),
+            "add binary-driver base",
+        );
+        if paths.len() == 2 {
+            assert_cli_success(
+                &run_libra_command(&["add", paths[1]], root),
+                "add binary-driver attributes",
+            );
+        }
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "binary base", "--no-verify"], root),
+            "commit binary-driver base",
+        );
+        if let Some(default_driver) = default_driver {
+            assert_cli_success(
+                &run_libra_command(&["config", "merge.default", default_driver], root),
+                "configure default binary driver",
+            );
+        }
+        assert_cli_success(
+            &run_libra_command(&["branch", "pick-side"], root),
+            "create pick side",
+        );
+        assert_cli_success(
+            &run_libra_command(&["checkout", "pick-side"], root),
+            "checkout pick side",
+        );
+        fs::write(root.join("driver.txt"), "picked modification\n").unwrap();
+        assert_cli_success(
+            &run_libra_command(&["add", "driver.txt"], root),
+            "add picked modification",
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &["commit", "-m", "picked modification", "--no-verify"],
+                root,
+            ),
+            "commit picked modification",
+        );
+        let picked =
+            String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], root).stdout)
+                .trim()
+                .to_string();
+        assert_cli_success(
+            &run_libra_command(&["checkout", "main"], root),
+            "checkout main",
+        );
+        assert_cli_success(
+            &run_libra_command(&["rm", "driver.txt"], root),
+            "delete current file",
+        );
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "current deletion", "--no-verify"], root),
+            "commit current deletion",
+        );
+
+        let output = run_libra_command(&["cherry-pick", &picked], root);
+        assert!(
+            !output.status.success(),
+            "{label}: modify/delete must remain conflicted"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("driver.txt")).unwrap(),
+            "picked modification\n",
+            "{label}: preserve the complete surviving side without text markers"
+        );
+    }
+}
+
+#[test]
 fn test_cherry_pick_cli_outside_repository_returns_fatal_128() {
     let temp = tempdir().unwrap();
     let output = run_libra_command(&["cherry-pick", "abc123"], temp.path());
@@ -1559,6 +1749,52 @@ fn conflict_sequence_repo() -> (tempfile::TempDir, String, String) {
     (repo, f1, f2)
 }
 
+/// Two commits that each conflict with `main` on a distinct file. This lets a
+/// resumed cherry-pick prove that its persisted options reach the later pick.
+fn rerere_conflict_sequence_repo() -> (tempfile::TempDir, String, String) {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    for path in ["first.txt", "second.txt"] {
+        std::fs::write(p.join(path), "base\n").unwrap();
+        assert_cli_success(&run_libra_command(&["add", path], p), "add base");
+    }
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base rerere files", "--no-verify"], p),
+        "commit base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], p),
+        "branch feature",
+    );
+    std::fs::write(p.join("first.txt"), "feature first\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "first.txt"], p), "add f1");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "f1", "--no-verify"], p),
+        "commit f1",
+    );
+    let f1 = cp_rev_parse(p, "HEAD");
+    std::fs::write(p.join("second.txt"), "feature second\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "second.txt"], p), "add f2");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "f2", "--no-verify"], p),
+        "commit f2",
+    );
+    let f2 = cp_rev_parse(p, "HEAD");
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+    for (path, contents) in [
+        ("first.txt", "main first\n"),
+        ("second.txt", "main second\n"),
+    ] {
+        std::fs::write(p.join(path), contents).unwrap();
+        assert_cli_success(&run_libra_command(&["add", path], p), "add main change");
+    }
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main rerere changes", "--no-verify"], p),
+        "commit main changes",
+    );
+    (repo, f1, f2)
+}
+
 /// `merge.conflictStyle = diff3` is honored by cherry-pick's line-level markers
 /// (parity with `libra merge` — Git honors the config for both): the base block
 /// appears as `||||||| base` with the common-ancestor content (lore.md §1.3).
@@ -1579,6 +1815,30 @@ fn cherry_pick_conflict_honors_diff3_style() {
     );
 }
 
+/// MG-10 G8: cherry-pick consumes the same zdiff3 renderer as merge. The
+/// ancestor section is present and the command pauses with resumable conflict
+/// state instead of rejecting the now-supported style.
+#[test]
+fn cherry_pick_conflict_honors_zdiff3_style() {
+    let (repo, feat) = conflict_repo();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.conflictStyle", "zdiff3"], p),
+        "set conflictStyle",
+    );
+    let out = run_libra_command(&["cherry-pick", &feat], p);
+    assert_eq!(out.status.code(), Some(128), "conflict exit");
+    let body = std::fs::read_to_string(p.join("shared.txt")).unwrap();
+    assert!(
+        body.contains("||||||| base\nbase\n=======\n"),
+        "zdiff3 base block comes from the shared renderer: {body:?}"
+    );
+    assert!(
+        body.contains("<<<<<<< HEAD") && body.contains(">>>>>>>"),
+        "zdiff3 conflict retains resolvable markers: {body:?}"
+    );
+}
+
 /// An unsupported `merge.conflictStyle` is a hard error raised BEFORE the
 /// conflicted index/worktree state is written: no markers, no persisted
 /// sequencer state (a follow-up pick is NOT blocked), worktree untouched.
@@ -1587,14 +1847,14 @@ fn cherry_pick_conflict_style_invalid_rejected_before_mutation() {
     let (repo, feat) = conflict_repo();
     let p = repo.path();
     assert_cli_success(
-        &run_libra_command(&["config", "merge.conflictStyle", "zdiff3"], p),
+        &run_libra_command(&["config", "merge.conflictStyle", "bogus"], p),
         "set conflictStyle",
     );
     let out = run_libra_command(&["cherry-pick", &feat], p);
     assert_eq!(out.status.code(), Some(128), "invalid style is fatal");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("unsupported merge.conflictStyle 'zdiff3'"),
+        stderr.contains("unsupported merge.conflictStyle 'bogus'"),
         "actionable error names the bad value: {stderr}"
     );
     let body = std::fs::read_to_string(p.join("shared.txt")).unwrap();
@@ -1621,6 +1881,55 @@ fn cherry_pick_conflict_style_invalid_rejected_before_mutation() {
     );
 }
 
+#[test]
+fn cherry_pick_invalid_conflict_style_does_not_block_clean_content_merge() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    fs::write(root.join("shared.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], root), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], root),
+        "commit base",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "pick-side"], root), "branch");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "pick-side"], root),
+        "checkout pick side",
+    );
+    fs::write(root.join("shared.txt"), "one\nPICK\nthree\nfour\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], root), "add pick");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "pick", "--no-verify"], root),
+        "commit pick",
+    );
+    let picked = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], root).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], root),
+        "checkout main",
+    );
+    fs::write(root.join("shared.txt"), "one\ntwo\nthree\nMAIN\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], root), "add main");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main", "--no-verify"], root),
+        "commit main",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.conflictStyle", "bogus"], root),
+        "set invalid style",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", &picked], root),
+        "clean content merge does not render conflict markers",
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("shared.txt")).unwrap(),
+        "one\nPICK\nthree\nMAIN\n"
+    );
+}
+
 /// A conflict exits 128/LBR-CONFLICT-001, writes worktree markers, and persists
 /// resumable state (proven by a follow-up new pick being blocked).
 #[test]
@@ -1638,6 +1947,146 @@ fn cherry_pick_conflict_persists_state() {
     let blocked = run_libra_command(&["cherry-pick", &feat], p);
     let (_h2, report2) = parse_cli_error_stderr(&blocked.stderr);
     assert_eq!(report2.error_code, "LBR-CONFLICT-002");
+}
+
+#[test]
+fn cherry_pick_rerere_autoupdate_flags_override_configured_staging() {
+    let (repo, feat) = conflict_repo();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "rerere.enabled", "true"], p),
+        "enable rerere",
+    );
+
+    // Seed the reusable resolution cache, then abandon the first sequence.
+    assert_eq!(
+        run_libra_command(&["cherry-pick", &feat], p).status.code(),
+        Some(128),
+        "first pick conflicts"
+    );
+    fs::write(p.join("shared.txt"), "resolved\n").expect("write resolution");
+    assert_cli_success(&run_libra_command(&["rerere"], p), "record resolution");
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--abort"], p),
+        "abort seed pick",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["config", "rerere.autoUpdate", "true"], p),
+        "configure auto staging",
+    );
+    assert_eq!(
+        run_libra_command(&["cherry-pick", "--no-rerere-autoupdate", &feat], p)
+            .status
+            .code(),
+        Some(128),
+        "explicit off still stops on the replayed conflict"
+    );
+    assert_eq!(
+        fs::read_to_string(p.join("shared.txt")).unwrap(),
+        "resolved\n"
+    );
+    assert!(
+        !run_libra_command(&["ls-files", "-u"], p).stdout.is_empty(),
+        "explicit off must leave replayed content unstaged despite true config"
+    );
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--abort"], p),
+        "abort explicit-off pick",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["config", "rerere.autoUpdate", "false"], p),
+        "configure no auto staging",
+    );
+    assert_eq!(
+        run_libra_command(&["cherry-pick", "--rerere-autoupdate", &feat], p)
+            .status
+            .code(),
+        Some(128),
+        "explicit on still reports the replayed conflict"
+    );
+    assert_eq!(
+        fs::read_to_string(p.join("shared.txt")).unwrap(),
+        "resolved\n"
+    );
+    assert!(
+        run_libra_command(&["ls-files", "-u"], p).stdout.is_empty(),
+        "explicit on must stage replayed content despite false config"
+    );
+}
+
+#[test]
+fn cherry_pick_rerere_autoupdate_off_survives_conflict_resume() {
+    let (repo, f1, f2) = rerere_conflict_sequence_repo();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "rerere.enabled", "true"], p),
+        "enable rerere",
+    );
+
+    // Seed both independent conflict resolutions before starting the sequence
+    // under test. The second cache entry is only encountered after --continue.
+    assert_eq!(
+        run_libra_command(&["cherry-pick", &f1, &f2], p)
+            .status
+            .code(),
+        Some(128),
+        "f1 seed conflict"
+    );
+    fs::write(p.join("first.txt"), "resolved first\n").unwrap();
+    assert_cli_success(&run_libra_command(&["rerere"], p), "record f1 resolution");
+    assert_cli_success(
+        &run_libra_command(&["add", "first.txt"], p),
+        "stage f1 seed",
+    );
+    assert_eq!(
+        run_libra_command(&["cherry-pick", "--continue"], p)
+            .status
+            .code(),
+        Some(128),
+        "f2 seed conflict"
+    );
+    fs::write(p.join("second.txt"), "resolved second\n").unwrap();
+    assert_cli_success(&run_libra_command(&["rerere"], p), "record f2 resolution");
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--abort"], p),
+        "abort seed sequence",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["config", "rerere.autoUpdate", "true"], p),
+        "configure auto staging",
+    );
+    assert_eq!(
+        run_libra_command(&["cherry-pick", "--no-rerere-autoupdate", &f1, &f2], p,)
+            .status
+            .code(),
+        Some(128),
+        "f1 replay stops unstaged"
+    );
+    assert_cli_success(
+        &run_libra_command(&["add", "first.txt"], p),
+        "manually stage f1 before the new-process continue",
+    );
+
+    // No flag is supplied to this fresh process. It must retain the original
+    // explicit off choice when it reaches f2, despite config being true.
+    assert_eq!(
+        run_libra_command(&["cherry-pick", "--continue"], p)
+            .status
+            .code(),
+        Some(128),
+        "f2 replay stops after continue"
+    );
+    assert_eq!(
+        fs::read_to_string(p.join("second.txt")).unwrap(),
+        "resolved second\n"
+    );
+    assert!(
+        !run_libra_command(&["ls-files", "-u"], p).stdout.is_empty(),
+        "persisted explicit off must leave f2's replayed resolution unstaged"
+    );
 }
 
 /// An in-progress cherry-pick blocks a new `merge`.

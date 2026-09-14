@@ -131,7 +131,9 @@ async fn read_foreign_config(objects_dir: &Path) -> Result<Option<(String, bool)
         return Ok(None);
     }
     let url = format!("sqlite://{}?mode=ro", db_path.display());
-    let conn = sea_orm::Database::connect(&url)
+    let mut options = sea_orm::ConnectOptions::new(url);
+    options.map_sqlx_sqlite_pool_opts(crate::internal::db::sqlite_pool_options);
+    let conn = sea_orm::Database::connect(options)
         .await
         .map_err(|e| format!("cannot open the base repo's config database: {e}"))?;
     // objectformat (config table; default sha1).

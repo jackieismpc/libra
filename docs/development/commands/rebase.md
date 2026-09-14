@@ -11,11 +11,11 @@ commit OIDs.
 
 ## 命令实现目标
 
-`libra rebase` 的目标是把提交重放到新的 base 上，并支持 continue/abort/skip 等冲突恢复流程。实现需要保持作者/提交者语义、文件模式、错误分类和 pull --rebase 交互。除 `--onto`、`--autosquash`、`--reapply-cherry-picks` 与 empty 控制外，P1-07a 已补齐四个脚本化控制：tracked dirty state 的 `--autostash`、逐提交且强制 sandbox 的可重复 `--exec`、原子 `--update-refs`（排除所有 worktree 已检出分支）和 reflog 驱动的 `--fork-point`。interactive、`--rebase-merges`、`--rerere-autoupdate` 与 `--empty=stop|ask` 仍未实现。
+`libra rebase` 的目标是把提交重放到新的 base 上，并支持 continue/abort/skip 等冲突恢复流程。实现需要保持作者/提交者语义、文件模式、错误分类和 pull --rebase 交互。每一步树级 replay 统一委托 `merge` 的三路引擎，避免 rebase 维护第二套 rename、driver、recursive、冲突精化或 D/F 决策。除 `--onto`、`--autosquash`、`--reapply-cherry-picks` 与 empty 控制外，P1-07a 已补齐四个脚本化控制：tracked dirty state 的 `--autostash`、逐提交且强制 sandbox 的可重复 `--exec`、原子 `--update-refs`（排除所有 worktree 已检出分支）和 reflog 驱动的 `--fork-point`。`--rerere-autoupdate`/`--no-rerere-autoupdate` 也已实现；interactive、`--rebase-merges` 与 `--empty=stop|ask` 仍未实现。
 
 ## 对比 Git 与兼容性
 
-- 兼容级别：`partial`。`--autostash`/`--no-autostash`、可重复 `--exec`、`--update-refs`/`--no-update-refs` 与 `--fork-point`/`--no-fork-point` 均为 last-wins 或 Git 同形语义；`--exec` 在所需 sandbox 不可强制时 fail-closed。`--update-refs` 记录 captured-tip CAS，支持 autosquash、become-empty、`--no-keep-empty` 与 `--skip` 的 rewrite 映射，并在一个 SQLite 事务内移动全部目标 refs。`--fork-point` 从 upstream reflog 候选中选择仍为 HEAD 祖先的最具体提交，找不到才回退普通 merge base。既有 `--onto`、autosquash、cherry-pick 与 empty 行为保持不变；interactive/`--rebase-merges`/`--rerere-autoupdate`/`--empty=stop|ask` 未支持。
+- 兼容级别：`partial`。`--autostash`/`--no-autostash`、可重复 `--exec`、`--update-refs`/`--no-update-refs`、`--fork-point`/`--no-fork-point` 与 `--rerere-autoupdate`/`--no-rerere-autoupdate` 均为 last-wins 或 Git 同形语义；`--exec` 在所需 sandbox 不可强制时 fail-closed。`--update-refs` 记录 captured-tip CAS，支持 autosquash、become-empty、`--no-keep-empty` 与 `--skip` 的 rewrite 映射，并在一个 SQLite 事务内移动全部目标 refs。`--fork-point` 从 upstream reflog 候选中选择仍为 HEAD 祖先的最具体提交，找不到才回退普通 merge base。rerere 选择写入 `RebaseAuxState`，故 `--continue` 使用起始操作决定；interactive/`--rebase-merges`/`--empty=stop|ask` 未支持。
 
 - 当前矩阵明确仍是部分兼容；未覆盖的 Git surface 必须显式列在“还未实现的功能”。
 
@@ -23,7 +23,7 @@ commit OIDs.
 ## 设计方案
 
 - 入口与分发：已公开接入 `src/cli.rs::Commands`；已由 `src/command/mod.rs` 导出。CLI 层在 `src/cli.rs` 把解析后的参数交给命令模块，命令模块负责把领域错误转换为 `CliError` / `CliResult`。
-- 源码分层：主要实现文件为 `src/command/rebase.rs`。参数/子命令类型包括 `RebaseArgs`；输出、错误或状态类型包括 `RebaseState`、`RebaseAuxState`、`ReplayResult`、`ReplayErrorKind`；主要执行函数包括 `execute_safe`、`run_rebase_start`、`continue_replay`、`finalize_rebase`。Autostash 复用 `src/command/stash.rs` 的 held-stash helper，exec 复用 `internal::ai::sandbox::run_shell_command`。
+- 源码分层：主要实现文件为 `src/command/rebase.rs`。参数/子命令类型包括 `RebaseArgs`；输出、错误或状态类型包括 `RebaseState`、`RebaseAuxState`、`ReplayResult`、`ReplayErrorKind`；主要执行函数包括 `execute_safe`、`run_rebase_start`、`continue_replay`、`finalize_rebase`。`replay_commit_with_unified_merge` 将原始 parent 集合、新 tip 与待 replay commit 交给 `src/command/merge.rs::merge_rebase_trees`；adapter 负责树决策和冲突 index/worktree materialization，rebase 自己保留 sequencer 与 rewritten-commit 状态。Autostash 复用 `src/command/stash.rs` 的 held-stash helper，exec 复用 `internal::ai::sandbox::run_shell_command`。
 - 执行路径：新序列先校验 exec，再按“stash object（含已落盘的 index-parent tree）→ fsynced sidecar → destructive reset”的顺序准备 autostash。主 todo/current-head 保存在 SQLite；`.libra/rebase-aux.json` 原子保存 exec pending index、captured refs/rewrite map 与 held stash OID，并由 `maintenance gc` 当作 fail-closed reachability root。每次 replay 成功后先保存状态和 rewrite，再执行 sandbox command；命令产生的新提交立即与 `state.current_head` 对齐，即使后续命令失败也可安全 continue/skip。结束时先物化 worktree/index，再以 captured-tip CAS 在单事务内更新当前分支、其他 refs 与 reflog，最后清 sequencer、以两个独立 three-way merge 恢复 staged index/unstaged worktree 层并删除 sidecar。
 
 - 流程图：以下流程图按当前源码分层展示主路径和底层对象边界，便于维护者把代码入口、执行函数和副作用范围对应起来。
@@ -45,6 +45,7 @@ flowchart TD
 
 ## 实现历史
 
+- 2026-09-12（MG-19 统一树引擎）：删除 rebase 私有的逐路径三路分类、冲突 marker 写入与 tree 构造逻辑。`replay_commit_with_unified_merge` 通过 `merge_rebase_trees` 复用 merge 的 rename、attribute/default driver、recursive virtual ancestor、冲突精化、D/F placement 和 stage/worktree materialization；冲突返回后仅由 rebase 继续持久化自己的 `RebaseState` 并执行 rerere autoupdate。普通 first-parent 序列遇到已有 merge commit 时，adapter 接收所有原始 parent 并折叠 recursive virtual base；输出仍扁平为单 parent，未扩展为 `--rebase-merges`。回归：`test_rebase_rename_uses_shared_tree_engine`、`test_rebase_driver_uses_shared_tree_engine`、`test_rebase_recursive_uses_all_merge_parents`、`test_rebase_refine_uses_shared_tree_engine`。
 - 2026-07-31：修复重放提交的身份。`create_replayed_commit` 的四个分支（pick / fixup / squash / amend）此前都走 `Commit::from_tree_id`，该构造函数把 author 与 committer 双双硬编码为 `mega <admin@mega.org>`，因此本文开头声称的「保持作者/提交者语义」并未真正成立：原作者被丢弃，rebase 执行者也未被记录。现改为 `Commit::new` 显式给出两个 signature，按 Git 语义分别取值——**author 保留不重打**：`pick` 取被重放提交自身的 author，`fixup`/`squash`/`amend` 折叠进更早的提交，故取 `target` 的 author（Git 口径：折叠组中第一个提交的作者）；**committer 取当前执行者**，经 `commit::create_committer_signature` 解析，与 `libra commit` 同源，时间戳为当次。新增内部错误类型 `ReplayCommitError{Identity,ObjectLoad}`，使「身份缺失」（配置问题）不再被并入 `CommitLoad`（对象损坏）：前者映射到新增的 `ReplayErrorKind::IdentityMissing` / `RebaseError::IdentityMissing` 与 `LBR-AUTH-001` + 配置提示。回归 target：`command_test` 的 `test_rebase_preserves_original_author_and_stamps_current_committer` 与 `test_rebase_autosquash_keeps_target_author_and_current_committer`。
 - 2026-07-25（exec 沙箱元数据可写修复）：`SandboxPolicy::WorkspaceWrite` 新增 `allow_metadata_writes`（serde 默认 `false`，保持既有载荷语义）。此前所有 WorkspaceWrite 根都把 `.git`/`.libra`/`.codex`/`.agents` 强制只读，导致 `--exec` 内嵌套的 `libra add`/`libra commit` 在 macOS seatbelt（EPERM）与 bwrap（只读 bind）下都无法写对象库，P1-07a 验收的「exec 内创建提交」在真实机器上回归。`--exec` 的命令来自用户显式 CLI 输入（非仓库内容），信任边界与 hooks 不同，故 `run_sandboxed_rebase_exec` 现在设置 `allow_metadata_writes: true`，metadata 可写、网络仍拒绝；hooks 等仓库内容驱动的执行面保持 `false`。回归：`compat_noninteractive_history_controls::rebase_exec_failure_stops_and_continue_retries_the_command` 在 macOS 恢复通过。
 - 2026-07-15（plan-20260708 P1-07a 测试确定性修复）：`compat_noninteractive_history_controls::rebase_exec_cannot_write_outside_the_repository_workspace` 原断言 exec 越界写必须使 rebase 失败，但该拒绝语义只在系统沙箱（bwrap）无法启动、Required enforcement fail-closed 的机器上成立；bwrap 可用时（`--unshare-all` + `--tmpfs /tmp` + 挂载脚手架），越界写会被**包含在 sandbox 私有命名空间内并在退出时丢弃**（touch 退出 0、宿主无文件）。测试改为钉住真正的安全不变量——逃逸文件绝不出现在宿主文件系统——并对两种合法结局分支断言（包含丢弃 → rebase 完成且无 sequencer 残留；拒绝/fail-closed → `LBR-CONFLICT-002` 且可 `--abort`）；任何真实 fail-open 逃逸仍会失败。用户文档 EN/zh 已同步包含语义说明。
@@ -63,15 +64,15 @@ flowchart TD
 
 - 公开状态：已公开；模块状态：已导出。
 - 用户文档：`docs/commands/rebase.md`。
-- Synopsis：`libra rebase [--onto <newbase>] [--autosquash] [--reapply-cherry-picks] [--autostash] [--exec <cmd>] [--update-refs] [--fork-point] [--no-rerere-autoupdate] [--keep-empty | --no-keep-empty] [--empty=<mode>] <upstream> [<branch>] | --continue | --abort | --skip`。
-- 公开参数/子命令包括：`<upstream>`、`[<branch>]`、`--onto`、`--autosquash`、`--reapply-cherry-picks`、`--autostash`/`--no-autostash`、可重复 `--exec`、`--update-refs`/`--no-update-refs`、`--fork-point`/`--no-fork-point`、`--no-rerere-autoupdate`、empty 控制与 `--continue`/`--abort`/`--skip`。Exec stop 后 continue 重试当前 command；skip 保留已 replay commit 并跳过该 commit 剩余 exec commands。
+- Synopsis：`libra rebase [--onto <newbase>] [--autosquash] [--reapply-cherry-picks] [--autostash] [--exec <cmd>] [--update-refs] [--fork-point] [--rerere-autoupdate | --no-rerere-autoupdate] [--keep-empty | --no-keep-empty] [--empty=<mode>] <upstream> [<branch>] | --continue | --abort | --skip`。
+- 公开参数/子命令包括：`<upstream>`、`[<branch>]`、`--onto`、`--autosquash`、`--reapply-cherry-picks`、`--autostash`/`--no-autostash`、可重复 `--exec`、`--update-refs`/`--no-update-refs`、`--fork-point`/`--no-fork-point`、`--rerere-autoupdate`/`--no-rerere-autoupdate`、empty 控制与 `--continue`/`--abort`/`--skip`。Rerere flag last-wins，省略时继承配置，并随 `RebaseAuxState` 持久化到 `--continue`；Exec stop 后 continue 重试当前 command；skip 保留已 replay commit 并跳过该 commit 剩余 exec commands。
 
 
 ## 还未实现的功能
 
 | 类别 | 未完成项 | 当前处理 |
 |---|---|---|
-| 兼容矩阵说明 | `--onto`/autosquash/cherry-pick/empty controls 与 P1-07a 的 autostash/exec/update-refs/fork-point 已支持；interactive/`--rebase-merges`/`--rerere-autoupdate`/`--empty=stop\|ask` 未支持 | 按当前兼容矩阵保留；实现状态变化时同步 `_compatibility.md` 和测试证据。 |
+| 兼容矩阵说明 | `--onto`/autosquash/cherry-pick/empty controls、P1-07a 的 autostash/exec/update-refs/fork-point，以及 rerere autoupdate toggles 已支持；interactive/`--rebase-merges`/`--empty=stop\|ask` 未支持 | 按当前兼容矩阵保留；实现状态变化时同步 `_compatibility.md` 和测试证据。 |
 | 永久非目标 | submodule / gitlink 内容合并（`_compatibility.md` D24、ADR-MG-01） | 三路重放输入的 gitlink 由 merge/rebase/cherry-pick 共用的 `command::merge::ensure_gitlinks_not_arbitrated` 校验：任一侧与 base 不同即在任何写入前以 `ReplayErrorKind::GitlinkUnsupported` → `LBR-UNSUPPORTED-001` 拒绝（消息含路径）；三侧一致原样带入重放树（此前 `collect_tree_items_and_paths` 会静默丢弃）。`rebuild_index_from_tree` 相应改为登记 gitlink 条目而非报错。证据：`command::merge_test::merge_gitlink_rebase_consumer_*`、`--lib rebase::rebuild_index_from_tree_registers_gitlink_entries_verbatim`。 |
 | 兼容差异项 | Interactive | 原始对照：不支持；相关参数/替代：-i / --interactive；当前说明：不适用。 后续实现时需要补对应回归测试并同步兼容矩阵。 |
 | ✅ 已实现 | Exec | 可重复 `--exec <cmd>` 在每个 replay commit 后按序执行；required sandbox、禁网、workspace-write；失败 round-trip 到 `--continue`/`--skip`。 |
@@ -79,7 +80,7 @@ flowchart TD
 | ✅ 已实现 | Autostash | `--autostash`/`--no-autostash` last-wins；tracked changes 以 held stash 跨 conflict/continue/abort，staged index 与 unstaged worktree 分层 three-way 恢复，apply 冲突提升到普通 stash。 |
 | ✅ 已实现 | Update refs | `--update-refs`/`--no-update-refs` last-wins；captured-tip CAS、单事务 refs+reflog、checked-out branch 排除，覆盖 empty/skip/autosquash 映射。 |
 | ✅ 已实现 | Fork point | `--fork-point`/`--no-fork-point` last-wins；upstream reflog 最具体 ancestor，缺失时 merge-base fallback。 |
-| 部分实现 | Rerere autoupdate | `--no-rerere-autoupdate` 作为接受式 no-op 已公开（Libra 无 rerere）；`--rerere-autoupdate` 仍未公开。 |
+| ✅ 已实现 | Rerere autoupdate | `--rerere-autoupdate`/`--no-rerere-autoupdate` last-wins，省略时继承 `rerere.autoUpdate`；显式选择随 `RebaseAuxState` 到 `--continue`，rerere 禁用时 no-op。rerere 按规范化 hunk sides 匹配，并仅在 preimage/current/postimage 三方回放干净时写回。证据：`rebase_rerere_autoupdate_flags_override_configured_staging`。 |
 | 兼容差异项 | Rebase merges | 原始对照：不支持；相关参数/替代：--rebase-merges；当前说明：默认行为。 后续实现时需要补对应回归测试并同步兼容矩阵。 |
 | ✅ 已实现 | Keep empty | `--keep-empty`（no-op，默认保留）与 `--no-keep-empty`（丢弃 start-empty 提交：`commit_starts_empty` 在 `run_rebase_start` 收集后过滤 `commits_to_replay`；过滤后的 todo 持久化故 `--continue` 遵循）组成 toggle，均已公开。带集成测试（`test_rebase_keep_empty_is_accepted_noop_and_preserves_empty_commit`、`test_rebase_no_keep_empty_drops_start_empty_commits`）。 |
 | ✅ 已实现 | Empty mode `--empty=<mode>` | `--empty=drop`/`keep` 控制 replay 后*变空*的提交（与 `--no-keep-empty` 的 start-empty 区分）：`replay_commit_with_conflict_detection` 在 merged tree == 新父 tree 且原提交非 start-empty（`their_tree != base_tree`）时，drop 模式返回 `ReplayResult::BecameEmptyDropped`（循环跳过、不前进 HEAD、记入 `dropped_commits`、打印 `dropping <sha> <subject> -- patch contents already upstream`），keep 模式照常提交。`empty_mode` 经 `RebaseState` 新增列 round-trip 到 `--continue`/`--skip`（ADD COLUMN 迁移，默认 `keep`）。缺省 keep 是有意与 Git（默认 drop）的分歧，避免改变既有默认行为。`stop`/`ask`（Git 的 halt-on-empty）因 Libra 非交互 rebase 无 halt-续作流而拒绝（`LBR-CLI-002`/129）。带集成测试 `test_rebase_empty_drop_skips_become_empty_commit`、`test_rebase_empty_default_keeps_become_empty_commit`、`test_rebase_empty_invalid_mode_rejected`。 |

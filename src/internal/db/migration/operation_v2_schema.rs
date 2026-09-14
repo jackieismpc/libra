@@ -67,7 +67,9 @@ pub(super) async fn validate_operation_v1_schema(
 }
 
 async fn reference_database(definitions: &[&str]) -> Result<DatabaseConnection, DbErr> {
-    let reference = Database::connect("sqlite::memory:")
+    let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
+    options.map_sqlx_sqlite_pool_opts(crate::internal::db::sqlite_pool_options);
+    let reference = Database::connect(options)
         .await
         .map_err(|error| schema_error("reference database", error))?;
     // Only this isolated database receives DDL; the repository transaction is read-only here.

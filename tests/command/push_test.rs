@@ -857,7 +857,7 @@ fn test_push_merge_commit_to_git_remote_succeeds() {
 
 #[cfg(unix)]
 #[test]
-#[serial(env)]
+#[serial(env, cwd)]
 fn test_push_multi_refspec_delete_tags_and_mirror_dry_run() {
     let temp_root = tempfile::tempdir().expect("failed to create temp root");
     let remote_dir = temp_root.path().join("remote.git");
@@ -878,6 +878,10 @@ fn test_push_multi_refspec_delete_tags_and_mirror_dry_run() {
         "initial content",
         "initial commit",
     );
+    // This scenario spans multiple child Git and Libra processes while it
+    // asserts against one remote. Hold the process CWD lock so another
+    // command test cannot change ambient repository discovery mid-scenario.
+    let _cwd_guard = ChangeDirGuard::new(&local_dir);
     add_fake_ssh_remote(&local_dir, &remote_dir);
     let current_branch = current_branch_name(&local_dir);
 
@@ -1028,6 +1032,14 @@ fn test_push_multi_refspec_delete_tags_and_mirror_dry_run() {
     let json: Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("tags push should emit valid JSON, got: {stdout}\nerror: {e}"));
     assert_eq!(json["data"]["updates"][0]["remote_ref"], "refs/tags/v1.0");
+    assert_eq!(
+        json["data"]["objects_pushed"], 0,
+        "same-tip lightweight tag should reuse the advertised branch history: {json}"
+    );
+    assert_eq!(
+        json["data"]["bytes_pushed"], 32,
+        "same-tip lightweight tag should send only the required empty SHA-1 pack: {json}"
+    );
     let tag_ref_out = Command::new("git")
         .args([
             "--git-dir",

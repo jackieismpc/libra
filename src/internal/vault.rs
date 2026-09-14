@@ -22,20 +22,13 @@
 //! stronger guarantees, integrate an OS keychain or hardware token.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
-use libvault::{
-    RustyVault,
-    core::SealConfig,
-    errors::RvError,
-    storage::{Backend, BackendEntry, sql::sqlite::SqliteBackend},
-};
-use sea_orm::sqlx::{AssertSqlSafe, SqlitePool, query_scalar, sqlite::SqliteConnectOptions};
+use libvault::{RustyVault, core::SealConfig, storage::sql::sqlite::SqliteBackend};
 use serde_json::Value;
 
 use crate::utils::util::try_get_storage_path;
@@ -829,139 +822,9 @@ pub async fn remove_credentials() {
 
 // ── Internal helpers ──
 
-/// Compatibility wrapper around libvault's SQLite backend.
-///
-/// libvault 0.2.2 currently emits `ESCAPE '\\\\'` in `list()`, which SQLite
-/// rejects with `ESCAPE expression must be a single character`. We delegate all
-/// operations to the upstream backend except `list()`, which is implemented
-/// with an SQL expression accepted by SQLite.
-struct CompatSqliteBackend {
-    inner: SqliteBackend,
-    pool: SqlitePool,
-    table: String,
-}
-
-impl CompatSqliteBackend {
-    async fn new(
-        conf: &HashMap<String, Value>,
-        db_path: &Path,
-        table: &str,
-        timeout: Duration,
-    ) -> Result<Self> {
-        let inner = SqliteBackend::new(conf)
-            .await
-            .map_err(|e| anyhow!("vault sqlite backend creation failed: {e}"))?;
-
-        // Keep this side-channel connection aligned with libvault's effective
-        // filename resolution, especially when `VAULT_SQLITE_FILENAME` is set.
-        let create_if_missing = conf
-            .get("create_if_missing")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        let configured_path = std::env::var("VAULT_SQLITE_FILENAME")
-            .ok()
-            .map(PathBuf::from)
-            .or_else(|| {
-                conf.get("filename")
-                    .and_then(Value::as_str)
-                    .map(PathBuf::from)
-            })
-            .unwrap_or_else(|| db_path.to_path_buf());
-
-        let resolved_path = if configured_path.is_absolute() {
-            configured_path
-        } else {
-            std::env::current_dir()
-                .context("failed to resolve current directory for vault sqlite path")?
-                .join(configured_path)
-        };
-        let resolved_path = match resolved_path.canonicalize() {
-            Ok(canonical) => canonical,
-            Err(_) if create_if_missing => resolved_path,
-            Err(err) => {
-                return Err(anyhow!(
-                    "failed to resolve vault sqlite path '{}': {err}",
-                    resolved_path.display()
-                ));
-            }
-        };
-
-        let options = SqliteConnectOptions::new()
-            .filename(resolved_path)
-            .busy_timeout(timeout)
-            .create_if_missing(true)
-            .read_only(false);
-        let pool = SqlitePool::connect_with(options)
-            .await
-            .map_err(|e| anyhow!("vault sqlite pool creation failed: {e}"))?;
-
-        Ok(Self {
-            inner,
-            pool,
-            table: table.to_string(),
-        })
-    }
-}
-
-#[async_trait::async_trait]
-impl Backend for CompatSqliteBackend {
-    async fn list(&self, prefix: &str) -> Result<Vec<String>, RvError> {
-        if prefix.starts_with('/') {
-            return Err(RvError::ErrSqliteBackendNotSupportAbsolute);
-        }
-
-        // NOTE: `ESCAPE '\'` uses a single-character escape literal accepted by SQLite.
-        let sql = format!(
-            "SELECT vault_key FROM `{}` WHERE vault_key LIKE ? ESCAPE '\\'",
-            self.table
-        );
-        let escaped_prefix = prefix
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        // sqlx 0.9 requires an explicit assertion for interpolated SQL: the
-        // table name comes from our own vault configuration (never user input)
-        // and the LIKE prefix is bound as a parameter.
-        let keys: Vec<Vec<u8>> = query_scalar(AssertSqlSafe(sql))
-            .bind(format!("{escaped_prefix}%").as_bytes())
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| RvError::from(anyhow!(e)))?;
-
-        let mut result = HashSet::new();
-        for key_bytes in keys {
-            let key = String::from_utf8(key_bytes)?;
-            let key = key.strip_prefix(prefix).unwrap_or(&key);
-            match key.find('/') {
-                Some(idx) => {
-                    result.insert(key[..idx + 1].to_string());
-                }
-                None => {
-                    result.insert(key.to_string());
-                }
-            }
-        }
-
-        Ok(result.into_iter().collect())
-    }
-
-    async fn get(&self, key: &str) -> Result<Option<BackendEntry>, RvError> {
-        self.inner.get(key).await
-    }
-
-    async fn put(&self, entry: &BackendEntry) -> Result<(), RvError> {
-        self.inner.put(entry).await
-    }
-
-    async fn delete(&self, key: &str) -> Result<(), RvError> {
-        self.inner.delete(key).await
-    }
-}
-
 async fn create_vault(root_dir: &Path) -> Result<RustyVault> {
     let db_path = root_dir.join(VAULT_DB_NAME);
     let table_name = "vault".to_string();
-    let timeout = Duration::from_secs(5);
     let mut conf = HashMap::new();
     conf.insert(
         "filename".to_string(),
@@ -971,8 +834,11 @@ async fn create_vault(root_dir: &Path) -> Result<RustyVault> {
     conf.insert("timeout".to_string(), Value::String("5s".to_string()));
     conf.insert("table".to_string(), Value::String(table_name.clone()));
 
-    let backend: Arc<CompatSqliteBackend> =
-        Arc::new(CompatSqliteBackend::new(&conf, &db_path, &table_name, timeout).await?);
+    let backend = Arc::new(
+        SqliteBackend::new(&conf)
+            .await
+            .map_err(|e| anyhow!("vault sqlite backend creation failed: {e}"))?,
+    );
 
     let vault =
         RustyVault::new(backend, None).map_err(|e| anyhow!("vault creation failed: {e}"))?;

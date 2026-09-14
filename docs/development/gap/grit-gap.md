@@ -141,7 +141,7 @@ gitlink（`0o160000`）在 tree/index 中仍可识别；`ls-tree` / `show` / `fs
 | `diff` 增强（`A...B`、`-w`） | **4 ✅** | **两项均已实现**：`-w`/`--ignore-all-space` 在 `diff.rs:217`（另有 `-b`/`--ignore-space-change` `:225`，归一化在 `:5718`/`:5727`，接线 `:2425`）；`A...B` merge-base range 在 `diff.rs:1742`（`split_once("...")`）+ `diff.rs:1751`（调 `internal::merge_base::merge_base`）。原锚点 `normalize_diff_range` **函数已不存在** | `diff*.rs` |
 | `repack` / `pack-objects`（隐藏） | **4 ✅** | **已实现（v0.17.1780）**：`src/command/{repack,pack_objects}.rs` + `src/internal/pack_writer.rs`；`COMPATIBILITY.md:205`/`:206`（`pack-objects` 仍 hidden） | `repack.rs`、`pack_objects.rs` |
 | `diff-index` / `diff-files` / `diff-tree` | **4 ✅** | **已实现（v0.17.1769）**：`src/command/diff_plumbing.rs`，三命令委托共享 diff 引擎（不分叉实现）；`COMPATIBILITY.md:164`/`:165`/`:166` | 三个 plumbing 命令 |
-| `rerere` | **5 ✅（归一化仍收窄）** | **已实现（v0.17.1771；Phase B 自动集成 v0.17.1781）**：`src/command/rerere.rs`；`COMPATIBILITY.md:173`。**已知收窄仍在**：整文件逐字节匹配，`rerere.rs:19` 注释「Git's per-hunk normalisation / ours-theirs-swap independence remain a documented follow-up」，`rerere.rs:254` `renormalize: false` | `grit-lib/src/rerere.rs` |
+| `rerere` | **5 ✅** | **已实现（v0.17.1771；Phase B 自动集成 v0.17.1781；MG-20 规范化）**：`src/command/rerere.rs`；`COMPATIBILITY.md:201`。完整冲突按 hunk sides 的字典序规范化（丢弃 diff3 base）取 SHA-256，ours/theirs 互换可命中；回放使用 fail-safe 三方合并，不能干净应用时不写回。无完整 marker 仍保留整文件哈希回退 | `grit-lib/src/rerere.rs` |
 | `bundle` | **6 ✅（thin/prerequisite 仍延后）** | **已实现（v0.17.1774）**：`src/command/bundle.rs`；`COMPATIBILITY.md:144`。**`unbundle` 子命令已后续补上**（`bundle.rs:106`/`:589`，v0.18.82）。仍为 full/non-thin/no-prerequisite 写出（`bundle.rs:13`） | `bundle.rs` |
 | `fast-export` / `fast-import` | **6 ✅** | **已实现（v0.17.1773 / v0.17.1776）**：`src/command/{fast_export,fast_import}.rs`；`COMPATIBILITY.md:167`/`:168`。marks **文件**（`--import-marks`/`--export-marks`）仍延后（`COMPATIBILITY.md:167` 明列 "marks files … are deferred"），进程内 mark 表已有 | `fast_export.rs`、`fast_import.rs` |
 | `check-mailmap` | **6 ✅（log/blame 集成仍缺）** | **命令已实现（v0.17.1772）**：`src/command/check_mailmap.rs`；`COMPATIBILITY.md:199`。**log/blame 集成仍未做**：`log.rs:316` 明写 `--no-mailmap` 是「no-op: Libra's log never applies a mailmap」，`blame.rs`/`shortlog.rs` 零 mailmap 命中 | `check_mailmap.rs` |
@@ -169,7 +169,7 @@ gitlink（`0o160000`）在 tree/index 中仍可识别；`ls-tree` / `show` / `fs
 
 ### 未覆盖的已知缺口（有意排除出本计划）
 
-以下 `partial` 命令在 `docs/development/commands/README.md` 有记录的缺口，但**不在本 Grit 差距补全计划内**。它们由各自命令开发文档维护，不进入本文件的阶段路线；若 Grit 测试重写（`GGT-00A`）覆盖到这些命令，相关断言按 `direct`/`adapted`/`declined`/`blocked` 分类处理，`blocked` 不指向本计划的任务编号。**2026-08-27 逐行复核**：下表 6 行已被实现推翻（`cat-file`/`shortlog`/`commit`/`reset`+`restore`/`fsck` 缺口清空，`tag`/`format-patch`/`log` 缺口收窄），条目按治理规则保留并改标注；以下 7 行经实测**仍成立**——`config` includeIf（`grep -rn "includeIf\|include_if" src/` 零命中）、`blame` reverse/incremental（`blame.rs` 零命中）、`stash create`/`store`（D8/D9，`COMPATIBILITY.md:131` 明写 deferred）、`symbolic-ref` 仅 HEAD（`symbolic_ref.rs:1,23` 明写）、`merge` octopus/custom strategies（`merge.rs:144-147` 注释「supports only `ours`」）、`bisect replay`（`bisect.rs` 零命中）、`clean -i`（`clean.rs` 零命中）。
+以下 `partial` 命令在 `docs/development/commands/README.md` 有记录的缺口，但**不在本 Grit 差距补全计划内**。它们由各自命令开发文档维护，不进入本文件的阶段路线；若 Grit 测试重写（`GGT-00A`）覆盖到这些命令，相关断言按 `direct`/`adapted`/`declined`/`blocked` 分类处理，`blocked` 不指向本计划的任务编号。**2026-08-27 逐行复核，2026-09-11 merge 状态修正**：下表 6 行已被实现推翻（`cat-file`/`shortlog`/`commit`/`reset`+`restore`/`fsck` 缺口清空，`tag`/`format-patch`/`log` 缺口收窄），条目按治理规则保留并改标注；以下 7 行经实测**仍成立**——`config` includeIf（`grep -rn "includeIf\|include_if" src/` 零命中）、`blame` reverse/incremental（`blame.rs` 零命中）、`stash create`/`store`（D8/D9，`COMPATIBILITY.md:131` 明写 deferred）、`symbolic-ref` 仅 HEAD（`symbolic_ref.rs:1,23` 明写）、`merge` 的 `ours` 之外自定义策略（octopus 多目标已由 MG-12 实现）、`bisect replay`（`bisect.rs` 零命中）、`clean -i`（`clean.rs` 零命中）。
 
 | 命令 | README 记录的缺口 | 排除理由 |
 |------|-------------------|----------|
@@ -189,7 +189,7 @@ gitlink（`0o160000`）在 tree/index 中仍可识别；`ls-tree` / `show` / `fs
 | `symbolic-ref` | 仅支持 HEAD | SQLite refs 架构限制，非 Grit 差距 |
 | `tag` | Git GPG interop（editor `-e` ✅ **已实现**：`tag.rs:68` `#[clap(short='e', long="edit")]`，`_compatibility.md:100` 亦确认） | 独立于本计划 |
 | `cherry-pick` / `revert` | `--edit`、strategy flags、multi-commit todo | sequencer 增强，部分由 D 编号治理 |
-| `merge` | octopus/custom strategies | 策略引擎增强，独立于本计划（`--stat`、`--verify-signatures`(vault-key PGP) 已实现） |
+| `merge` | `ours` 之外的自定义策略 | 策略引擎增强，独立于本计划（octopus 多目标、`--stat`、`--verify-signatures`(vault-key PGP) 已实现） |
 | `commit` | ~~`-t --template`~~ | ✅ **已实现**（`commit.rs:107` `#[arg(short='t', long="template", value_name="FILE")]`，含 `commit.template` config 回退）；`--status` 亦已实现，本行缺口已清空 |
 | `describe` | （`--contains` 已实现，git name-rev） | 独立于本计划 |
 | `reset` / `restore` | ~~reset merge/keep mode、restore conflict re-render（`--merge`/`--conflict`）variants~~ | ✅ **均已实现**（`reset.rs:78` `pub merge` / `reset.rs:83` `pub keep`；`restore.rs:296` `pub conflict: Option<String>`；`_compatibility.md:95` 亦确认）；restore `--overlay`/`--no-overlay`/`--ours`/`--theirs`/`--ignore-unmerged` 亦已实现，本行缺口已清空 |
@@ -310,7 +310,7 @@ flowchart TD
 
 ---
 
-### 阶段 5 — rerere（3–5 周）✅ 已交付（v0.17.1771 独立命令 + v0.17.1781 自动集成。逐 hunk 归一化仍为已知收窄）
+### 阶段 5 — rerere（3–5 周）✅ 已交付（v0.17.1771 独立命令 + v0.17.1781 自动集成 + MG-20 逐 hunk 归一化）
 
 | 顺序 | 工作项 |
 |------|--------|
@@ -358,7 +358,7 @@ flowchart TD
 | **M3** | 2 + 3.3–3.4 + 4.1–4.2 | index/tree plumbing；`merge-base`；`apply --check`；`diff A...B`；`repack` |
 | **M4** | 5 + 6.1 | `rerere`；`bundle` |
 | **M5** | 6.2–6.5 | `fast-export/import`；`mailmap`；`replace` |
-| **贯穿** | 7 | 本地协议不再依赖系统 `git`（**2026-08-27 复核：M1–M5 与本行的功能面已全部交付**，见「差距清单与阶段映射」表的逐行版本标注；剩余为 `GGT-00A`（执行由 [`plan-20260729.md`](../plan/plan-20260729.md) 的 CT 卡承接）与本次复核列出的 7 项延后/未实现项：`mktree`、`check-ref-format`、`apply` 写入模式、`credential.helper` 消费侧接线、mailmap 的 log/blame 集成、`replace` 接 SQLite refs + `--edit`/`--graft`、`rerere` 逐 hunk 归一化、`bundle` thin/prerequisite 增量） |
+| **贯穿** | 7 | 本地协议不再依赖系统 `git`（**2026-08-27 复核：M1–M5 与本行的功能面已全部交付**，见「差距清单与阶段映射」表的逐行版本标注；MG-20 后剩余为 `GGT-00A`（执行由 [`plan-20260729.md`](../plan/plan-20260729.md) 的 CT 卡承接）与 6 项延后/未实现项：`mktree`、`check-ref-format`、`apply` 写入模式、`credential.helper` 消费侧接线、mailmap 的 log/blame 集成、`replace` 接 SQLite refs + `--edit`/`--graft`、`bundle` thin/prerequisite 增量） |
 
 ```mermaid
 gantt

@@ -314,6 +314,225 @@ fn create_cli_rebase_success_repo() -> tempfile::TempDir {
     repo
 }
 
+/// A rename on the new base must carry the replayed commit's edit to the new
+/// path. This exercises rebase through merge's rename arbitration instead of
+/// treating the change as a delete plus an unrelated add.
+#[test]
+fn test_rebase_rename_uses_shared_tree_engine() {
+    let repo = tempdir().expect("failed to create temp repo");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+
+    let base = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\n";
+    let feature_edit = "line1\nfeature edit\nline3\nline4\nline5\nline6\nline7\nline8\n";
+    commit_file_via_cli(root, "old.txt", base, "base tracks old path");
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], root),
+        "create feature branch",
+    );
+    commit_file_via_cli(root, "old.txt", feature_edit, "feature edits old path");
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], root),
+        "switch to main",
+    );
+    fs::rename(root.join("old.txt"), root.join("new.txt")).expect("rename base path");
+    assert_cli_success(
+        &run_libra_command(&["add", "-A", "."], root),
+        "stage base rename",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main renames path", "--no-verify"], root),
+        "commit base rename",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], root),
+        "switch to feature",
+    );
+    assert_cli_success(
+        &run_libra_command(&["rebase", "main"], root),
+        "rebase edit across renamed path",
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("new.txt")).expect("read replayed rename result"),
+        feature_edit
+    );
+    assert!(
+        !root.join("old.txt").exists(),
+        "the old path must not return after the replay"
+    );
+}
+
+/// Attribute-selected drivers are part of the shared tree engine. The union
+/// driver makes an otherwise overlapping replay clean and preserves both sides.
+#[test]
+fn test_rebase_driver_uses_shared_tree_engine() {
+    let repo = tempdir().expect("failed to create temp repo");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+
+    fs::write(root.join("driver.txt"), "top\nbase\nbottom\n").expect("write driver base");
+    fs::write(root.join(".gitattributes"), "*.txt merge=union\n").expect("write driver attributes");
+    assert_cli_success(
+        &run_libra_command(&["add", "driver.txt", ".gitattributes"], root),
+        "stage driver base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "driver base", "--no-verify"], root),
+        "commit driver base",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], root),
+        "create feature branch",
+    );
+    commit_file_via_cli(
+        root,
+        "driver.txt",
+        "top\ntheirs\nbottom\n",
+        "feature driver change",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], root),
+        "switch to main",
+    );
+    commit_file_via_cli(
+        root,
+        "driver.txt",
+        "top\nours\nbottom\n",
+        "main driver change",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], root),
+        "switch to feature",
+    );
+    assert_cli_success(
+        &run_libra_command(&["rebase", "main"], root),
+        "rebase through union driver",
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("driver.txt")).expect("read union result"),
+        "top\nours\ntheirs\nbottom\n"
+    );
+}
+
+/// A flattened replay of a merge commit still has every original parent as a
+/// tree-merge base. Here the merge resolution differs from its first parent:
+/// using that parent alone would replay cleanly, while the shared engine's
+/// recursive virtual ancestor correctly exposes a conflict.
+#[test]
+fn test_rebase_recursive_uses_all_merge_parents() {
+    let repo = tempdir().expect("failed to create temp repo");
+    let root = repo.path();
+    init_repo_via_cli(root);
+    configure_identity_via_cli(root);
+    commit_file_via_cli(root, "shared.txt", "base\n", "root");
+    assert_cli_success(
+        &run_libra_command(&["branch", "target"], root),
+        "create target branch",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "topic"], root),
+        "create topic branch",
+    );
+    commit_file_via_cli(root, "shared.txt", "topic\n", "topic change");
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], root),
+        "switch to main",
+    );
+    commit_file_via_cli(root, "shared.txt", "main\n", "main change");
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "topic"], root),
+        "switch to topic",
+    );
+    let merge = run_libra_command(&["merge", "main"], root);
+    assert_eq!(merge.status.code(), Some(128), "topic/main merge conflicts");
+    fs::write(root.join("shared.txt"), "resolution\n").expect("write merge resolution");
+    assert_cli_success(
+        &run_libra_command(&["add", "shared.txt"], root),
+        "stage merge resolution",
+    );
+    assert_cli_success(
+        &run_libra_command(&["merge", "--continue"], root),
+        "complete merge commit",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "target"], root),
+        "switch to target",
+    );
+    commit_file_via_cli(root, "target.txt", "target\n", "target-only change");
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "topic"], root),
+        "return to topic",
+    );
+    let output = run_libra_command(&["rebase", "target"], root);
+    assert_eq!(
+        output.status.code(),
+        Some(128),
+        "recursive virtual base must expose the merge-resolution conflict"
+    );
+    let markers = fs::read_to_string(root.join("shared.txt")).expect("read recursive markers");
+    assert!(
+        markers.contains("topic") && markers.contains("resolution"),
+        "the virtual-base replay must compare the rewritten topic with the merge resolution: {markers:?}"
+    );
+}
+
+/// Rebase conflict presentation and index stages are written by the same
+/// materializer as merge. `diff3` exposes the ancestor block while the index
+/// retains the base/ours/theirs roles required by `rebase --continue`.
+#[test]
+fn test_rebase_refine_uses_shared_tree_engine() {
+    let repo = create_cli_rebase_conflict_ready_repo();
+    let root = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.conflictStyle", "diff3"], root),
+        "configure diff3 markers",
+    );
+
+    let output = run_libra_command(&["rebase", "main"], root);
+    assert_eq!(
+        output.status.code(),
+        Some(128),
+        "rebase must stop on conflict"
+    );
+    let marker_file = fs::read_to_string(root.join("conflict.txt")).expect("read markers");
+    assert!(
+        marker_file.contains("||||||| base\nbase\n=======\n"),
+        "diff3 ancestor section comes from the shared renderer: {marker_file:?}"
+    );
+
+    let stages = run_libra_command(&["ls-files", "-s"], root);
+    assert_cli_success(&stages, "inspect conflicted index stages");
+    let stage_stdout = String::from_utf8_lossy(&stages.stdout);
+    let stage_lines: Vec<_> = stage_stdout
+        .lines()
+        .filter(|line| line.ends_with("\tconflict.txt"))
+        .collect();
+    assert_eq!(
+        stage_lines.len(),
+        3,
+        "expected three conflict stages: {stage_lines:?}"
+    );
+    for stage in [" 1\t", " 2\t", " 3\t"] {
+        assert!(
+            stage_lines.iter().any(|line| line.contains(stage)),
+            "missing stage {stage:?}: {stage_lines:?}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn test_rebase_preserves_executable_mode_in_rewritten_commit() {
@@ -926,8 +1145,8 @@ fn test_rebase_no_autostash_flag_is_accepted_noop() {
 fn test_rebase_no_rerere_autoupdate_flag_is_accepted_noop() {
     let repo = create_cli_rebase_success_repo();
 
-    // `--no-rerere-autoupdate` is accepted and a no-op: Libra has no rerere, so
-    // the rebase proceeds normally.
+    // Rerere is disabled by default, so an explicit override remains a no-op
+    // for an otherwise clean rebase.
     let output = run_libra_command(
         &["--json", "rebase", "--no-rerere-autoupdate", "main"],
         repo.path(),
@@ -937,6 +1156,153 @@ fn test_rebase_no_rerere_autoupdate_flag_is_accepted_noop() {
     let json = parse_json_stdout(&output);
     assert_eq!(json["data"]["status"], "completed");
     assert_eq!(json["data"]["replay_count"], 1);
+}
+
+#[test]
+fn rebase_rerere_autoupdate_flags_override_configured_staging() {
+    let repo = create_cli_rebase_conflict_ready_repo();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "rerere.enabled", "true"], p),
+        "enable rerere",
+    );
+
+    // Seed the reusable resolution cache, then restore the feature branch.
+    assert_eq!(
+        run_libra_command(&["rebase", "main"], p).status.code(),
+        Some(128)
+    );
+    fs::write(p.join("conflict.txt"), "resolved\n").expect("write resolution");
+    assert_cli_success(&run_libra_command(&["rerere"], p), "record resolution");
+    assert_cli_success(
+        &run_libra_command(&["rebase", "--abort"], p),
+        "abort seed rebase",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["config", "rerere.autoUpdate", "true"], p),
+        "configure auto staging",
+    );
+    assert_eq!(
+        run_libra_command(&["rebase", "--no-rerere-autoupdate", "main"], p)
+            .status
+            .code(),
+        Some(128),
+        "explicit off still reports the replayed conflict"
+    );
+    assert_eq!(
+        fs::read_to_string(p.join("conflict.txt")).unwrap(),
+        "resolved\n"
+    );
+    assert!(
+        !run_libra_command(&["ls-files", "-u"], p).stdout.is_empty(),
+        "explicit off must leave replayed content unstaged despite true config"
+    );
+    assert_cli_success(
+        &run_libra_command(&["rebase", "--abort"], p),
+        "abort explicit-off rebase",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["config", "rerere.autoUpdate", "false"], p),
+        "configure no auto staging",
+    );
+    assert_eq!(
+        run_libra_command(&["rebase", "--rerere-autoupdate", "main"], p)
+            .status
+            .code(),
+        Some(128),
+        "explicit on still reports the replayed conflict"
+    );
+    assert_eq!(
+        fs::read_to_string(p.join("conflict.txt")).unwrap(),
+        "resolved\n"
+    );
+    assert!(
+        run_libra_command(&["ls-files", "-u"], p).stdout.is_empty(),
+        "explicit on must stage replayed content despite false config"
+    );
+}
+
+#[test]
+fn rebase_rerere_autoupdate_off_survives_conflict_resume() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    for path in ["first.txt", "second.txt"] {
+        commit_file_via_cli(p, path, "base\n", &format!("base {path}"));
+    }
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "topic"], p),
+        "topic branch",
+    );
+    commit_file_via_cli(p, "first.txt", "topic first\n", "topic f1");
+    commit_file_via_cli(p, "second.txt", "topic second\n", "topic f2");
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+    commit_file_via_cli(p, "first.txt", "main first\n", "main f1");
+    commit_file_via_cli(p, "second.txt", "main second\n", "main f2");
+    assert_cli_success(&run_libra_command(&["switch", "topic"], p), "switch topic");
+    assert_cli_success(
+        &run_libra_command(&["config", "rerere.enabled", "true"], p),
+        "enable rerere",
+    );
+
+    // Populate resolutions for both replayed commits, then restore the topic.
+    assert_eq!(
+        run_libra_command(&["rebase", "main"], p).status.code(),
+        Some(128)
+    );
+    fs::write(p.join("first.txt"), "resolved first\n").unwrap();
+    assert_cli_success(&run_libra_command(&["rerere"], p), "record f1 resolution");
+    assert_cli_success(
+        &run_libra_command(&["add", "first.txt"], p),
+        "stage f1 seed",
+    );
+    assert_eq!(
+        run_libra_command(&["rebase", "--continue"], p)
+            .status
+            .code(),
+        Some(128),
+        "f2 seed conflict"
+    );
+    fs::write(p.join("second.txt"), "resolved second\n").unwrap();
+    assert_cli_success(&run_libra_command(&["rerere"], p), "record f2 resolution");
+    assert_cli_success(
+        &run_libra_command(&["rebase", "--abort"], p),
+        "abort seed rebase",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["config", "rerere.autoUpdate", "true"], p),
+        "configure auto staging",
+    );
+    assert_eq!(
+        run_libra_command(&["rebase", "--no-rerere-autoupdate", "main"], p)
+            .status
+            .code(),
+        Some(128),
+        "f1 replay stops unstaged"
+    );
+    assert_cli_success(
+        &run_libra_command(&["add", "first.txt"], p),
+        "manually stage f1 before the new-process continue",
+    );
+
+    // The fresh --continue must use the sidecar's explicit off value for f2.
+    assert_eq!(
+        run_libra_command(&["rebase", "--continue"], p)
+            .status
+            .code(),
+        Some(128),
+        "f2 replay stops after continue"
+    );
+    assert_eq!(
+        fs::read_to_string(p.join("second.txt")).unwrap(),
+        "resolved second\n"
+    );
+    assert!(
+        !run_libra_command(&["ls-files", "-u"], p).stdout.is_empty(),
+        "persisted explicit off must leave f2's replayed resolution unstaged"
+    );
 }
 
 #[test]
@@ -1430,6 +1796,7 @@ async fn test_basic_rebase() {
     .await;
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -1655,6 +2022,7 @@ async fn test_rebase_preserves_untracked_files() {
     fs::write(temp_path.path().join("notes.txt"), "keep me").unwrap();
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -1784,6 +2152,7 @@ async fn test_rebase_already_up_to_date() {
 
     // Try to rebase feature onto master (should be up to date)
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -1971,6 +2340,7 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
 
     // Start rebase
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -2003,6 +2373,7 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
     // Rebase should complete (no conflict in this case)
     // But let's test abort when no rebase is in progress
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -2206,6 +2577,7 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
     })
     .await;
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -2266,6 +2638,7 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
 
     // Abort should restore the original branch ref.
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -2353,6 +2726,7 @@ async fn test_rebase_continue_no_rebase() {
 
     // Try to continue when no rebase is in progress
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -2422,6 +2796,7 @@ async fn test_rebase_skip_no_rebase() {
 
     // Try to skip when no rebase is in progress
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -2612,6 +2987,7 @@ async fn test_rebase_with_conflict_and_abort() {
     .await;
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -2651,6 +3027,7 @@ async fn test_rebase_with_conflict_and_abort() {
 
     // 6. Abort the rebase
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -2865,6 +3242,7 @@ async fn test_rebase_binary_conflict_writes_markers() {
     })
     .await;
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -2907,6 +3285,7 @@ async fn test_rebase_binary_conflict_writes_markers() {
 
     // Cleanup: abort rebase
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -3142,6 +3521,7 @@ async fn test_rebase_with_conflict_and_skip() {
     .await;
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -3173,6 +3553,7 @@ async fn test_rebase_with_conflict_and_skip() {
     );
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -3373,6 +3754,7 @@ async fn test_rebase_with_conflict_and_continue() {
     .await;
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -3431,6 +3813,7 @@ async fn test_rebase_with_conflict_and_continue() {
 
     // Continue the rebase
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -3717,6 +4100,7 @@ async fn test_rebase_multiple_commits_partial_conflict() {
     .await;
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -3749,6 +4133,7 @@ async fn test_rebase_multiple_commits_partial_conflict() {
 
     // Skip the conflicting commit (F1)
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -3961,6 +4346,7 @@ async fn test_rebase_state_persistence() {
     .await;
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -4010,6 +4396,7 @@ async fn test_rebase_state_persistence() {
 
     // Clean up - abort the rebase
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -4174,6 +4561,7 @@ async fn test_rebase_fast_forward_branch_behind() {
     .await;
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -4341,6 +4729,7 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
     fs::write(temp_path.path().join("file.txt"), "local-modification").unwrap();
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -4508,6 +4897,7 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
     fs::write(temp_path.path().join("new.txt"), "local-untracked").unwrap();
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -4709,6 +5099,7 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
     fs::write(temp_path.path().join("file.txt"), "dirty").unwrap();
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -4915,6 +5306,7 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
     .await;
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -4952,6 +5344,7 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
 
     // Clean up
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -5157,6 +5550,7 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
     fs::write(temp_path.path().join("new.txt"), "keep me").unwrap();
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -5191,6 +5585,7 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
 
     // Clean up
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -5375,6 +5770,7 @@ async fn test_rebase_continue_requires_resolution() {
     .await;
 
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -5408,6 +5804,7 @@ async fn test_rebase_continue_requires_resolution() {
 
     // Continue without resolving conflicts
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,
@@ -5441,6 +5838,7 @@ async fn test_rebase_continue_requires_resolution() {
 
     // Clean up
     execute(RebaseArgs {
+        rerere_autoupdate: false,
         no_rerere_autoupdate: false,
         keep_empty: false,
         no_keep_empty: false,

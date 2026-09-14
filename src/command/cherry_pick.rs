@@ -62,6 +62,7 @@ type ConflictEntry = (
     Option<ObjectHash>,
     Option<ObjectHash>,
     Option<ObjectHash>,
+    merge::BuiltinMergeDriver,
 );
 
 const CHERRY_PICK_EXAMPLES: &str = "\
@@ -145,13 +146,16 @@ enum CherryPickError {
     /// The repository configures an unsupported `merge.conflictStyle` value —
     /// a hard error before any conflicted index/worktree state is written,
     /// consistent with `libra merge`.
-    #[error("unsupported merge.conflictStyle '{0}' (expected 'merge' or 'diff3')")]
+    #[error("unsupported merge.conflictStyle '{0}' (expected 'merge', 'diff3', or 'zdiff3')")]
     InvalidConflictStyle(String),
 
     /// The `merge.conflictStyle` config could not be read (config-store I/O
     /// failure) — never a silent default-style fall-back.
     #[error("failed to read merge.conflictStyle config: {0}")]
     ConflictStyleRead(String),
+
+    #[error("failed to read merge.default config: {0}")]
+    MergeDriverConfigRead(String),
 }
 
 impl CherryPickError {
@@ -176,6 +180,7 @@ impl CherryPickError {
             Self::SaveFailed(_) => StableErrorCode::IoWriteFailed,
             Self::InvalidConflictStyle(_) => StableErrorCode::RepoStateInvalid,
             Self::ConflictStyleRead(_) => StableErrorCode::IoReadFailed,
+            Self::MergeDriverConfigRead(_) => StableErrorCode::IoReadFailed,
         }
     }
 }
@@ -249,10 +254,13 @@ impl From<CherryPickError> for CliError {
                 .with_hint("check filesystem permissions and repository writability"),
             CherryPickError::InvalidConflictStyle(_) => CliError::failure(message)
                 .with_stable_code(stable_code)
-                .with_hint("set merge.conflictStyle to 'merge' (default) or 'diff3'"),
+                .with_hint("set merge.conflictStyle to 'merge' (default), 'diff3', or 'zdiff3'"),
             CherryPickError::ConflictStyleRead(_) => CliError::fatal(message)
                 .with_stable_code(stable_code)
                 .with_hint("check repository integrity and retry"),
+            CherryPickError::MergeDriverConfigRead(_) => CliError::fatal(message)
+                .with_stable_code(stable_code)
+                .with_hint("check repository config readability and retry"),
         }
     }
 }
@@ -276,6 +284,7 @@ enum CherryPickSingleError {
     InvalidConflictStyle(String),
     /// `merge.conflictStyle` config-store read failure.
     ConflictStyleRead(String),
+    MergeDriverConfigRead(String),
     /// The pick's three-way inputs carry a gitlink the cherry-pick would have to
     /// arbitrate — refused before any index/worktree write (ADR-MG-01).
     GitlinkUnsupported(String),
@@ -308,10 +317,10 @@ struct CherryPickOpts {
     keep_redundant_commits: bool,
     #[serde(default)]
     gpg_sign: bool,
-    /// `--rerere-autoupdate`: stage a rerere-replayed resolution. Persisted so a
-    /// later pick in a resumed sequence keeps auto-staging replayed conflicts.
-    #[serde(default)]
-    rerere_autoupdate: bool,
+    /// Explicit rerere staging policy. `None` inherits `rerere.autoUpdate`;
+    /// either value must survive a conflict + resumed sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rerere_autoupdate: Option<bool>,
     /// Mainline parent for merge-commit picks; applies to every commit in the
     /// `-m <n>` invocation, so it must survive a conflict + resume.
     #[serde(default)]
@@ -341,7 +350,7 @@ impl CherryPickOpts {
             allow_empty_message: args.allow_empty_message,
             keep_redundant_commits: args.keep_redundant_commits,
             gpg_sign: args.gpg_sign,
-            rerere_autoupdate: args.rerere_autoupdate,
+            rerere_autoupdate: rerere_autoupdate_override(args),
             mainline: args.mainline,
             cleanup: args.cleanup.clone(),
             empty: args.empty.clone(),
@@ -363,13 +372,24 @@ impl CherryPickOpts {
             allow_empty_message: self.allow_empty_message,
             keep_redundant_commits: self.keep_redundant_commits,
             gpg_sign: self.gpg_sign,
-            rerere_autoupdate: self.rerere_autoupdate,
+            rerere_autoupdate: self.rerere_autoupdate == Some(true),
+            no_rerere_autoupdate: self.rerere_autoupdate == Some(false),
             mainline: self.mainline,
             cleanup: self.cleanup,
             empty: self.empty,
             strategy_option: self.strategy_option.into_iter().collect(),
             ..Default::default()
         }
+    }
+}
+
+const fn rerere_autoupdate_override(args: &CherryPickArgs) -> Option<bool> {
+    if args.rerere_autoupdate {
+        Some(true)
+    } else if args.no_rerere_autoupdate {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -600,17 +620,13 @@ pub struct CherryPickArgs {
     // ── Unsupported Git options captured for explicit rejection ──
     #[clap(long = "strategy", value_name = "name", hide = true)]
     pub strategy: Option<String>,
-    #[clap(
-        long = "rerere-autoupdate",
-        overrides_with = "no_rerere_autoupdate",
-        hide = true
-    )]
+    /// Auto-stage a rerere-replayed resolution for this pick, overriding
+    /// `rerere.autoUpdate`. The last rerere toggle wins.
+    #[clap(long = "rerere-autoupdate", overrides_with = "no_rerere_autoupdate")]
     pub rerere_autoupdate: bool,
-    #[clap(
-        long = "no-rerere-autoupdate",
-        overrides_with = "rerere_autoupdate",
-        hide = true
-    )]
+    /// Do not auto-stage a rerere-replayed resolution for this pick, overriding
+    /// `rerere.autoUpdate`. The last rerere toggle wins.
+    #[clap(long = "no-rerere-autoupdate", overrides_with = "rerere_autoupdate")]
     pub no_rerere_autoupdate: bool,
     #[clap(long = "commit", hide = true)]
     pub commit: bool,
@@ -685,6 +701,9 @@ fn map_single_error(err: CherryPickSingleError, commit_label: &str) -> CherryPic
         CherryPickSingleError::SaveFailed(r) => CherryPickError::SaveFailed(r),
         CherryPickSingleError::InvalidConflictStyle(v) => CherryPickError::InvalidConflictStyle(v),
         CherryPickSingleError::ConflictStyleRead(r) => CherryPickError::ConflictStyleRead(r),
+        CherryPickSingleError::MergeDriverConfigRead(r) => {
+            CherryPickError::MergeDriverConfigRead(r)
+        }
         CherryPickSingleError::GitlinkUnsupported(detail) => {
             CherryPickError::GitlinkUnsupported(detail)
         }
@@ -1126,7 +1145,9 @@ async fn run_cherry_pick_continue(
 
     // rerere: the conflict is resolved — record its postimage so an identical
     // conflict is auto-resolved next time. A no-op unless `rerere.enabled`.
-    if let Err(error) = crate::command::rerere::auto_update(opts_args.rerere_autoupdate).await {
+    if let Err(error) =
+        crate::command::rerere::auto_update(rerere_autoupdate_override(&opts_args)).await
+    {
         tracing::warn!("rerere auto-update on cherry-pick --continue failed: {error}");
     }
 
@@ -1373,7 +1394,6 @@ async fn cherry_pick_single_commit(
     let mut index = Index::load(&index_file).map_err(|e| {
         CherryPickSingleError::LoadObject(format!("failed to load current index: {e}"))
     })?;
-
     // ── Three-way apply: base = parent tree, ours = current index stage 0,
     // theirs = picked commit tree. A path whose ours-side still matches base
     // fast-forwards to theirs; a path where both sides agree is a no-op; a path
@@ -1400,8 +1420,31 @@ async fn cherry_pick_single_commit(
     )
     .map_err(|refusal| CherryPickSingleError::GitlinkUnsupported(refusal.to_string()))?;
 
+    let changes = diff_trees(&their_tree, &parent_tree);
+    let needs_content_driver = changes.iter().any(|(path, their_hash, base_hash)| {
+        let ours_hash = ours_items.get(path).copied();
+        ours_hash != *base_hash
+            && ours_hash != *their_hash
+            && (ours_hash.is_some() || their_hash.is_some())
+    });
+    let default_driver = if needs_content_driver {
+        merge::read_merge_default_driver()
+            .await
+            .map_err(CherryPickSingleError::MergeDriverConfigRead)?
+    } else {
+        None
+    };
+    let (preflighted_conflict_style, mut deferred_conflict_style_error) = if needs_content_driver {
+        match merge::conflict_style_from_config().await {
+            Ok(style) => (Some(style), None),
+            Err(error) => (Some(merge::ConflictStyle::Merge), Some(error)),
+        }
+    } else {
+        (None, None)
+    };
+
     let mut conflicts: Vec<ConflictEntry> = Vec::new();
-    for (path, their_hash, base_hash) in diff_trees(&their_tree, &parent_tree) {
+    for (path, their_hash, base_hash) in changes {
         let ours_hash = ours_items.get(&path).cloned();
         if ours_hash == base_hash {
             match their_hash {
@@ -1412,11 +1455,78 @@ async fn cherry_pick_single_commit(
             }
         } else if ours_hash == their_hash {
             // Both sides already converged on the same content — nothing to do.
+        } else if let (Some(ours_hash), Some(their_hash)) = (ours_hash, their_hash) {
+            let driver = merge::builtin_merge_driver_for_path(&path, default_driver.as_deref());
+            // Preserve the pre-driver add/add behavior for the implicit text
+            // fallback (MG-08 G15). An explicitly selected binary/union driver
+            // still owns the base-less content merge below.
+            if base_hash.is_none() && driver == merge::BuiltinMergeDriver::Text {
+                if let Some(favor) = args.strategy_option.last().copied() {
+                    apply_favored_pick_resolution(
+                        &mut index,
+                        &path,
+                        base_hash,
+                        Some(ours_hash),
+                        Some(their_hash),
+                        favor,
+                    )?;
+                } else {
+                    index.remove(path_to_utf8(&path)?, 0);
+                    add_stage_entry(&mut index, &path, ours_hash, 2)?;
+                    add_stage_entry(&mut index, &path, their_hash, 3)?;
+                    conflicts.push((path, Some(ours_hash), Some(their_hash), None, driver));
+                }
+                continue;
+            }
+            let base_data = match base_hash {
+                Some(base_hash) => {
+                    let base: Blob = load_object(&base_hash)
+                        .map_err(|error| CherryPickSingleError::LoadObject(error.to_string()))?;
+                    base.data
+                }
+                None => Vec::new(),
+            };
+            let ours: Blob = load_object(&ours_hash)
+                .map_err(|error| CherryPickSingleError::LoadObject(error.to_string()))?;
+            let theirs: Blob = load_object(&their_hash)
+                .map_err(|error| CherryPickSingleError::LoadObject(error.to_string()))?;
+            match merge::merge_bytes_with_refined_driver(
+                driver,
+                &base_data,
+                &ours.data,
+                &theirs.data,
+                args.strategy_option.last().copied(),
+                preflighted_conflict_style.unwrap_or(merge::ConflictStyle::Merge),
+                0,
+            )
+            .map_err(CherryPickSingleError::SaveFailed)?
+            {
+                merge::BuiltinMergeOutcome::Clean(bytes) => {
+                    let blob = Blob::from_content_bytes(bytes);
+                    save_object(&blob, &blob.id).map_err(|error| {
+                        CherryPickSingleError::SaveFailed(format!(
+                            "failed to save merged cherry-pick result for '{}': {error}",
+                            path.display()
+                        ))
+                    })?;
+                    update_index_entry(&mut index, &path, blob.id)?;
+                }
+                merge::BuiltinMergeOutcome::Conflict(_) => {
+                    index.remove(path_to_utf8(&path)?, 0);
+                    if let Some(base_hash) = base_hash {
+                        add_stage_entry(&mut index, &path, base_hash, 1)?;
+                    }
+                    add_stage_entry(&mut index, &path, ours_hash, 2)?;
+                    add_stage_entry(&mut index, &path, their_hash, 3)?;
+                    conflicts.push((path, Some(ours_hash), Some(their_hash), base_hash, driver));
+                }
+            }
         } else if let Some(favor) = args.strategy_option.last().copied() {
             apply_favored_pick_resolution(
                 &mut index, &path, base_hash, ours_hash, their_hash, favor,
             )?;
         } else {
+            let driver = merge::builtin_merge_driver_for_path(&path, default_driver.as_deref());
             index.remove(path_to_utf8(&path)?, 0);
             if let Some(b) = base_hash {
                 add_stage_entry(&mut index, &path, b, 1)?;
@@ -1427,26 +1537,38 @@ async fn cherry_pick_single_commit(
             if let Some(t) = their_hash {
                 add_stage_entry(&mut index, &path, t, 3)?;
             }
-            conflicts.push((path, ours_hash, their_hash, base_hash));
+            conflicts.push((path, ours_hash, their_hash, base_hash, driver));
         }
     }
 
     if !conflicts.is_empty() {
-        // Honor the Git-compatible `merge.conflictStyle` config (merge/diff3)
-        // for the line-level markers, same as `libra merge` (lore.md §1.3).
-        // Resolved FIRST — before the conflicted index is saved or the worktree
-        // is touched — so an invalid config errors with nothing mutated.
+        // Honor the shared merge/diff3/zdiff3 renderer. A bad setting was
+        // deferred while deciding whether a real conflict existed; surface it
+        // now, before the conflicted index or worktree is written.
+        if let Some(error) = deferred_conflict_style_error.take() {
+            return Err(match error {
+                super::merge::ConflictStyleError::Invalid(value) => {
+                    CherryPickSingleError::InvalidConflictStyle(value)
+                }
+                super::merge::ConflictStyleError::Read(detail) => {
+                    CherryPickSingleError::ConflictStyleRead(detail)
+                }
+            });
+        }
         let conflict_style =
-            super::merge::conflict_style_from_config()
-                .await
-                .map_err(|e| match e {
-                    super::merge::ConflictStyleError::Invalid(value) => {
-                        CherryPickSingleError::InvalidConflictStyle(value)
-                    }
-                    super::merge::ConflictStyleError::Read(detail) => {
-                        CherryPickSingleError::ConflictStyleRead(detail)
-                    }
-                })?;
+            match preflighted_conflict_style {
+                Some(style) => style,
+                None => super::merge::conflict_style_from_config()
+                    .await
+                    .map_err(|error| match error {
+                        super::merge::ConflictStyleError::Invalid(value) => {
+                            CherryPickSingleError::InvalidConflictStyle(value)
+                        }
+                        super::merge::ConflictStyleError::Read(detail) => {
+                            CherryPickSingleError::ConflictStyleRead(detail)
+                        }
+                    })?,
+            };
         index
             .save(&index_file)
             .map_err(|e| CherryPickSingleError::SaveFailed(format!("failed to save index: {e}")))?;
@@ -1454,7 +1576,7 @@ async fn cherry_pick_single_commit(
         // onto each divergent path so the user can resolve them in the worktree.
         reset_workdir_tracked_only(&current_index, &index)?;
         let short_src = short_display_hash(&commit_id.to_string()).to_string();
-        for (path, ours_hash, their_hash, base_hash) in &conflicts {
+        for (path, ours_hash, their_hash, base_hash, driver) in &conflicts {
             write_conflict_markers_file(
                 path,
                 ours_hash,
@@ -1462,17 +1584,20 @@ async fn cherry_pick_single_commit(
                 base_hash,
                 &short_src,
                 conflict_style,
+                *driver,
             )?;
         }
         // rerere: record the preimage of each just-written conflict and replay a
         // previously recorded resolution if one matches. A no-op unless
         // `rerere.enabled` is set, so default cherry-pick behaviour is unchanged.
-        if let Err(error) = crate::command::rerere::auto_update(args.rerere_autoupdate).await {
+        if let Err(error) =
+            crate::command::rerere::auto_update(rerere_autoupdate_override(args)).await
+        {
             tracing::warn!("rerere auto-update after cherry-pick conflict failed: {error}");
         }
         let mut paths: Vec<String> = conflicts
             .iter()
-            .map(|(path, _, _, _)| path.display().to_string())
+            .map(|(path, _, _, _, _)| path.display().to_string())
             .collect();
         paths.sort();
         return Err(CherryPickSingleError::Conflicted(paths));
@@ -1883,7 +2008,8 @@ fn write_conflict_markers_file(
     their_hash: &Option<ObjectHash>,
     base_hash: &Option<ObjectHash>,
     short_src: &str,
-    conflict_style: diffy::ConflictStyle,
+    conflict_style: merge::ConflictStyle,
+    driver: merge::BuiltinMergeDriver,
 ) -> Result<(), CherryPickSingleError> {
     fn side_bytes(hash: &Option<ObjectHash>) -> Option<Vec<u8>> {
         hash.as_ref()
@@ -1895,20 +2021,43 @@ fn write_conflict_markers_file(
 
     // Line-level merge applies only when both sides are present and text; the
     // shared helper returns None otherwise so we fall back to whole-file markers.
-    let content: Vec<u8> = match (&ours_bytes, &theirs_bytes) {
-        (Some(ours), Some(theirs)) => super::merge::render_line_level_conflict(
-            base_bytes.as_deref(),
-            ours,
-            theirs,
-            short_src,
-            conflict_style,
-        )
-        .unwrap_or_else(|| whole_file_conflict(ours, theirs, short_src)),
-        _ => whole_file_conflict(
-            ours_bytes.as_deref().unwrap_or(&[]),
-            theirs_bytes.as_deref().unwrap_or(&[]),
-            short_src,
-        ),
+    let binary_conflict = driver == merge::BuiltinMergeDriver::Binary
+        || (driver == merge::BuiltinMergeDriver::Union
+            && ours_bytes.is_some()
+            && theirs_bytes.is_some()
+            && [
+                base_bytes.as_deref(),
+                ours_bytes.as_deref(),
+                theirs_bytes.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(merge::merge_input_is_binary));
+    let content: Vec<u8> = if binary_conflict {
+        // A binary modify/delete conflict keeps whichever complete side still
+        // exists. Choosing only ours would turn an ours-deleted/theirs-modified
+        // path into an empty worktree file even though stage 3 retained data.
+        ours_bytes
+            .clone()
+            .or_else(|| theirs_bytes.clone())
+            .unwrap_or_default()
+    } else {
+        match (&ours_bytes, &theirs_bytes) {
+            (Some(ours), Some(theirs)) => super::merge::render_line_level_conflict(
+                base_bytes.as_deref(),
+                ours,
+                theirs,
+                short_src,
+                conflict_style,
+            )
+            .map_err(CherryPickSingleError::SaveFailed)?
+            .unwrap_or_else(|| whole_file_conflict(ours, theirs, short_src)),
+            _ => whole_file_conflict(
+                ours_bytes.as_deref().unwrap_or(&[]),
+                theirs_bytes.as_deref().unwrap_or(&[]),
+                short_src,
+            ),
+        }
     };
 
     let target = util::working_dir().join(path);
@@ -1933,24 +2082,11 @@ fn write_conflict_markers_file(
 /// (a delete/modify conflict, or binary content): ours between `<<<<<<< HEAD`
 /// and `=======`, theirs up to `>>>>>>> <short-source>`.
 fn whole_file_conflict(ours: &[u8], theirs: &[u8], short_src: &str) -> Vec<u8> {
-    fn side_text(bytes: &[u8]) -> String {
-        String::from_utf8_lossy(bytes).into_owned()
-    }
-    let ours = side_text(ours);
-    let theirs = side_text(theirs);
-
-    let mut content = String::from("<<<<<<< HEAD\n");
-    content.push_str(&ours);
-    if !ours.is_empty() && !ours.ends_with('\n') {
-        content.push('\n');
-    }
-    content.push_str("=======\n");
-    content.push_str(&theirs);
-    if !theirs.is_empty() && !theirs.ends_with('\n') {
-        content.push('\n');
-    }
-    content.push_str(&format!(">>>>>>> {short_src}\n"));
-    content.into_bytes()
+    // Preserve cherry-pick's established lossy binary/delete-modify fallback;
+    // the shared renderer only owns marker framing and line endings here.
+    let ours = String::from_utf8_lossy(ours);
+    let theirs = String::from_utf8_lossy(theirs);
+    merge::render_whole_file_conflict(ours.as_bytes(), theirs.as_bytes(), "HEAD", short_src)
 }
 
 /// Build (and persist) the nested tree for the current index, delegating to the
@@ -2370,6 +2506,7 @@ mod tests {
             allow_empty_message: true,
             keep_redundant_commits: true,
             gpg_sign: true,
+            rerere_autoupdate: true,
             mainline: Some(2),
             cleanup: Some("strip".to_string()),
             empty: Some("drop".to_string()),
@@ -2387,10 +2524,16 @@ mod tests {
         assert!(rebuilt.allow_empty_message);
         assert!(rebuilt.keep_redundant_commits);
         assert!(rebuilt.gpg_sign);
+        assert!(rebuilt.rerere_autoupdate);
+        assert!(!rebuilt.no_rerere_autoupdate);
         assert_eq!(rebuilt.mainline, Some(2));
         assert_eq!(rebuilt.cleanup.as_deref(), Some("strip"));
         assert_eq!(rebuilt.empty.as_deref(), Some("drop"));
         assert_eq!(rebuilt.strategy_option, vec![MergeFavor::Ours]);
+
+        let old: CherryPickOpts = serde_json::from_str("{}")
+            .expect("options written before rerere override remain readable");
+        assert_eq!(old.rerere_autoupdate, None);
     }
 
     #[test]
@@ -2399,5 +2542,21 @@ mod tests {
             .expect("valid cherry-pick arguments should parse");
         assert!(args.gpg_sign);
         assert!(!args.no_gpg_sign);
+    }
+
+    #[test]
+    fn rerere_autoupdate_flags_are_last_wins_and_round_trip() {
+        let args = CherryPickArgs::try_parse_from([
+            "cherry-pick",
+            "--rerere-autoupdate",
+            "--no-rerere-autoupdate",
+            "deadbeef",
+        ])
+        .expect("the last rerere toggle must win");
+        assert_eq!(rerere_autoupdate_override(&args), Some(false));
+
+        let rebuilt = CherryPickOpts::from_args(&args).into_args();
+        assert!(!rebuilt.rerere_autoupdate);
+        assert!(rebuilt.no_rerere_autoupdate);
     }
 }

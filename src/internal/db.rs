@@ -37,6 +37,18 @@ use sea_orm::{
 
 use crate::utils::path;
 
+/// Local SQLite connections live until their pool closes. SQLx 0.9.0 publishes
+/// an idle connection before incrementing `num_idle`; a concurrent acquisition
+/// can transiently underflow that count. Its reaper snapshots the count as an
+/// unbounded, non-yielding loop, which can strand runtime shutdown forever.
+/// Disable both timers to avoid spawning that reaper. Keep connection limits
+/// and acquisition timeouts supplied by each caller (SeaORM defaults to one).
+pub(crate) fn sqlite_pool_options(
+    options: sea_orm::sqlx::sqlite::SqlitePoolOptions,
+) -> sea_orm::sqlx::sqlite::SqlitePoolOptions {
+    options.idle_timeout(None).max_lifetime(None)
+}
+
 /// Result of applying repository database schema upgrades.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaUpgradeReport {
@@ -141,6 +153,7 @@ pub(crate) async fn open_connection_without_schema_management(
     let normalized_path = normalize_path_for_sqlite(db_path);
     let mut option = ConnectOptions::new(format!("sqlite://{normalized_path}"));
     option.sqlx_logging(false); // TODO use better option
+    option.map_sqlx_sqlite_pool_opts(sqlite_pool_options);
     // Recovery-critical durability (lore.md 2.6 / _general.md §12): the
     // sequencer, refs, reflog, and config all live here, so every commit MUST
     // reach disk — pin `synchronous = FULL` explicitly rather than relying on
@@ -705,6 +718,7 @@ async fn connect_database(db_path: &str) -> io::Result<DatabaseConnection> {
     let normalized_path = normalize_path_for_sqlite(db_path);
     let mut option = ConnectOptions::new(format!("sqlite://{normalized_path}"));
     option.sqlx_logging(false); // TODO use better option
+    option.map_sqlx_sqlite_pool_opts(sqlite_pool_options);
     Database::connect(option)
         .await
         .map_err(|err| IOError::other(format!("Database connection error: {err:?}")))
@@ -811,6 +825,49 @@ mod tests {
         config, object_index,
         reference::{self, ConfigKind},
     };
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sqlite_pools_disable_the_racy_reaper_and_preserve_single_connection() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_str().unwrap();
+        for conn in [
+            connect_database(path).await.unwrap(),
+            open_connection_without_schema_management(path, Duration::from_millis(200))
+                .await
+                .unwrap(),
+        ] {
+            let pool = conn.get_sqlite_connection_pool();
+            assert_eq!(pool.options().get_idle_timeout(), None);
+            assert_eq!(pool.options().get_max_lifetime(), None);
+            assert_eq!(pool.options().get_max_connections(), 1);
+            conn.execute_unprepared("CREATE TABLE IF NOT EXISTS regression (value INTEGER)")
+                .await
+                .unwrap();
+            // Exercise connection return/acquisition across workers, the path
+            // that raced with SQLx's reaper in the hung merge subprocess. Use
+            // reads: 128 FULL-synchronous commits measure disk flush latency,
+            // not pool lifecycle, and exceeded this deadline on disk-backed TMPDIR.
+            let mut queries = tokio::task::JoinSet::new();
+            for _ in 0..8 {
+                let conn = conn.clone();
+                queries.spawn(async move {
+                    for _ in 0..16 {
+                        conn.execute_unprepared("SELECT COUNT(*) FROM regression")
+                            .await
+                            .unwrap();
+                    }
+                });
+            }
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while let Some(result) = queries.join_next().await {
+                    result.unwrap();
+                }
+                conn.close().await.unwrap();
+            })
+            .await
+            .expect("SQLite queries and pool closure must complete");
+        }
+    }
 
     /// TestDbPath is a helper struct create and delete test database file
     struct TestDbPath(String);

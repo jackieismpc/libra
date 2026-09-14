@@ -7,7 +7,7 @@
 ## 概要
 
 ```
-libra rebase [--autosquash] [--reapply-cherry-picks] [--autostash] [--exec <cmd>] [--update-refs] [--fork-point] [--no-rerere-autoupdate] [--keep-empty | --no-keep-empty] [--empty=<mode>] <upstream>
+libra rebase [--autosquash] [--reapply-cherry-picks] [--autostash] [--exec <cmd>] [--update-refs] [--fork-point] [--rerere-autoupdate | --no-rerere-autoupdate] [--keep-empty | --no-keep-empty] [--empty=<mode>] <upstream>
 libra rebase --onto <newbase> <upstream> [<branch>]
 libra rebase --continue
 libra rebase --abort
@@ -19,6 +19,8 @@ libra rebase --skip
 `libra rebase` 将当前分支上的一系列提交移动到新的 base 提交之上。它会找到当前分支与指定 upstream 之间的共同祖先，收集从该祖先到当前 HEAD 的所有提交，并在 upstream 分支之上重放每个提交。所有提交重放后，当前分支引用会更新为指向最终 rebased 提交。
 
 如果重放期间发生冲突，rebase 会停止并报告冲突文件。用户手动解决冲突、暂存已解决文件，然后运行 `libra rebase --continue` 继续。或者，`--abort` 会恢复原始分支状态，`--skip` 会丢弃当前提交并继续下一个。
+
+每次 replay 都使用与 `libra merge` 相同的三路树引擎。因此，rename 检测（包括 `merge.renames` / `merge.renameLimit`）、`.gitattributes` 与 `merge.default` driver、`merge.conflictStyle` 的冲突精化以及文件/目录冲突处理，都会以相同语义作用于 rebase。普通 first-parent replay 遇到已有 merge commit 时，会先把该提交的所有原始 parent 折叠为引擎的 recursive virtual base，再执行 replay；改写结果仍是扁平的单 parent 提交。这不表示已实现 `--rebase-merges`，也不会保留 merge topology。
 
 `--autostash` 会在重放前把 tracked index/worktree 变更保存为 held stash，并在成功或中止后分别恢复 staged index 层与 unstaged worktree 层。可重复的 `--exec <cmd>` 会在每个重放提交后通过 Libra 强制 workspace-write、禁网 sandbox 依次执行；失败会停止序列，`--continue` 重试失败命令。exec 失败后的 `--skip` 保留已重放提交并跳过该提交剩余命令。`--update-refs` 原子重定向重写区间中的其他本地分支，但排除任何 worktree 已检出的分支。`--fork-point` 从 upstream reflog 选择仍是 `HEAD` 祖先的最具体旧 tip，找不到时回退普通 merge base。
 
@@ -43,7 +45,7 @@ Rebase 状态（剩余和已完成提交列表、原始 HEAD 和目标 base）�
 | | `--exec <cmd>` | 在每个重放提交后，通过强制 workspace-write、禁网 sandbox 执行可重复 shell 命令。非零退出或超时停止 rebase，`--continue` 重试。 |
 | | `--update-refs` / `--no-update-refs` | 原子移动指向重写区间的其他本地分支；排除任何 worktree 已检出的分支。最后一个 toggle 生效。 |
 | | `--fork-point` / `--no-fork-point` | 尽可能从 upstream reflog 选重放边界，否则使用普通 merge base。最后一个 toggle 生效。 |
-| | `--no-rerere-autoupdate` | Git 兼容的接受式 no-op：启用时 rerere 记录已集成，但 rebase 不公开正向 `--rerere-autoupdate`；暂存行为遵循 `rerere.autoUpdate`。 |
+| | `--rerere-autoupdate` / `--no-rerere-autoupdate` | 覆盖本次 rebase 的 rerere 回放暂存：正向标志会暂存回放解法，负向标志保持未暂存；最后出现的标志生效。两者均省略时继承 `rerere.autoUpdate`。rerere 按规范化 hunk 两侧匹配，且只写入干净的三方回放。选择会写入 rebase auxiliary state，因此 `--continue` 使用原始决定。rerere 禁用时二者均为 no-op。 |
 | | `--keep-empty` | 保留 start-empty（重放前就为空）的提交而非丢弃。为 Git 兼容性接受的 no-op：Libra 的 rebase 默认就保留空提交。与 `--no-keep-empty` 组成 toggle，last-wins。 |
 | | `--no-keep-empty` | 丢弃 start-empty 提交（其 tree 等于父 tree，未引入变更）而非重放。与 `--keep-empty` 组成 toggle。（此项控制*开始*就为空的提交；`--empty=<mode>` 控制 replay 后*变空*的提交。） |
 | | `--empty=<mode>` | 如何处理 replay 后*变空*的提交（其变更已在新 base 上）：`drop` 跳过它（HEAD 不前进，并打印 `dropping <sha> <subject> -- patch contents already upstream`），`keep` 保留这个空提交。省略时 Libra **保留**——有意与 Git 不同（Git 默认 drop）；需要 Git 行为请用 `--empty=drop`。该模式会跨冲突 round-trip 到 `--continue`/`--skip`。Git 的 `stop`/`ask`（停下交由你决定）不支持（Libra 非交互 rebase 无 halt-on-empty 续作流）；它们与任何未知值均为用法错误（`LBR-CLI-002`，退出 129）。 |
@@ -357,7 +359,7 @@ Libra 提供折中方案：带 conflict-stop 语义的线性 rebase（Git 用户
 | Autostash | 支持 `--autostash` / `--no-autostash`；tracked 变更跨 sequencer 停止保持 held | `--autostash` / `--no-autostash` | N/A |
 | Update refs | 支持；排除已检出分支，并原子比较捕获 tip 后移动 | `--update-refs` / `--no-update-refs` | N/A |
 | Fork point | 支持 upstream reflog 选点与 merge-base 回退 | `--fork-point` / `--no-fork-point` | N/A |
-| Rerere autoupdate | `--no-rerere-autoupdate` 为接受式 no-op；不公开正向 flag，暂存遵循 `rerere.autoUpdate` | `--rerere-autoupdate` / `--no-rerere-autoupdate` | N/A |
+| Rerere 自动暂存 | 两个标志均覆盖回放暂存（last-wins）；省略时继承 `rerere.autoUpdate` | `--rerere-autoupdate` / `--no-rerere-autoupdate` | 选择跨 `--continue` 保持 |
 | Rebase merges | 不支持 | `--rebase-merges` | 默认行为 |
 | Keep empty | `--keep-empty`（no-op；默认已保留）/ `--no-keep-empty`（丢弃 start-empty 提交） | `--keep-empty` / `--no-keep-empty` | 默认保留空提交 |
 | Empty mode | `--empty=<drop\|keep>`（become-empty；默认 **keep**） | `--empty=<drop\|keep\|stop>`（默认 drop） | N/A |
