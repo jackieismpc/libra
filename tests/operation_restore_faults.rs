@@ -64,6 +64,102 @@ fn interrupted_swap_manifest_recovers_the_worktree_idempotently() {
 }
 
 #[test]
+fn crash_during_staging_must_preserve_unmoved_original() {
+    // Review-reproduced failure: a crash while top-level entries are being
+    // moved into `backup` leaves some originals in `backup` and the rest still
+    // in the worktree root. Recovery must restore the moved ones and MUST NOT
+    // delete the ones that were never moved (their only copy is in the root).
+    let root = tempdir().expect("worktree");
+    let transaction = root.path().join(".libra/operation-restore-crash-staging");
+    fs::create_dir_all(transaction.join("backup")).expect("backup");
+    fs::create_dir_all(transaction.join("stage")).expect("stage");
+    // `a.txt` was already moved into backup (original preserved there).
+    fs::write(transaction.join("backup/a.txt"), b"old-a").expect("backup a");
+    // `b.txt` is the original that was never moved; it still lives in root.
+    fs::write(root.path().join("b.txt"), b"old-b").expect("original b");
+    // Staged replacements for both exist but were never installed.
+    fs::write(transaction.join("stage/a.txt"), b"new-a").expect("stage a");
+    fs::write(transaction.join("stage/b.txt"), b"new-b").expect("stage b");
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "backup_paths": ["a.txt", "b.txt"],
+        "install_entries": [
+            {"path": "a.txt", "object_oid": oid(b"new-a").to_string(), "mode": "Blob"},
+            {"path": "b.txt", "object_oid": oid(b"new-b").to_string(), "mode": "Blob"}
+        ]
+    });
+    fs::write(
+        transaction.join("manifest.json"),
+        serde_json::to_vec(&manifest).expect("serialize manifest"),
+    )
+    .expect("manifest");
+    // The move phase started but never finished: no installing marker.
+    fs::write(transaction.join("phase-backing-up"), b"").expect("backing-up marker");
+
+    assert_eq!(
+        recover_restore_transactions(root.path()).expect("recover"),
+        1
+    );
+    assert_eq!(
+        fs::read(root.path().join("a.txt")).expect("a restored"),
+        b"old-a"
+    );
+    assert_eq!(
+        fs::read(root.path().join("b.txt")).expect("b preserved"),
+        b"old-b"
+    );
+    assert!(!transaction.exists());
+}
+
+#[test]
+fn crash_during_recovery_must_preserve_already_restored_original() {
+    // Review-reproduced failure: a crash inside recovery itself. Some
+    // originals were already restored from `backup` into the worktree root,
+    // others are still in `backup`. Re-running recovery must not delete the
+    // already-restored originals and must finish restoring the remainder.
+    let root = tempdir().expect("worktree");
+    let transaction = root.path().join(".libra/operation-restore-crash-recovery");
+    fs::create_dir_all(transaction.join("backup")).expect("backup");
+    fs::create_dir_all(transaction.join("stage")).expect("stage");
+    // `a.txt` was already restored on the first (interrupted) recovery pass:
+    // the original is back in root and gone from backup.
+    fs::write(root.path().join("a.txt"), b"old-a").expect("restored a");
+    // `b.txt` is still in backup, waiting for this pass.
+    fs::write(transaction.join("backup/b.txt"), b"old-b").expect("backup b");
+    // Staged replacements remain; they must not be installed.
+    fs::write(transaction.join("stage/a.txt"), b"new-a").expect("stage a");
+    fs::write(transaction.join("stage/b.txt"), b"new-b").expect("stage b");
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "backup_paths": ["a.txt", "b.txt"],
+        "install_entries": [
+            {"path": "a.txt", "object_oid": oid(b"new-a").to_string(), "mode": "Blob"},
+            {"path": "b.txt", "object_oid": oid(b"new-b").to_string(), "mode": "Blob"}
+        ]
+    });
+    fs::write(
+        transaction.join("manifest.json"),
+        serde_json::to_vec(&manifest).expect("serialize manifest"),
+    )
+    .expect("manifest");
+    fs::write(transaction.join("phase-installing"), b"").expect("installing marker");
+
+    assert_eq!(
+        recover_restore_transactions(root.path()).expect("recover"),
+        1
+    );
+    assert_eq!(
+        fs::read(root.path().join("a.txt")).expect("a preserved"),
+        b"old-a"
+    );
+    assert_eq!(
+        fs::read(root.path().join("b.txt")).expect("b restored"),
+        b"old-b"
+    );
+    assert!(!transaction.exists());
+}
+
+#[test]
 fn dry_run_receipt_is_machine_stable() {
     let receipt = RestoreReceipt {
         target_op_id: "target-op".to_string(),
