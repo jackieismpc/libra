@@ -212,7 +212,11 @@ pub fn sole_writer() {
         &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
         &mut calls,
     );
-    assert_eq!(calls.writer_calls, ["begin_mutation"]);
+    calls.writer_calls.sort();
+    assert_eq!(
+        calls.writer_calls,
+        ["apply_configuration_repair", "begin_mutation"]
+    );
     assert_eq!(calls.ddl_uses, ["write_configuration_barrier"]);
     let manifest = schema::schema_manifest();
     assert_eq!(manifest.configuration_barrier.version, i64::MAX);

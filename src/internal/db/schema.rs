@@ -650,6 +650,51 @@ pub(crate) async fn open_readonly_connection_for_role(
     open_literal_connection(db_path, busy_timeout, role, true).await
 }
 
+/// A private repair handle: no file creation, automatic migration, cached
+/// connection or Repository policy. The caller supplies confirmation, format
+/// attestation and backup, and proves physical connection continuity itself.
+#[cfg(unix)]
+pub(crate) async fn open_configuration_repair_connection(
+    db_path: &Path,
+) -> io::Result<DatabaseConnection> {
+    open_literal_connection(
+        db_path,
+        Duration::from_millis(200),
+        DatabaseRole::GlobalConfig,
+        false,
+    )
+    .await
+}
+
+/// Initialize only configuration-owned receipt metadata inside the repair
+/// caller's already locked transaction. No bootstrap/top-up or data migration
+/// belongs here. The caller must subsequently use the sole barrier writer.
+#[cfg(unix)]
+pub(crate) async fn initialize_configuration_ledger_for_repair(
+    txn: &DatabaseTransaction,
+) -> io::Result<()> {
+    let role = DatabaseRole::GlobalConfig;
+    let inspection = inspect_configuration_schema(txn, role).await?;
+    if inspection.issue.is_some()
+        || inspection.base_receipt_present
+        || inspection.barrier_present
+        || latest_schema_version_for_role(role)? != Some(CONFIGURATION_BASE_VERSION)
+    {
+        return Err(io::Error::other(
+            "configuration repair eligibility changed; rerun schema diagnosis",
+        ));
+    }
+    txn.execute_unprepared(CONFIGURATION_LEDGER_SQL)
+        .await
+        .map_err(io::Error::other)?;
+    txn.execute_raw(Statement::from_sql_and_values(
+        txn.get_database_backend(),
+        "INSERT INTO configuration_schema_versions (version, name, applied_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+        [CONFIGURATION_BASE_VERSION.into(), CONFIGURATION_BASE_NAME.into()],
+    )).await.map_err(io::Error::other)?;
+    Ok(())
+}
+
 async fn open_literal_connection(
     db_path: &Path,
     busy_timeout: Duration,
@@ -680,6 +725,7 @@ async fn open_literal_connection(
     // The URL is fixed: SQLite URI metacharacters in the caller's path must
     // not become query options or redirect the connection to another file.
     let mut options = ConnectOptions::new("sqlite://role-owned-database");
+    options.max_connections(1);
     options.sqlx_logging(false);
     options.map_sqlx_sqlite_pool_opts(super::sqlite_pool_options);
     options.map_sqlx_sqlite_opts(move |opts| {

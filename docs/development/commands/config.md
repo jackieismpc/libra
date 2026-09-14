@@ -15,6 +15,8 @@
 
 ## 设计方案
 
+- Schema 角色与恢复：global/system 配置连接使用 `DatabaseRole::GlobalConfig/SystemConfig` 及独立 configuration ledger，不运行 Repository migration；local 配置仍属于 Repository。`doctor --global-schema` 在 `src/command/config/doctor.rs` 只读诊断，默认 `repair_eligible=false`。配对的 `--repair --confirm <canonical-path>` 由独立 `repair.rs` 处理，仅在已注册 producer-format 指纹、私有 Unix 路径与锁检查通过后执行一致性备份；备份验证后，在同一物理连接的 SQLite 写事务内重验并初始化 configuration ledger，调用唯一 `db::write_configuration_barrier`。不读配置值、不打开 Vault/System/Repository DB；不运行自动升级或 Repository recovery。CLI 的 Repository scope census 保持只读以绕过仓库资源，但明确 repair 的 operation class 是 `LibraStateMutation`，不可把它当作无副作用诊断。
+- 恢复契约与验证：完整边界见 [database-migration-scope.md](../internal/database-migration-scope.md) 和[用户 config 文档](../../commands/config.md)。格式 attestation 不证明历史 writer，未知/超长/内嵌 NUL 元数据拒绝；backup、原子事务、WAL、并发拒绝与 secret-free 门归 `compat_global_config_schema_future` / `db_migration_test`；hash-pinned 旧 reader 拒写由 `old_reader_oracle_test` 的显式 opt-in gate 证明。故障门仅在 `test-upgrade` + `LIBRA_TEST=1` 下编译/启用，release 不含 hook；测试仅使用临时 fixture。
 - 入口与分发：已公开接入 `src/cli.rs::Commands`；已由 `src/command/mod.rs` 导出。CLI 层在 `src/cli.rs` 把解析后的参数交给命令模块，命令模块负责把领域错误转换为 `CliError` / `CliResult`。
 - 源码分层：主要实现文件为 `src/command/config.rs`。参数/子命令类型包括：`ConfigArgs`、`ConfigCommand`；输出、错误或状态类型包括：`ConfigListEntry`、`ConfigImportSummary`、`ConfigSshKeyEntry`、`ConfigGpgKeyEntry`（`--json` 序列化），错误通过 `CliError` / `CliResult` 统一传播；主要执行函数包括：`execute`、`execute_safe`、`execute_inner`、`resolve_command`。
 - 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；数据库路径会通过 SeaORM/SQLite 或 D1 客户端持久化元数据。

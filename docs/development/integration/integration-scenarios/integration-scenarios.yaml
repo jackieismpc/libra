@@ -59,6 +59,12 @@ notes: |
   compat_format_patch_mail_roundtrip, and compat_matrix_alignment in
   tests/INDEX.md and the integration-test-plan matrix. IX-01's isolated full
   installer smoke is likewise Cargo-only as compat_install_alias.
+  MIG-06 confirmed config schema repair remains Cargo-only in
+  compat_global_config_schema_future and db_migration_test (global_schema_repair_
+  filters). Fault gates require test-upgrade; old_reader_oracle_test additionally
+  requires explicit opt-in and hash-pinned v0.22.16/v0.22.19 binaries. The
+  integration-test-plan matrix and plan-20260910.md record exact isolated gates;
+  these are not new cli.* runner scenarios and never repair ambient user DBs.
 
 scenarios:
   # --- Wave 1: core local version control (no network, no external services) ---

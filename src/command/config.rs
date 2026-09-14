@@ -41,6 +41,7 @@ use crate::{
 };
 
 mod doctor;
+mod repair;
 
 /// Cached database connection for Global scope, paired with the resolved DB path.
 static GLOBAL_CONFIG_CONN: Lazy<Mutex<Option<(PathBuf, DatabaseConnection)>>> =
@@ -436,6 +437,12 @@ pub enum ConfigCommand {
         /// Inspect only the global configuration schema (required)
         #[clap(long, required = true)]
         global_schema: bool,
+        /// Repair an attested legacy global schema after a verified backup (Unix)
+        #[clap(long, requires = "confirm")]
+        repair: bool,
+        /// Confirm the exact absolute canonical global database path
+        #[clap(long, requires = "repair", value_name = "CANONICAL_PATH")]
+        confirm: Option<PathBuf>,
     },
     /// Set a configuration value
     Set {
@@ -592,13 +599,31 @@ pub fn is_schema_doctor_request(args: &ConfigArgs) -> bool {
     matches!(args.command, Some(ConfigCommand::Doctor { .. }))
 }
 
+pub fn is_schema_repair_request(args: &ConfigArgs) -> bool {
+    matches!(
+        args.command,
+        Some(ConfigCommand::Doctor { repair: true, .. })
+    )
+}
+
 fn validate_schema_doctor_args(args: &ConfigArgs) -> CliResult<()> {
     let requested = matches!(
         args.command,
         Some(ConfigCommand::Doctor {
-            global_schema: true
+            global_schema: true,
+            ..
         })
     );
+    if let Some(ConfigCommand::Doctor {
+        repair, confirm, ..
+    }) = &args.command
+        && *repair != confirm.is_some()
+    {
+        return Err(CliError::command_usage(
+            "schema repair requires both --repair and --confirm <canonical-global-db-path>",
+        )
+        .with_stable_code(StableErrorCode::CliInvalidArguments));
+    }
     if !requested
         || args.local
         || args.system
@@ -658,7 +683,18 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
     }
 
     match cmd {
-        ResolvedCommand::Doctor => doctor::execute(output).await,
+        ResolvedCommand::Doctor => {
+            if let Some(ConfigCommand::Doctor {
+                repair: true,
+                confirm: Some(path),
+                ..
+            }) = &args.command
+            {
+                repair::execute(path, output).await
+            } else {
+                doctor::execute(output).await
+            }
+        }
         ResolvedCommand::Set {
             key,
             value,

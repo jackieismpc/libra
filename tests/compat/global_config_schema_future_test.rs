@@ -14,6 +14,553 @@ const ENV_SECRET_VALUE: &str = "ENV_STORAGE_SECRET_SHOULD_NOT_LEAK";
 const INSTALL_COMMAND: &str =
     "curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh | sh";
 
+#[cfg(unix)]
+#[path = "../helpers/config_repair.rs"]
+mod repair_support;
+
+#[cfg(unix)]
+#[test]
+fn global_schema_repair_requires_repair_flag() {
+    use repair_support::*;
+    let fixture = RepairFixture::new();
+    let before = file_fingerprint(&fixture.db);
+    let output = run(fixture.command(&["--json", "config", "doctor", "--global-schema"]));
+    assert_eq!(data(&output)["repair_eligible"], false);
+    let output = run(fixture.command(&[
+        "config",
+        "doctor",
+        "--global-schema",
+        "--confirm",
+        fixture.db.to_str().unwrap(),
+    ]));
+    assert!(!output.status.success());
+    assert_eq!(file_fingerprint(&fixture.db), before);
+    assert!(fixture.backups().is_empty());
+    assert!(!suffix(&fixture.db, ".schema-repair.lock").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn global_schema_repair_requires_canonical_confirm() {
+    use repair_support::*;
+    let fixture = RepairFixture::new();
+    let before = file_fingerprint(&fixture.db);
+    let dotted = format!("{}/./config.db", fixture.db.parent().unwrap().display());
+    for confirm in ["config.db", "/missing/config.db", &dotted] {
+        let output = run(fixture.command(&[
+            "--json",
+            "config",
+            "doctor",
+            "--global-schema",
+            "--repair",
+            "--confirm",
+            confirm,
+        ]));
+        assert!(!output.status.success());
+        assert!(stderr_text(&output).contains("LBR-CLI-002"));
+        assert_secret_free(&output);
+        assert_eq!(file_fingerprint(&fixture.db), before);
+    }
+    assert!(fixture.backups().is_empty());
+    assert!(!suffix(&fixture.db, ".schema-repair.lock").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn global_schema_repair_holds_target_lock() {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    use repair_support::*;
+    let fixture = RepairFixture::new();
+    let before = file_fingerprint(&fixture.db);
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(suffix(&fixture.db, ".schema-repair.lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    let output = fixture.repair();
+    assert!(!output.status.success());
+    assert!(stderr_text(&output).contains("lock"));
+    assert_secret_free(&output);
+    assert_eq!(file_fingerprint(&fixture.db), before);
+    assert!(fixture.backups().is_empty());
+}
+
+#[cfg(all(unix, feature = "test-upgrade"))]
+fn repair_recheck_after_lock(sql: &str) {
+    use repair_support::*;
+    let fixture = RepairFixture::new();
+    let (command, checkpoint) = fixture.checkpoint_command("locked");
+    let mut child = ChildGuard::spawn(command);
+    child.wait_checkpoint(&checkpoint);
+    let lock = fs::OpenOptions::new()
+        .write(true)
+        .open(suffix(&fixture.db, ".schema-repair.lock"))
+        .unwrap();
+    assert!(matches!(lock.try_lock(), Err(fs::TryLockError::WouldBlock)));
+    execute_sql(&fixture.db, sql);
+    let external_state = file_fingerprint(&fixture.db);
+    resume(&checkpoint, true);
+    let output = child.finish();
+    assert!(!output.status.success());
+    assert_secret_free(&output);
+    assert_eq!(file_fingerprint(&fixture.db), external_state);
+    assert!(fixture.backups().is_empty());
+}
+
+#[cfg(all(unix, feature = "test-upgrade"))]
+#[test]
+fn global_schema_repair_rechecks_attestation_under_lock() {
+    repair_recheck_after_lock(
+        "DELETE FROM schema_versions WHERE version=(SELECT MIN(version) FROM schema_versions)",
+    );
+}
+
+#[cfg(all(unix, feature = "test-upgrade"))]
+#[test]
+fn global_schema_repair_rechecks_receipt_manifest_under_lock() {
+    repair_recheck_after_lock(
+        "INSERT INTO schema_versions VALUES(2026090802,'unregistered','fixture')",
+    );
+}
+
+#[cfg(all(unix, feature = "test-upgrade"))]
+#[test]
+fn global_schema_repair_rechecks_fingerprint_under_lock() {
+    repair_recheck_after_lock("DROP INDEX idx_config_kv_key");
+}
+
+#[cfg(unix)]
+#[test]
+fn global_schema_repair_rejects_truncated_or_nul_metadata() {
+    use repair_support::*;
+    for sql in [
+        "PRAGMA writable_schema=ON; UPDATE sqlite_master SET sql=sql || ' /*' || printf('%5000s','tail') || '*/' WHERE name='idx_config_kv_key'; PRAGMA writable_schema=OFF;",
+        "PRAGMA writable_schema=ON; UPDATE sqlite_master SET sql=sql || char(0) || 'unattested tail' WHERE name='idx_config_kv_key'; PRAGMA writable_schema=OFF;",
+        "UPDATE schema_versions SET name=name || printf('%300s','tail') WHERE version=(SELECT MIN(version) FROM schema_versions)",
+        "UPDATE schema_versions SET name=name || char(0) || 'unattested tail' WHERE version=(SELECT MIN(version) FROM schema_versions)",
+    ] {
+        let fixture = RepairFixture::new();
+        execute_sql(&fixture.db, sql);
+        let before = file_fingerprint(&fixture.db);
+        let output = fixture.repair();
+        assert!(!output.status.success(), "unexpectedly eligible: {sql}");
+        assert_secret_free(&output);
+        assert_eq!(file_fingerprint(&fixture.db), before);
+        assert!(fixture.backups().is_empty());
+        assert!(!suffix(&fixture.db, ".schema-repair.lock").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn global_schema_repair_ineligible_keeps_main_db() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    use repair_support::*;
+    for sql in [
+        "INSERT INTO reference(name,kind) VALUES('main','Branch')",
+        "DROP INDEX idx_config_kv_key",
+        "DELETE FROM schema_versions WHERE version=(SELECT MIN(version) FROM schema_versions)",
+        "INSERT INTO schema_versions VALUES(2026090802,'unknown','fixture')",
+        "UPDATE metadata_kv SET value='not-the-bootstrap-seed'",
+        "CREATE TABLE sqliteXhidden(value TEXT); INSERT INTO sqliteXhidden VALUES('repository data')",
+    ] {
+        let fixture = RepairFixture::new();
+        execute_sql(&fixture.db, sql);
+        let before = file_fingerprint(&fixture.db);
+        let output = fixture.repair();
+        assert!(!output.status.success(), "unexpectedly eligible: {sql}");
+        assert_secret_free(&output);
+        assert_eq!(file_fingerprint(&fixture.db), before);
+        assert!(fixture.backups().is_empty());
+        assert!(!suffix(&fixture.db, ".schema-repair.lock").exists());
+    }
+    let fixture = RepairFixture::new();
+    let before = file_fingerprint(&fixture.db);
+    fs::set_permissions(
+        fixture.db.parent().unwrap(),
+        fs::Permissions::from_mode(0o777),
+    )
+    .unwrap();
+    assert!(!fixture.repair().status.success());
+    assert_eq!(file_fingerprint(&fixture.db), before);
+    assert!(fixture.backups().is_empty());
+    assert!(!suffix(&fixture.db, ".schema-repair.lock").exists());
+    fs::set_permissions(
+        fixture.db.parent().unwrap(),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let alias = fixture.root.join("alias.db");
+    symlink(&fixture.db, &alias).unwrap();
+    let mut command = fixture.repair_command();
+    command.env("LIBRA_CONFIG_GLOBAL_DB", &alias);
+    assert!(!run(command).status.success());
+    assert_eq!(file_fingerprint(&fixture.db), before);
+    let hard_link = fixture.root.join("linked.db");
+    fs::hard_link(&fixture.db, hard_link).unwrap();
+    assert!(!fixture.repair().status.success());
+    assert_eq!(file_fingerprint(&fixture.db), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn global_schema_repair_uses_sqlite_consistent_backup() {
+    use repair_support::*;
+    let fixture = RepairFixture::new();
+    let before = rowsets(&fixture.db);
+    let report = data(&fixture.repair());
+    let backup = Path::new(report["backup_path"].as_str().unwrap());
+    assert_eq!(rowsets(backup), before);
+    assert_eq!(report["backup_verified"], true);
+    assert_eq!(report["committed"], true);
+    let source = include_str!("../../src/command/config/repair.rs");
+    assert!(source.contains("VACUUM INTO ?"));
+    assert!(source.contains("temp.libra_config_repair_connection"));
+    assert!(!source.contains("immutable("));
+    assert!(source.contains("info.mode() & 0o1000"));
+    assert!(!source.contains("info.mode() & libc::S_ISVTX"));
+}
+
+#[cfg(all(unix, feature = "test-upgrade"))]
+#[test]
+fn global_schema_repair_backup_does_not_hold_write_transaction() {
+    use repair_support::*;
+    let fixture = RepairFixture::new();
+    let (command, checkpoint) = fixture.checkpoint_command("during_backup");
+    let mut child = ChildGuard::spawn(command);
+    child.wait_checkpoint(&checkpoint);
+    execute_sql(&fixture.db, "BEGIN IMMEDIATE; ROLLBACK;");
+    resume(&checkpoint, true);
+    assert_eq!(data(&child.finish())["outcome"], "repaired");
+}
+
+#[cfg(all(unix, feature = "test-upgrade"))]
+#[test]
+fn global_schema_repair_rejects_concurrent_commit_after_backup() {
+    use repair_support::*;
+    let fixture = RepairFixture::new();
+    let (command, checkpoint) = fixture.checkpoint_command("after_backup");
+    let mut child = ChildGuard::spawn(command);
+    child.wait_checkpoint(&checkpoint);
+    execute_sql(
+        &fixture.db,
+        "UPDATE config_kv SET value='concurrent-preserved' WHERE key='test.repair'",
+    );
+    let external_state = rowsets(&fixture.db);
+    resume(&checkpoint, true);
+    let output = child.finish();
+    assert!(!output.status.success());
+    assert_secret_free(&output);
+    assert!(stderr_text(&output).contains("changed during backup"));
+    assert_eq!(rowsets(&fixture.db), external_state);
+    assert_eq!(fixture.backups().len(), 1);
+    assert_eq!(
+        integer(
+            &fixture.db,
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='configuration_schema_versions'"
+        ),
+        0
+    );
+}
+
+#[cfg(all(unix, feature = "test-upgrade"))]
+#[test]
+fn global_schema_repair_rejects_target_replacement_before_commit() {
+    use repair_support::*;
+    for stage in ["after_backup", "after_ledger"] {
+        let fixture = RepairFixture::new();
+        let before = rowsets(&fixture.db);
+        let (command, checkpoint) = fixture.checkpoint_command(stage);
+        let mut child = ChildGuard::spawn(command);
+        child.wait_checkpoint(&checkpoint);
+        let directory = fixture.backups().pop().unwrap();
+        let backup = directory.join("backup.sqlite");
+        assert_eq!(rowsets(&backup), before);
+        let moved = fixture.root.join("original.db");
+        fs::rename(&fixture.db, &moved).unwrap();
+        fs::copy(&backup, &fixture.db).unwrap();
+        let replacement = file_fingerprint(&fixture.db);
+        resume(&checkpoint, true);
+        let output = child.finish();
+        assert!(
+            !output.status.success(),
+            "replacement at {stage} was accepted"
+        );
+        assert_secret_free(&output);
+        assert_eq!(file_fingerprint(&fixture.db), replacement);
+        assert_eq!(
+            rowsets(&moved),
+            before,
+            "original transaction must roll back"
+        );
+        assert_eq!(rowsets(&backup), before);
+    }
+}
+
+#[cfg(all(unix, feature = "test-upgrade"))]
+#[test]
+fn global_schema_repair_failed_backup_is_retained_unverified_and_not_reused() {
+    use repair_support::*;
+    let fixture = RepairFixture::new();
+    let before = file_fingerprint(&fixture.db);
+    let (command, checkpoint) = fixture.checkpoint_command("during_backup");
+    let mut child = ChildGuard::spawn(command);
+    child.wait_checkpoint(&checkpoint);
+    resume(&checkpoint, false);
+    let output = child.finish();
+    assert!(!output.status.success());
+    assert!(stderr_text(&output).contains("LBR-IO-002"));
+    assert_secret_free(&output);
+    assert_eq!(file_fingerprint(&fixture.db), before);
+    let retained = fixture.backups();
+    assert_eq!(retained.len(), 1);
+    let state_path = retained[0].join("recovery.json");
+    let state: serde_json::Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(state["backup_verified"], false);
+    assert_eq!(state["committed"], false);
+    let partial_backup = retained[0].join("backup.sqlite");
+    let partial_bytes = fs::read(&partial_backup).unwrap();
+    let report = data(&fixture.repair());
+    assert_ne!(
+        report["backup_path"].as_str().unwrap(),
+        partial_backup.to_str().unwrap()
+    );
+    assert_eq!(fixture.backups().len(), 2);
+    assert_eq!(fs::read(partial_backup).unwrap(), partial_bytes);
+}
+
+#[cfg(not(unix))]
+#[test]
+fn global_schema_repair_unsupported_platform_has_no_side_effects() {
+    let fixture = CliFixture::new();
+    let mut command = fixture.command(
+        &fixture.root,
+        &[
+            "config",
+            "doctor",
+            "--global-schema",
+            "--repair",
+            "--confirm",
+            fixture.global_db.to_str().unwrap(),
+        ],
+    );
+    let before = directory_files(&fixture.root);
+    let output = command.output().unwrap();
+    assert!(!output.status.success());
+    assert!(stderr_text(&output).contains("supported only"));
+    assert_eq!(directory_files(&fixture.root), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn global_schema_repair_backup_reopens() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use repair_support::*;
+    let fixture = RepairFixture::new();
+    let report = data(&fixture.repair());
+    let backup = Path::new(report["backup_path"].as_str().unwrap());
+    assert_eq!(integer(backup, "SELECT COUNT(*) FROM schema_versions"), 60);
+    assert_eq!(integer(backup, "SELECT COUNT(*) FROM config_kv"), 2);
+    assert_eq!(
+        fs::metadata(backup).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(backup.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    let recovery: serde_json::Value =
+        serde_json::from_slice(&fs::read(backup.parent().unwrap().join("recovery.json")).unwrap())
+            .unwrap();
+    assert_eq!(recovery["backup_verified"], true);
+    assert_eq!(recovery["committed"], true);
+}
+
+#[cfg(unix)]
+#[test]
+fn global_schema_repair_100_mib_backup_budget() {
+    use repair_support::*;
+    let fixture = RepairFixture::new();
+    execute_sql(
+        &fixture.db,
+        "WITH RECURSIVE sizes(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM sizes WHERE n<100) INSERT INTO config_kv(key,value,encrypted) SELECT 'benchmark.'||n,zeroblob(1048576),0 FROM sizes",
+    );
+    assert!(fs::metadata(&fixture.db).unwrap().len() >= 100 * 1024 * 1024);
+    let started = std::time::Instant::now();
+    let report = data(&fixture.repair());
+    let elapsed = started.elapsed();
+    eprintln!(
+        "MIG-06 100 MiB backup+verification+repair: {elapsed:?}; OS={}, arch={}, temp={} (CI ubuntu-latest/macOS local disk)",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        fixture.root.display()
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "100 MiB repair exceeded its 10s budget: {elapsed:?}"
+    );
+    let backup = Path::new(report["backup_path"].as_str().unwrap());
+    assert_eq!(
+        integer(
+            backup,
+            "SELECT sum(length(value)) FROM config_kv WHERE key LIKE 'benchmark.%'"
+        ),
+        100 * 1024 * 1024
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn global_schema_repair_backup_row_set_matches_source() {
+    use repair_support::*;
+    let fixture = RepairFixture::new();
+    let before = rowsets(&fixture.db);
+    let report = data(&fixture.repair());
+    let backup = Path::new(report["backup_path"].as_str().unwrap());
+    assert_eq!(rowsets(backup), before);
+    assert_eq!(
+        integer(
+            backup,
+            "SELECT seq FROM sqlite_sequence WHERE name='config_kv'"
+        ),
+        10000
+    );
+    assert_eq!(
+        integer(
+            &fixture.db,
+            "SELECT seq FROM sqlite_sequence WHERE name='config_kv'"
+        ),
+        10000
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn global_schema_repair_backup_includes_committed_wal_rows() {
+    use repair_support::*;
+    let fixture = RepairFixture::new();
+    let rt = runtime();
+    let writer = rt.block_on(connect(&fixture.db, false));
+    rt.block_on(async {
+        writer.execute_unprepared("PRAGMA journal_mode=WAL; UPDATE config_kv SET value='wal-preserved' WHERE key='test.repair'").await.unwrap();
+    });
+    assert!(fs::metadata(suffix(&fixture.db, "-wal")).unwrap().len() > 32);
+    assert!(suffix(&fixture.db, "-shm").is_file());
+    let before = rowsets(&fixture.db);
+    let report = data(&fixture.repair());
+    let backup = Path::new(report["backup_path"].as_str().unwrap());
+    assert_eq!(
+        rowsets(backup),
+        before,
+        "backup must include WAL commits, not just main-file bytes"
+    );
+    let read = run(fixture.command(&["config", "get", "--global", "test.repair"]));
+    assert!(read.status.success());
+    assert!(String::from_utf8_lossy(&read.stdout).contains("wal-preserved"));
+    rt.block_on(writer.close()).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn global_schema_repair_new_reader_accepts_fixture() {
+    use repair_support::*;
+    let fixture = RepairFixture::new();
+    let system_before = file_fingerprint(&fixture.system);
+    let report = data(&fixture.repair());
+    assert_eq!(report["outcome"], "repaired");
+    assert_eq!(
+        report["schema_sha256"],
+        "aaf969a014d1690f58cc76d2df0d71a55cb871cf6f70bfcc9bd1c6ec3f48714e"
+    );
+    let read = run(fixture.command(&["config", "get", "--global", "test.repair"]));
+    assert!(read.status.success());
+    assert!(String::from_utf8_lossy(&read.stdout).contains("preserved"));
+    let before = file_fingerprint(&fixture.db);
+    let noop = data(&fixture.repair());
+    assert_eq!(noop["outcome"], "already_protected");
+    assert_eq!(noop["producer_format"], serde_json::Value::Null);
+    assert_eq!(file_fingerprint(&fixture.db), before);
+    assert_eq!(fixture.backups().len(), 1);
+    assert_eq!(file_fingerprint(&fixture.system), system_before);
+}
+
+#[cfg(unix)]
+#[test]
+fn global_schema_repair_failure_is_secret_free() {
+    use repair_support::*;
+    let fixture = RepairFixture::new();
+    execute_sql(
+        &fixture.db,
+        &format!(
+            "CREATE TRIGGER secret_schema BEFORE INSERT ON config_kv BEGIN SELECT RAISE(ABORT,'{CANARY}'); END"
+        ),
+    );
+    let before = file_fingerprint(&fixture.db);
+    let output = fixture.repair();
+    assert!(!output.status.success());
+    assert!(stderr_text(&output).contains("LBR-CONFIG-001"));
+    assert_secret_free(&output);
+    assert_eq!(file_fingerprint(&fixture.db), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn global_schema_repair_refuses_fifo_without_blocking() {
+    use std::ffi::CString;
+
+    use repair_support::*;
+    let fixture = RepairFixture::new();
+    let fifo = fixture.root.join("pipe.db");
+    let name = CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: name is NUL-terminated and belongs to this disposable fixture.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let mut command = fixture.command(&[
+        "--json",
+        "config",
+        "doctor",
+        "--global-schema",
+        "--repair",
+        "--confirm",
+        fifo.to_str().unwrap(),
+    ]);
+    command.env("LIBRA_CONFIG_GLOBAL_DB", &fifo);
+    let started = std::time::Instant::now();
+    let output = run(command);
+    assert!(!output.status.success());
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert!(stderr_text(&output).contains("regular file"));
+    assert_secret_free(&output);
+    assert!(!suffix(&fifo, ".schema-repair.lock").exists());
+}
+
+#[test]
+fn global_schema_repair_docs_describe_attestation_boundary() {
+    for source in [
+        include_str!("../../docs/commands/config.md"),
+        include_str!("../../docs/commands/zh-CN/config.md"),
+    ] {
+        for text in [
+            "--repair",
+            "--confirm",
+            "Unix",
+            "backup.sqlite",
+            "recovery.json",
+            "v0.22.19",
+        ] {
+            assert!(source.contains(text), "repair docs missing {text}");
+        }
+    }
+}
+
 fn doctor_data(fixture: &CliFixture) -> serde_json::Value {
     let output = fixture.run(
         &fixture.root,

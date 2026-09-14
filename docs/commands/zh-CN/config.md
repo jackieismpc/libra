@@ -61,8 +61,8 @@ scoped get/list、默认值级联与 remote preflight 不写入 barrier；配置
 `libra --json config doctor --global-schema`，只检查全局 schema 元数据。
 路径为 `LIBRA_CONFIG_GLOBAL_DB` 或 `~/.libra/config.db`；无需仓库，不读取配置值、
 vault、System/Repository DB，不运行迁移、写 barrier、创建备份或触发自动升级／恢复。
-缺失目标保持缺失。冗余 `--global` 可用；`--local`、`--system`、值／操作参数、
-`--repair`、`--confirm` 均拒绝。
+缺失目标保持缺失。冗余 `--global` 可用；`--local`、`--system` 和值／操作参数拒绝。
+成对的 `--repair --confirm` 选择下方独立写入流程；单独使用其中任意选项均失败。
 
 JSON envelope 的 `data.report_version=1`；human 与 JSON 使用同一报告，包含
 `scope`、`role`、`path_source`、configured/canonical path、`exists`、`size_bytes`、
@@ -77,7 +77,7 @@ UTC `modified_at_utc` 和 `configuration`／`legacy` ledger。
 `issue` 只报告已证明不支持的 ledger/version；非法参数仍使用现有 CLI usage error。
 `producer_disposition` 区分已登记但未归因的 Repository receipt、合法配置 barrier 与未知来源。
 当前 manifest 将 `2026090801` 识别为 `operation_v2_branch_convergence`，但 receipt 或 mtime
-不能证明历史 writer PID/binary。**本版本 `repair_eligible` 始终为 `false`**。
+不能证明历史 writer PID/binary。**默认只读 doctor 的 `repair_eligible` 始终为 `false`**。
 不支持状态应升级到 producer-compatible build；禁止手工编辑 SQLite receipt，
 doctor 也不是 remote-sync bypass。
 
@@ -87,6 +87,65 @@ WAL-mode 缺失正常 WAL/SHM 文件时，保守报告 `unreadable`，不打开 
 稳定目标的主 DB/WAL 内容及 mtime 不变；前后检查文件 identity、size、mtime，发现变化时报告
 `changed_during_inspection`。检查并非文件系统锁，外部 rotation 可能与它竞态，SQLite 协调文件可能变化；
 OS access time 与 SHM 协调状态不保证恒定。即使检查通过也不提供 repair 权限。
+
+## 显式确认的 legacy global schema repair
+
+需要 Libra v0.22.26 或更新版本；v0.22.25 仅提供只读 doctor。
+
+修复与默认只读 doctor 分离，必须显式请求：
+
+```sh
+libra --json config doctor --global-schema
+libra --json config doctor --global-schema --repair --confirm /absolute/canonical/path/config.db
+```
+
+请使用自己报告中的精确 `canonical_path`，不要复制示例路径。确认值必须是逐字节匹配的
+绝对规范路径；配置路径中的符号链接／非规范部分、值操作参数及其他 scope 均拒绝。
+不运行 Repository preflight、System DB 读取或自动升级。
+
+当前只注册 **v0.22.19 Linux amd64 producer-format cohort**，并非出现 `2026090801`
+就能修复。source revision 为 `b94bfe12f2ec2f039b88ddb5c6f8871787d60f17`，producer binary
+SHA-256 为 `03447eb983178433425b5afffba351edae4044e7ded5b9e35c956dddb2bb68a6`。
+完整 293 个 schema objects（含 SQLite 内部结构）、60 个原始 receipts 和运行时 manifest
+都必须通过检查。Repository 数据／存储位置、未知表／trigger／receipt、被改动的 bootstrap
+metadata 均不合资格。格式 attestation **不能归因某个真实文件的历史 writer/PID**；未知状态
+仍须使用 producer-compatible binary，禁止改 receipt 来伪造匹配。
+
+写入修复目前仅支持 **Unix** 的已验证本地文件系统：Linux ext-family、XFS、Btrfs、tmpfs、
+overlayfs，以及 macOS APFS/HFS。Windows、其他／未知文件系统、网络文件系统在任何 repair
+副作用之前拒绝。文件及直接父目录须属于当前 effective uid，且不可 group/world-writable；
+文件只能有一个 hard link。不安全祖先和 SQLite sidecar 拒绝。私有固定锁
+`config.db.schema-repair.lock` 串行化 repair，结束后保留，不自动删除。
+这些措施无法抵抗同 uid/root 恶意进程；修复前应停止其他 writer、文件替换和 rotation 工具，
+发现替换或并发提交时终止。
+
+先由 SQLite `VACUUM INTO` 在不持有源库写事务的情况下建立一致逻辑备份，flush 后重新只读
+打开，检查完整性与格式。目标旁的私有 `.libra-config-repair-<random>/`（0700）保留
+`backup.sqlite`（0600）和 `recovery.json`。应用不枚举／解密配置值，由 SQLite 复制其逻辑
+内容；备份属于敏感数据。失败或中断的副本保留为 **unverified**，不会自动删除或复用。
+
+备份验证后才取得 SQLite 写锁，重新核对 manifest、attestation 和文件 identity；连接内 TEMP
+nonce 配合 `data_version` 拒绝连接替换或其他进程的提交。一个事务初始化
+`configuration_schema_versions`，并向 legacy ledger 追加配置拥有的
+`configuration_legacy_reader_barrier`。原 receipts、配置行、加密标记及 sequence 高水位均保留；
+不运行 Repository migration，不改变 journal mode，不显式 checkpoint。旧版 Repository-only
+binary 必须在写入前拒绝 barrier；后续应使用兼容的新 binary，没有自动降级。
+
+成功 JSON 为 `data.action="repair"`、`report_version=1`、`outcome="repaired"`、
+`backup_path`、`backup_verified=true`、`committed=true` 及已注册格式／source hashes。
+已经保护的配置返回 `outcome="already_protected"`，不创建备份、不写入、不声称 producer
+attestation；这也不是完整健康诊断。默认 doctor 的只读报告与 `repair_eligible=false` 不变。
+
+恢复必须显式进行。保留当前 DB 和 recovery directory；只有有效 `recovery.json` 中的
+`backup_verified=true` 才能作为考虑恢复 `backup.sqlite` 的前提，缺失／中断／未验证状态
+不能证明备份可用。崩溃或 commit 结果不明确时先跑只读 doctor，过时的状态文件不能决定事务
+是否提交。停止所有使用该库的进程，核验备份完整性及来源，保存当前 DB 和 sidecars 供分析，
+再由维护者将已验证一致备份作为整体恢复并设置正确私有权限。禁止覆盖 live DB、将旧 WAL/SHM
+混入恢复后的主库、恢复未验证副本或手工修改 receipt；保留 producer-compatible binary。
+
+非法确认使用 `LBR-CLI-002`，格式／路径／权限资格拒绝使用 `LBR-CONFIG-001`，锁、备份与事务
+失败使用 `LBR-IO-002`。错误不包含配置值或原始 SQLite schema 错误。备份存在不代表 repair
+已提交；应检查 commit 状态，不确定时重新诊断。
 
 ## 选项
 

@@ -201,6 +201,15 @@ not only the exit code. `repair_eligible` is always false: even recognized
 without creating them; see [the doctor contract](commands/config.md#read-only-global-schema-doctor)
 for live-file race limits. Do not manually edit migration receipts.
 
+The separate explicit `doctor --global-schema --repair --confirm <canonical-path>`
+workflow uses `LBR-CLI-002` for invalid confirmation, `LBR-CONFIG-001` for
+ineligible format/path/permissions or changed attestation, and `LBR-IO-002` for
+lock, consistent-backup and transaction failures. Unsupported platforms reject
+before repair side effects. Errors are controlled and never forward raw SQLite
+schema text or configuration values. A retained `backup.sqlite` is not proof of
+a committed repair: inspect verification/commit state and preserve recovery
+evidence on uncertainty. See [repair recovery](commands/config.md#confirmed-legacy-global-schema-repair).
+
 ### Conflict
 
 | Stable code | Meaning |

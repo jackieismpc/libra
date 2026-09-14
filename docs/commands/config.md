@@ -87,7 +87,8 @@ to inspect only global schema metadata. It works outside a repository, uses
 values, open the vault, inspect System/Repository databases, migrate a schema,
 write a barrier, create a backup, or run automatic upgrade/recovery. A missing
 target remains absent. `--global` is optional and redundant; `--local`,
-`--system`, value/action flags, `--repair` and `--confirm` are rejected.
+`--system` and value/action flags are rejected. The paired `--repair --confirm`
+options select the separate mutating workflow below; either option alone fails.
 
 The JSON envelope's `data.report_version` is `1`. The same report backs human
 output: `scope`, `role`, `path_source`, configured/canonical paths, `exists`,
@@ -109,8 +110,8 @@ untrusted text. Invalid invocations still fail with the existing CLI usage error
 receipts, a recognized configuration barrier, and unattributed state. The
 current manifest recognizes `2026090801` as `operation_v2_branch_convergence`;
 that does not prove which process/binary wrote this file. Mtime is diagnostic
-metadata, not producer attestation. **`repair_eligible` is always `false` in
-this release**, including compatible/known receipts. Upgrade to a
+metadata, not producer attestation. **The default doctor's `repair_eligible`
+is always `false`**, including compatible/known receipts. Upgrade to a
 producer-compatible build for unsupported state; never manually edit SQLite
 receipts. Doctor does not provide a remote-sync bypass.
 
@@ -125,6 +126,86 @@ identity, size and mtime checks report observed concurrent changes as
 can race those checks and SQLite coordination files may change. OS access times
 and SHM coordination are not invariant, and no repair authority follows from
 passing the checks.
+
+## Confirmed legacy global schema repair
+
+Requires Libra v0.22.26 or later; v0.22.25 provides only the read-only doctor.
+
+The opt-in repair workflow is separate from the read-only doctor:
+
+```sh
+libra --json config doctor --global-schema
+libra --json config doctor --global-schema --repair --confirm /absolute/canonical/path/config.db
+```
+
+Use the exact `canonical_path` from your own report, not the example path.
+`--confirm` must be absolute and match byte-for-byte; symlink/noncanonical
+configured paths and combinations with value operations or another scope are
+refused. No repository preflight, system database access or auto-upgrade runs.
+
+Repair currently supports only a narrowly registered **v0.22.19 Linux amd64
+producer-format cohort**, not every database with receipt `2026090801`. Its
+source revision is `b94bfe12f2ec2f039b88ddb5c6f8871787d60f17` and producer binary
+SHA-256 is `03447eb983178433425b5afffba351edae4044e7ded5b9e35c956dddb2bb68a6`.
+All 293 schema objects (including SQLite internal structures), all 60 original
+receipts and the runtime manifest must match. Repository data or storage paths,
+unknown tables/triggers/receipts, and altered bootstrap metadata are ineligible.
+Format attestation does **not** identify the historical writer/PID of your file.
+Unknown states remain upgrade-only; never change receipts to make a file match.
+
+Mutating repair is **Unix-only** with verified local filesystem semantics:
+Linux ext-family, XFS, Btrfs, tmpfs and overlayfs; macOS APFS/HFS. Windows,
+other/unrecognized filesystems and network filesystems fail closed before any
+repair side effect. The file and its immediate directory must belong to the
+current effective user and must not be group/world-writable; the file must have
+one hard link. Unsafe ancestors and sidecars are refused. A fixed private
+`config.db.schema-repair.lock` serializes repairs and is intentionally retained.
+These checks do not defeat a malicious same-user/root process. Stop other
+writers and file replacement/rotation tools before repair; observed replacement
+or concurrent commits abort the operation.
+
+Before schema changes, SQLite `VACUUM INTO` creates a consistent logical backup
+without a source write transaction. It is flushed and reopened for integrity
+and format checks. A private `.libra-config-repair-<random>/` directory beside
+the target retains `backup.sqlite` (0600) and `recovery.json` (inside a 0700
+directory). The application does not enumerate/decrypt configuration values;
+SQLite copies their logical contents. Treat the backup as sensitive. Failed or
+interrupted copies are retained **unverified**, not silently deleted or reused.
+
+After backup verification, a SQLite write lock protects a second manifest,
+attestation and file-identity check. A connection-local nonce and `data_version`
+reject a changed connection or a concurrent commit. One transaction initializes
+`configuration_schema_versions` and appends the configuration-owned
+`configuration_legacy_reader_barrier` to the legacy ledger. Original receipts,
+configuration rows, encryption flags and sequence high-water marks are retained;
+no Repository migration runs, and no journal-mode change or explicit checkpoint
+is requested. Old Repository-only binaries refuse the barrier before writing;
+use a compatible new binary thereafter. There is no automatic downgrade.
+
+Successful JSON uses `data.action="repair"`, `report_version=1`,
+`outcome="repaired"`, `backup_path`, `backup_verified=true`, and `committed=true`,
+plus the registered format/source hashes. An already protected configuration
+returns `outcome="already_protected"` with no backup, mutation or producer
+attestation; this is not a full database health assessment. Default doctor
+output and its `repair_eligible=false` remain unchanged.
+
+Recovery is explicit, never automatic. Preserve both the current database and
+its recovery directory. A valid `recovery.json` with `backup_verified=true` is
+required before considering `backup.sqlite`; interrupted/missing/unverified
+metadata is not proof of a usable backup. After a crash or uncertain commit,
+run read-only doctor first: a stale status file cannot determine whether the
+transaction committed. Stop every process using the database, verify the
+backup's integrity and provenance, preserve the current DB and its sidecars for
+forensics, then have the repository maintainer restore that verified consistent
+backup as a unit with correct private permissions. Never overlay a live DB,
+mix old WAL/SHM files with a restored main file, restore an unverified artifact,
+or manually edit migration receipts. Keep a producer-compatible binary available.
+
+Invalid confirmation uses `LBR-CLI-002`; unsupported format/path/permission
+eligibility uses `LBR-CONFIG-001`; lock, backup and transaction failures use
+`LBR-IO-002`. Failures never include configuration values or raw SQLite schema
+errors. A retained backup is not proof that repair committed; check the reported
+commit state and rerun diagnosis when the outcome is uncertain.
 
 ## Options
 

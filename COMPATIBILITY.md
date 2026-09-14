@@ -111,6 +111,17 @@ created. No values, migration, backup, repository preflight or auto-upgrade are
 accessed. Live-file races and SQLite coordination are not a filesystem freeze;
 see the [doctor contract](docs/commands/config.md#read-only-global-schema-doctor).
 
+The separate `config doctor --global-schema --repair --confirm <canonical-path>`
+workflow is a Libra-only, Unix-local, explicit forward repair for the registered
+v0.22.19 producer-format cohort. It rejects Repository data and unrecognized
+schema/receipts, verifies a private SQLite-consistent backup before a locked
+transaction, preserves business rows/original receipts and appends only
+configuration-owned metadata/barrier. Windows and unsupported filesystems fail
+closed before repair side effects. Format attestation does not identify a
+historical writer; default doctor remains read-only and never grants repair
+authority. See [repair and recovery](docs/commands/config.md#confirmed-legacy-global-schema-repair)
+for eligibility, retained backup/status files, concurrency and explicit restore limits.
+
 `--offline` and `LIBRA_READ_POLICY=offline|local` intentionally allow local-only
 object access with a warning, not remote synchronization. Complete process or
 repo-local `vault.env.LIBRA_STORAGE_*` values can make Global storage config

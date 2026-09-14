@@ -128,7 +128,7 @@ impl Report {
         self.legacy.readable = legacy_readable;
         self.classification = classification;
         self.hints = vec![
-            "Schema metadata and mtime do not attest a producer. Repair is not available; do not edit SQLite receipts manually.",
+            "Schema metadata and mtime do not attest a producer. Explicit --repair --confirm requires separate format, path and backup checks; do not edit SQLite receipts manually.",
         ];
         if let Some(issue) = inspection.issue {
             self.classification = match issue.kind {

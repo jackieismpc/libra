@@ -120,6 +120,66 @@ mod legacy_config;
 #[path = "db_migration/role_scope.rs"]
 mod role_scope;
 
+#[cfg(unix)]
+#[path = "helpers/config_repair.rs"]
+mod repair_support;
+
+#[cfg(all(unix, feature = "test-upgrade"))]
+#[test]
+fn global_schema_repair_transaction_is_atomic() {
+    use repair_support::*;
+    for stage in ["after_ledger", "after_barrier"] {
+        let fixture = RepairFixture::new();
+        let before = rowsets(&fixture.db);
+        let (command, checkpoint) = fixture.checkpoint_command(stage);
+        let mut child = ChildGuard::spawn(command);
+        child.wait_checkpoint(&checkpoint);
+        assert_eq!(
+            rowsets(&fixture.db),
+            before,
+            "uncommitted schema must not escape"
+        );
+        resume(&checkpoint, false);
+        let output = child.finish();
+        assert!(!output.status.success());
+        assert_secret_free(&output);
+        assert_eq!(rowsets(&fixture.db), before);
+        let backups = fixture.backups();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(rowsets(&backups[0].join("backup.sqlite")), before);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn global_schema_repair_writes_configuration_ledger_only() {
+    use repair_support::*;
+    let fixture = RepairFixture::new();
+    let before = rowsets(&fixture.db);
+    assert_eq!(data(&fixture.repair())["outcome"], "repaired");
+    let mut after = rowsets(&fixture.db);
+    after
+        .remove("configuration_schema_versions")
+        .expect("configuration ledger was added");
+    let receipts = after.get_mut("schema_versions").unwrap();
+    let mut rows: Vec<serde_json::Value> = serde_json::from_str(receipts).unwrap();
+    assert_eq!(rows.len(), 61);
+    rows.retain(|row| row[0].as_i64() != Some(i64::MAX));
+    assert_eq!(rows.len(), 60);
+    *receipts = serde_json::to_string(&rows).unwrap();
+    assert_eq!(
+        after, before,
+        "all business rows and original receipts must survive"
+    );
+    assert_eq!(
+        integer(
+            &fixture.db,
+            "SELECT COUNT(*) FROM configuration_schema_versions WHERE version=2026090601 AND name='configuration_base'"
+        ),
+        1
+    );
+}
+
 #[tokio::test]
 async fn configuration_barrier_is_idempotent_and_atomic() {
     configuration_barrier::atomic_barrier().await;

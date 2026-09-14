@@ -172,20 +172,57 @@ An operator-confirmed GlobalConfig repair is the sole exception. It must:
 1. classify the target read-only and reject unattested or ambiguous receipts;
 2. canonicalize the target and obtain explicit confirmation for that exact
    path without revealing configuration values;
-3. lock the target and re-check identity, fingerprint, role, receipt, and
-   eligibility to close symlink and time-of-check/time-of-use races;
+3. reject unsafe paths before repair side effects, lock the target and re-check
+   identity, fingerprint, role, receipt and eligibility; reject observed path
+   replacement, without claiming protection against malicious same-uid/root actors;
 4. create and reopen-verify a SQLite-consistent backup before changing the
    primary database;
 5. perform the allowlisted forward transformation and audit write in one
    atomic transaction;
 6. reopen with the new reader and verify the fixed old reader fails closed
    without writing; and
-7. leave the original database unchanged on classification, backup,
-   transaction, or verification failure.
+7. leave source data unchanged on classification/backup rejection and roll
+   back pre-commit transaction failures. Preserve the verified backup on any
+   uncertain commit/durability outcome; never claim a failed status write proves
+   that SQLite did not commit.
 
 Manual receipt deletion, in-place downgrade, byte-copy backup of a live
 journaled database, path-based role inference, and automatic repair are
 forbidden.
+
+### MIG-06 explicit repair implementation
+
+`config::repair` accepts only an exact canonical GlobalConfig confirmation and
+the registered v0.22.19 producer-format cohort. It compares bounded canonical
+JSON digests for all 293 schema objects and 60 receipts, reuses the central
+manifest classifier, and excludes Repository storage/data. Only configuration
+rows and the two known bootstrap metadata classes may be nonempty. This
+registers a format, not the historical writer of an arbitrary user file.
+
+Repair is limited to verified private Unix local paths; unsupported platforms,
+filesystems, ownership, writable ancestors, symlinks, hardlinks and unsafe
+sidecars fail closed. The persistent advisory lock only serializes repairs;
+SQLite locking arbitrates other writers. Path/inode checks are fences, not a
+filesystem-wide freeze. Operators must stop external file replacement tools.
+
+`schema::open_configuration_repair_connection` opens an existing literal file
+without creation or schema management. Its unshared one-connection pool and
+TEMP nonce guard establish physical handle continuity for `data_version`.
+`VACUUM INTO ?` runs before the source write transaction, producing a private,
+flushed, integrity-checked and attestation-checked backup. After
+`db::begin_write_transaction`, continuity, data_version, file identity and full
+eligibility are rechecked before the transaction calls
+`schema::initialize_configuration_ledger_for_repair` and the existing sole
+`db::write_configuration_barrier`. No Repository bootstrap/top-up runs, no
+original receipt is removed, and no business value is enumerated by the app.
+
+Recovery directories retain `backup.sqlite` and atomic `recovery.json` status.
+Failed/unverified copies cannot authorize restore. A commit can succeed before
+status persistence fails, so uncertain/crashed outcomes require read-only
+diagnosis and preserved evidence, not an automatic rollback assumption.
+`test-upgrade` plus `LIBRA_TEST=1` enables bounded fault checkpoints and a SQLite
+progress callback for the copying-stage lock test; release binaries exclude
+these hooks. Command and EN/zh recovery documentation define the public limits.
 
 ## Migration author checklist
 

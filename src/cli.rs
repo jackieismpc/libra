@@ -1933,6 +1933,13 @@ fn command_mutates_worktree_state(command: &Commands) -> bool {
 /// adapter can compile and run.
 fn operation_class_for_command(command: &Commands) -> crate::internal::operation::MutationClass {
     use crate::internal::operation::MutationClass;
+    // Global repair owns its SQLite boundary and never acquires Repository
+    // resources. Keep the repository-scope census read-only, but classify its
+    // explicit global mutation accurately before the generic scope mapping.
+    if matches!(command, Commands::Config(args) if command::config::is_schema_repair_request(args))
+    {
+        return MutationClass::LibraStateMutation;
+    }
     // `commit --dry-run` and `commit --porcelain` are previews: the command
     // deliberately uses ephemeral blob/cache state and promises not to
     // publish an operation or durable snapshot of its own.
@@ -2034,7 +2041,8 @@ fn command_has_existing_operation_boundary(command: &Commands) -> bool {
 }
 
 fn config_command_is_read_only(args: &command::config::ConfigArgs) -> bool {
-    command::config::is_schema_doctor_request(args)
+    (command::config::is_schema_doctor_request(args)
+        && !command::config::is_schema_repair_request(args))
         || args.get
         || args.get_all
         || args.list
