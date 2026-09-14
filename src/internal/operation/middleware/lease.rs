@@ -139,20 +139,23 @@ impl ScopeLease {
     pub(crate) async fn acquire_repository(
         scope: &PinnedRequestScope,
         repo_id: &str,
+        shared_repository: Option<&str>,
     ) -> Result<Self, OperationError> {
+        let permissions = LeaseFilePermissions::from_shared_repository(shared_repository)?;
         let key = format!("{repo_id}:repository");
         let path = scope.storage.join("operation-v2-repository.lock");
         let open_path = path.clone();
         let parent_path = scope.storage.clone();
-        let (file, parent) =
-            tokio::task::spawn_blocking(move || open_repository_files(&parent_path, &open_path))
-                .await
-                .map_err(|error| {
-                    OperationError::Storage(format!(
-                        "cannot prepare repository operation lease '{}' for {key}: {error}",
-                        path.display()
-                    ))
-                })??;
+        let (file, parent) = tokio::task::spawn_blocking(move || {
+            open_repository_files(&parent_path, &open_path, permissions)
+        })
+        .await
+        .map_err(|error| {
+            OperationError::Storage(format!(
+                "cannot prepare repository operation lease '{}' for {key}: {error}",
+                path.display()
+            ))
+        })??;
         file.try_lock()
             .map_err(|error| lock_error(error, &key, &path))?;
         verify_parent(&parent, &scope.storage)?;
@@ -192,12 +195,16 @@ fn open_files_with_permissions(
     Ok((file, parent))
 }
 
-fn open_repository_files(parent_path: &Path, path: &Path) -> Result<(File, File), OperationError> {
+fn open_repository_files(
+    parent_path: &Path,
+    path: &Path,
+    permissions: LeaseFilePermissions,
+) -> Result<(File, File), OperationError> {
     let parent = open_parent(parent_path)?;
     let file = {
         #[cfg(unix)]
         {
-            unix::open_repository_leaf(&parent, path, 0o666)?
+            unix::open_repository_leaf(&parent, path, permissions.creation_mode())?
         }
         #[cfg(not(unix))]
         {
@@ -218,6 +225,7 @@ fn open_repository_files(parent_path: &Path, path: &Path) -> Result<(File, File)
             ),
         ));
     }
+    permissions.apply(&file, path)?;
     verify_parent(&parent, parent_path)?;
     Ok((file, parent))
 }

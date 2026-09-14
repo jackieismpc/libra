@@ -9,6 +9,7 @@ use super::{
     OperationStoreV2, PinnedRequestScope, PointerError, WorkspaceStatePointer,
     middleware::ScopeLease,
 };
+use crate::internal::config::ConfigKv;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DoctorIssue {
@@ -56,10 +57,27 @@ impl DoctorEngine {
 
     pub async fn inspect(&self, dry_run: bool, fix: bool) -> Result<DoctorReport, DoctorError> {
         let _repo_lease = if fix && !dry_run {
-            Some(
-                ScopeLease::acquire_repository(&self.scope, &self.repo_id)
+            let shared_repository =
+                ConfigKv::get_with_conn(self.store.db(), "core.sharedRepository")
                     .await
-                    .map_err(|error| DoctorError::Storage(error.to_string()))?,
+                    .map_err(|error| DoctorError::Storage(error.to_string()))?;
+            if shared_repository
+                .as_ref()
+                .is_some_and(|entry| entry.encrypted)
+            {
+                return Err(DoctorError::Storage(
+                    "core.sharedRepository must be plaintext before acquiring the repository ref lease"
+                        .to_string(),
+                ));
+            }
+            Some(
+                ScopeLease::acquire_repository(
+                    &self.scope,
+                    &self.repo_id,
+                    shared_repository.as_ref().map(|entry| entry.value.as_str()),
+                )
+                .await
+                .map_err(|error| DoctorError::Storage(error.to_string()))?,
             )
         } else {
             None
@@ -183,9 +201,14 @@ impl DoctorEngine {
                 })
                 .unwrap_or(true)
         };
+        let operation_is_running = |journal: &super::JournalEntry| {
+            operations
+                .iter()
+                .find(|operation| operation.op_id == journal.op_id)
+                .is_some_and(|operation| operation.status == super::OperationStatusV2::Running)
+        };
         for journal in latest_journals.values() {
-            let incomplete = journal.phase != super::JournalPhase::Publish;
-            if incomplete && journal_belongs_to_scope(journal) {
+            if operation_is_running(journal) && journal_belongs_to_scope(journal) {
                 issues.push(DoctorIssue {
                     code: "unfinished-journal".to_string(),
                     message: format!("operation {} stopped at {}", journal.op_id, journal.phase),
@@ -226,9 +249,10 @@ impl DoctorEngine {
         }
 
         if fix && !dry_run {
-            if latest_journals.values().any(|journal| {
-                journal.phase != super::JournalPhase::Publish && journal_belongs_to_scope(journal)
-            }) {
+            if latest_journals
+                .values()
+                .any(|journal| operation_is_running(journal) && journal_belongs_to_scope(journal))
+            {
                 let engine = super::RestoreEngine::new(
                     self.scope.clone(),
                     self.repo_id.clone(),

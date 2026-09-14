@@ -18,6 +18,23 @@ use serde_json::json;
 use thiserror::Error;
 use uuid::Uuid;
 
+tokio::task_local! {
+    static CURRENT_OPERATION_ID: String;
+}
+
+/// Return the operation id active for the current async command.
+pub(crate) fn current_operation_id() -> Option<String> {
+    CURRENT_OPERATION_ID.try_with(Clone::clone).ok()
+}
+
+/// Run a future with the operation id of an existing persisted boundary.
+pub(crate) async fn with_operation_id<T>(
+    operation_id: String,
+    future: impl Future<Output = T>,
+) -> T {
+    CURRENT_OPERATION_ID.scope(operation_id, future).await
+}
+
 mod lease;
 use lease::LeaseFilePermissions;
 pub(crate) use lease::ScopeLease;
@@ -77,6 +94,67 @@ pub fn classify_command(name: &str) -> Result<MutationClass, ClassificationError
         _ => return Err(ClassificationError::Unknown(name)),
     };
     Ok(class)
+}
+
+/// Whether a command can change a ref shared by linked worktrees. The first
+/// token is used because legacy operation records include control arguments
+/// (for example, `rebase --continue`) in `command_name`.
+pub(crate) fn command_may_mutate_shared_refs(command_name: &str) -> bool {
+    let normalized = command_name.trim().to_ascii_lowercase();
+    let mut parts = normalized.split_ascii_whitespace();
+    let command = parts.next().unwrap_or_default();
+    if command == "op" {
+        return matches!(parts.next(), Some("restore" | "undo" | "redo" | "revert"));
+    }
+    matches!(
+        command,
+        "branch"
+            | "br"
+            | "tag"
+            | "commit"
+            | "ci"
+            | "reset"
+            | "fetch"
+            | "pull"
+            | "push"
+            | "merge"
+            | "rebase"
+            | "rb"
+            | "cherry-pick"
+            | "cp"
+            | "revert"
+            | "am"
+            | "bisect"
+            | "checkout"
+            | "switch"
+            | "sw"
+            | "update-ref"
+            | "symbolic-ref"
+            | "reflog"
+            | "notes"
+            | "replace"
+            | "stash"
+            | "remote"
+            | "worktree"
+            | "shell"
+            | "exec"
+            | "external-git"
+            | "hook"
+            | "fast-import"
+    )
+}
+
+fn operation_needs_repository_lease(meta: &OperationMetaV2, class: MutationClass) -> bool {
+    class == MutationClass::ExternalOrUnknown
+        || meta.command_name.as_deref().map_or_else(
+            || {
+                matches!(
+                    class,
+                    MutationClass::RepoMutation | MutationClass::SequencerMutation
+                )
+            },
+            command_may_mutate_shared_refs,
+        )
 }
 
 #[derive(Debug, Error)]
@@ -241,7 +319,7 @@ where
         class,
         post_snapshot_complete: false,
     };
-    let value = f(&mut txn).await?;
+    let value = with_operation_id(txn.op_id.clone(), f(&mut txn)).await?;
     Ok(OperationResult {
         value,
         operation_id: should_record.then_some(txn.op_id),
@@ -298,6 +376,15 @@ where
                 .to_string(),
         ));
     }
+    let shared_repository_value = shared_repository.as_ref().map(|entry| entry.value.as_str());
+    // Repository-wide ref transitions take the common lease before the
+    // worktree lease, matching restore's lock order. Worktree-only edits keep
+    // their existing concurrency across linked worktrees.
+    let _repository_lease = if operation_needs_repository_lease(&meta, class) {
+        Some(ScopeLease::acquire_repository(scope, &repo_id, shared_repository_value).await?)
+    } else {
+        None
+    };
     let lease_permissions = LeaseFilePermissions::from_shared_repository(
         shared_repository.as_ref().map(|entry| entry.value.as_str()),
     )?;
@@ -494,7 +581,7 @@ where
         now_millis(),
     )
     .await?;
-    let value = match f(&mut txn).await {
+    let value = match with_operation_id(txn.op_id.clone(), f(&mut txn)).await {
         Ok(value) => value,
         Err(error) => {
             persist_failed_operation(
@@ -838,6 +925,58 @@ mod tests {
             classify_command("future-command"),
             Err(ClassificationError::Unknown(_))
         ));
+    }
+
+    #[test]
+    fn operation_restore_commands_take_the_repository_ref_fence() {
+        for command in ["op restore", "op undo --last", "op redo", "op revert"] {
+            assert!(
+                command_may_mutate_shared_refs(command),
+                "{command} can restore a shared branch tip"
+            );
+        }
+        assert!(!command_may_mutate_shared_refs("op log"));
+    }
+
+    #[tokio::test]
+    async fn operation_id_context_matches_the_operation_txn() {
+        let root = tempfile::tempdir().expect("scope root");
+        let scope = crate::internal::worktree_scope::RequestScope {
+            scope: crate::internal::worktree_scope::WorktreeScope::Main,
+            workdir: root.path().to_path_buf(),
+            gitdir: root.path().join(".libra"),
+            storage: root.path().to_path_buf(),
+            worktree_root: root.path().to_path_buf(),
+        };
+
+        let result = run_with_operation(
+            &scope,
+            OperationMetaV2::default(),
+            MutationClass::RepoMutation,
+            |txn| {
+                let expected = txn.op_id.clone();
+                async move {
+                    assert_eq!(current_operation_id().as_deref(), Some(expected.as_str()));
+                    Ok::<_, OperationError>(expected)
+                }
+            },
+        )
+        .await
+        .expect("operation");
+        assert_eq!(result.operation_id.as_deref(), Some(result.value.as_str()));
+        assert!(current_operation_id().is_none());
+    }
+
+    #[tokio::test]
+    async fn persisted_control_boundary_id_can_scope_a_command() {
+        with_operation_id("persisted-control-op".to_string(), async {
+            assert_eq!(
+                current_operation_id().as_deref(),
+                Some("persisted-control-op")
+            );
+        })
+        .await;
+        assert!(current_operation_id().is_none());
     }
 
     #[tokio::test]

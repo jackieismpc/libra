@@ -249,6 +249,213 @@ async fn doctor_reports_missing_object_and_unfinished_journal_read_only() {
 }
 
 #[tokio::test]
+async fn doctor_recovers_a_running_publish_journal_once() {
+    let _test_lock = lock_cli_repository_tests().await;
+    let repository = tempdir().expect("repository");
+    libra::utils::test::setup_with_new_libra_in(repository.path()).await;
+    fs::write(repository.path().join("a.txt"), "one\n").expect("file");
+    for args in [
+        &["add", "a.txt"][..],
+        &["commit", "-m", "first", "--no-verify"][..],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_libra"))
+            .env("LIBRA_SKIP_WEB_BUILD", "1")
+            .args(args)
+            .current_dir(repository.path())
+            .output()
+            .expect("libra command");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let pinned = RequestScope::resolve(repository.path().to_path_buf()).expect("scope");
+    let database = get_db_conn_instance_for_path(&pinned.storage.join(util::DATABASE))
+        .await
+        .expect("database");
+    let repo_id = ConfigKv::get_with_conn(&database, "libra.repoid")
+        .await
+        .expect("repo id")
+        .expect("repo id entry")
+        .value;
+    let storage = ClientStorage::init_local(pinned.storage.join("objects"));
+    let store = OperationStoreV2::new_for_repo(&repo_id, database, storage);
+    let scope_key = pinned.scope.storage_key();
+    let baseline_heads = store
+        .read_heads(&repo_id, scope_key)
+        .await
+        .expect("baseline heads");
+    let baseline_id = baseline_heads
+        .first()
+        .cloned()
+        .expect("baseline operation head");
+    let baseline = store
+        .load_operation(&baseline_id)
+        .await
+        .expect("load baseline")
+        .expect("baseline operation");
+
+    let interrupted_id = "doctor-publish-interrupted";
+    store
+        .write_operation(&OperationV2 {
+            op_id: interrupted_id.to_string(),
+            parent_op_ids: baseline_heads.clone(),
+            pre_view_oid: baseline.post_view_oid,
+            post_view_oid: baseline.post_view_oid,
+            kind: OperationKind::Undo,
+            status: OperationStatusV2::Running,
+            metadata: OperationMetaV2::default(),
+            restores_op_id: Some(baseline_id.clone()),
+            reverts_op_id: None,
+            predecessor_map_oid: None,
+        })
+        .await
+        .expect("interrupted operation");
+    store
+        .append_journal(&JournalEntry {
+            journal_id: "doctor-publish-interrupted-journal".to_string(),
+            op_id: interrupted_id.to_string(),
+            phase: JournalPhase::Publish,
+            pre_view_oid: Some(baseline.post_view_oid),
+            target_view_oid: Some(baseline.post_view_oid),
+            owner: "test".to_string(),
+            updated_at: 1,
+            recovery_payload: Some(
+                serde_json::json!({
+                    "kind": "restore",
+                    "restore_refs": false,
+                    "workspace_id": "main"
+                })
+                .to_string(),
+            ),
+        })
+        .await
+        .expect("publish journal");
+    store
+        .cas_update_op_heads(
+            &repo_id,
+            scope_key,
+            &baseline_heads,
+            &[interrupted_id.to_string()],
+        )
+        .await
+        .expect("published interrupted head");
+    // Model the physical restore having installed its target snapshot before
+    // the process crashed after publishing the operation head.
+    fs::write(repository.path().join("a.txt"), "two\n").expect("interrupted target state");
+
+    // This terminal operation retains an earlier-phase journal. Doctor must
+    // leave it alone after the active interrupted operation is recovered.
+    let terminal_id = "doctor-terminal-operation";
+    store
+        .write_operation(&OperationV2 {
+            op_id: terminal_id.to_string(),
+            parent_op_ids: baseline_heads.clone(),
+            pre_view_oid: baseline.post_view_oid,
+            post_view_oid: baseline.post_view_oid,
+            kind: OperationKind::Undo,
+            status: OperationStatusV2::Failed,
+            metadata: OperationMetaV2::default(),
+            restores_op_id: Some(baseline_id),
+            reverts_op_id: None,
+            predecessor_map_oid: None,
+        })
+        .await
+        .expect("terminal operation");
+    store
+        .append_journal(&JournalEntry {
+            journal_id: "doctor-terminal-operation-journal".to_string(),
+            op_id: terminal_id.to_string(),
+            phase: JournalPhase::Mutation,
+            pre_view_oid: Some(baseline.post_view_oid),
+            target_view_oid: Some(baseline.post_view_oid),
+            owner: "test".to_string(),
+            updated_at: 2,
+            recovery_payload: Some(
+                serde_json::json!({
+                    "kind": "restore",
+                    "restore_refs": false,
+                    "workspace_id": "main"
+                })
+                .to_string(),
+            ),
+        })
+        .await
+        .expect("terminal journal");
+
+    let engine = DoctorEngine::new(pinned.clone(), repo_id.clone(), store.clone());
+    let dry_run = engine.inspect(true, true).await.expect("doctor dry run");
+    assert!(
+        dry_run
+            .issues
+            .iter()
+            .any(|issue| issue.code == "unfinished-journal"),
+        "a running operation at Publish still needs recovery"
+    );
+    assert!(dry_run.fixed.is_empty(), "dry-run must not repair");
+    assert_eq!(
+        store
+            .read_heads(&repo_id, scope_key)
+            .await
+            .expect("heads after dry run"),
+        vec![interrupted_id.to_string()],
+        "dry-run must preserve the published head"
+    );
+    assert_eq!(
+        fs::read(repository.path().join("a.txt")).expect("file after dry run"),
+        b"two\n",
+        "dry-run must preserve the interrupted physical state"
+    );
+
+    let fixed = engine.inspect(false, true).await.expect("doctor fix");
+    assert!(fixed.fixed.iter().any(|item| item == "unfinished-journals"));
+    assert_eq!(
+        store
+            .load_operation(interrupted_id)
+            .await
+            .expect("load recovered operation")
+            .expect("recovered operation")
+            .status,
+        OperationStatusV2::Failed,
+        "doctor rolls back the interrupted publish"
+    );
+    assert_eq!(
+        store
+            .read_heads(&repo_id, scope_key)
+            .await
+            .expect("recovered heads"),
+        baseline_heads,
+        "doctor restores the prior head"
+    );
+    assert_eq!(
+        fs::read(repository.path().join("a.txt")).expect("file after recovery"),
+        b"one\n",
+        "doctor must restore the physical pre-view as well as the operation head"
+    );
+
+    let second = engine
+        .inspect(false, true)
+        .await
+        .expect("second doctor fix");
+    assert!(
+        !second
+            .issues
+            .iter()
+            .any(|issue| issue.code == "unfinished-journal"),
+        "terminal and recovered operations must not be re-diagnosed as unfinished"
+    );
+    assert!(
+        !second
+            .fixed
+            .iter()
+            .any(|item| item == "unfinished-journals"),
+        "terminal journals must not trigger another recovery pass"
+    );
+}
+
+#[tokio::test]
 async fn real_cli_operation_can_undo_and_redo_without_rewriting_the_target() {
     let _test_lock = lock_cli_repository_tests().await;
     let repository = tempdir().expect("repository");

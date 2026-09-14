@@ -23,14 +23,50 @@ use uuid::Uuid;
 
 use crate::internal::{
     branch::Branch,
+    config::ConfigKv,
     head::Head,
     model::reference,
     operation::{
         OperationGraphRecord, OperationParentRecord, OperationQueryPage, OperationRecord,
         OperationService, OperationStatus, OperationViewRecord, OperationViewRefRecord,
         OperationViewWorkspaceRecord,
+        middleware::{ScopeLease, command_may_mutate_shared_refs},
     },
 };
+
+async fn acquire_repository_ref_lease(
+    db: &DatabaseConnection,
+    scope: &crate::internal::operation::PinnedRequestScope,
+    repo_id: &str,
+    command_name: &str,
+) -> Result<ScopeLease, OperationError> {
+    let shared_repository = ConfigKv::get_with_conn(db, "core.sharedRepository")
+        .await
+        .map_err(|error| {
+            OperationError::begin(format!(
+                "cannot read core.sharedRepository before acquiring the repository ref lease: {error}"
+            ))
+        })?;
+    if shared_repository
+        .as_ref()
+        .is_some_and(|entry| entry.encrypted)
+    {
+        return Err(OperationError::begin(
+            "core.sharedRepository must be plaintext before acquiring the repository ref lease",
+        ));
+    }
+    ScopeLease::acquire_repository(
+        scope,
+        repo_id,
+        shared_repository.as_ref().map(|entry| entry.value.as_str()),
+    )
+    .await
+    .map_err(|error| {
+        OperationError::begin(format!(
+            "cannot acquire repository ref lease for command '{command_name}': {error}"
+        ))
+    })
+}
 
 const PARENT_RESOLUTION_PAGE_SIZE: u64 = 200;
 const DEDUP_WINDOW_SECS: i64 = 5;
@@ -437,6 +473,26 @@ where
     meta.validate()?;
     validate_parent_policy(scope.parent_policy)?;
 
+    // Legacy transaction wrappers also write shared branch and HEAD rows.
+    // Take the repository fence before opening the transaction; ref writers
+    // cannot race a confirmed repository-wide restore between snapshot and
+    // commit. A pinned request scope supplies the common storage directory.
+    let _repository_lease = if scope.ownership == OperationOwnership::Repository
+        || command_may_mutate_shared_refs(&meta.command_name)
+    {
+        if let Some(request_scope) = crate::internal::worktree_scope::WorktreeScope::request_scope()
+        {
+            Some(
+                acquire_repository_ref_lease(db, &request_scope, &meta.repo_id, &meta.command_name)
+                    .await?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let op_id = Uuid::now_v7().to_string();
     let view_id = Uuid::now_v7().to_string();
     let start_ts = Utc::now().timestamp();
@@ -745,6 +801,7 @@ pub struct OperationBoundary {
     selected_parents: Vec<String>,
     parent_metrics: ParentSelectionMetrics,
     _dedup_guard: Option<ActiveDedupGuard>,
+    _repository_lease: Option<ScopeLease>,
 }
 
 /// How a boundary-recorded operation ended.
@@ -773,6 +830,20 @@ pub async fn begin_operation_with_conn(
 ) -> Result<OperationBoundary, OperationError> {
     meta.validate()?;
     validate_parent_policy(scope.parent_policy)?;
+
+    let repository_lease = if command_may_mutate_shared_refs(&meta.command_name) {
+        if let Some(request_scope) = crate::internal::worktree_scope::WorktreeScope::request_scope()
+        {
+            Some(
+                acquire_repository_ref_lease(db, &request_scope, &meta.repo_id, &meta.command_name)
+                    .await?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let op_id = Uuid::now_v7().to_string();
     let view_id = Uuid::now_v7().to_string();
@@ -922,6 +993,7 @@ pub async fn begin_operation_with_conn(
             selection_latency_us,
         },
         _dedup_guard: dedup_guard,
+        _repository_lease: repository_lease,
     })
 }
 
