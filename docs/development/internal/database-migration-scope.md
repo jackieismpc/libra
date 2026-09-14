@@ -114,6 +114,25 @@ System defaults. JSON retains its existing fields and adds scope/ledger/reason,
 without untrusted receipt names or values. All preflight and cascade reads
 remain physically read-only and never append the barrier.
 
+## Read-only schema diagnosis
+
+`libra config doctor --global-schema` routes directly to GlobalConfig metadata
+inspection, bypassing Repository/System policy, operation recording and both
+startup recovery and auto-upgrade. It reuses the literal read-only/no-create
+opener and centralized configuration classifier inside one SQLite read
+transaction. It never reads config/vault values, migrates, writes a barrier or
+creates a backup. A fixed SQLite header probe refuses WAL-mode opens without
+regular WAL/SHM sidecars; `immutable` is not safe for live databases.
+
+`report_version=1` exposes string receipt versions, observed/latest ledger
+metadata, UTC mtime and a controlled producer disposition. Manifest membership
+for `2026090801` is not writer attestation: `repair_eligible` is always false.
+Before/after DB/WAL identity, size and mtime fence observable changes but cannot
+exclude external rotation races; OS access time and SQLite coordination are
+outside the stable-target byte-invariance promise. An unavailable target is
+`unreadable`, never implicitly compatible. See the command documentation for
+all successful diagnostic classifications and the non-health-check exit code.
+
 ## Fixture isolation
 
 Tests that can reach global or system configuration must route every ambient

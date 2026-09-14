@@ -15,6 +15,7 @@ libra config list [--global | --system] [--name-only] [--show-origin] [--vault] 
 libra config unset [--global | --system] [--all] <key>
 libra config import [--global]
 libra config path [--global | --system]
+libra config doctor --global-schema
 libra config generate-ssh-key --remote <name>
 libra config generate-gpg-key [--name <name>] [--email <email>] [--usage <usage>]
 ```
@@ -77,6 +78,53 @@ unnecessary, but does not bypass SystemConfig compatibility for remote/cloud
 defaults. Use `--offline` or `LIBRA_READ_POLICY=offline|local` only for
 intentional local-only object access, not to bypass remote synchronization
 safety checks.
+
+## Read-only global schema doctor
+
+Run `libra config doctor --global-schema` (or `libra --json config doctor --global-schema`)
+to inspect only global schema metadata. It works outside a repository, uses
+`LIBRA_CONFIG_GLOBAL_DB` or `~/.libra/config.db`, and does not read configuration
+values, open the vault, inspect System/Repository databases, migrate a schema,
+write a barrier, create a backup, or run automatic upgrade/recovery. A missing
+target remains absent. `--global` is optional and redundant; `--local`,
+`--system`, value/action flags, `--repair` and `--confirm` are rejected.
+
+The JSON envelope's `data.report_version` is `1`. The same report backs human
+output: `scope`, `role`, `path_source`, configured/canonical paths, `exists`,
+`size_bytes`, `modified_at_utc`, and `configuration`/`legacy` ledger metadata.
+Each ledger reports `observed_version`, `latest_version`, `readable`, and
+`verified_name`; versions are strings (including the barrier's `i64::MAX`) to
+avoid JSON number precision loss. Null metadata means absent or unavailable,
+not proof of a healthy store. Receipt names are displayed only after manifest
+validation; arbitrary receipt text and configuration values are never output.
+
+`classification` is `absent`, `compatible`, `upgrade_required`,
+`unsupported_future`, `unsupported_receipt`, `unreadable`, or
+`changed_during_inspection`. Diagnosis itself exits successfully even when the
+store is unsupported; automation must inspect the classification, not just the
+exit status. `issue` identifies a proven unsupported ledger/version without
+untrusted text. Invalid invocations still fail with the existing CLI usage error.
+
+`producer_disposition` distinguishes registered but unattested Repository
+receipts, a recognized configuration barrier, and unattributed state. The
+current manifest recognizes `2026090801` as `operation_v2_branch_convergence`;
+that does not prove which process/binary wrote this file. Mtime is diagnostic
+metadata, not producer attestation. **`repair_eligible` is always `false` in
+this release**, including compatible/known receipts. Upgrade to a
+producer-compatible build for unsupported state; never manually edit SQLite
+receipts. Doctor does not provide a remote-sync bypass.
+
+The reader uses a normal read-only SQLite snapshot, never `immutable` on a live
+database. It conservatively reports `unreadable` without opening SQLite when a
+WAL-mode file lacks regular WAL/SHM sidecars. Do not create those files manually;
+retry while the owning application maintains its normal sidecars, or diagnose
+an independently obtained SQLite-consistent snapshot. Existing DB/WAL contents
+and modification times are unchanged on a stable target. Before/after file
+identity, size and mtime checks report observed concurrent changes as
+`changed_during_inspection`. This is not a filesystem lock: external rotation
+can race those checks and SQLite coordination files may change. OS access times
+and SHM coordination are not invariant, and no repair authority follows from
+passing the checks.
 
 ## Options
 

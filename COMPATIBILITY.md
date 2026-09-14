@@ -101,6 +101,16 @@ preflight do not write the marker; existing legacy receipts are preserved.
 This is forward-only: upgrade the binary, never manually edit SQLite receipts.
 Support for a legacy receipt does not authorize repair.
 
+`libra config doctor --global-schema` is a Libra-only read-only metadata
+diagnostic, not a Git config operation. Human/JSON reports include both ledgers,
+paths, UTC mtime and controlled producer disposition; `report_version=1` uses
+string versions. `2026090801` is known but does not attest its writer, and
+`repair_eligible=false` always. Unsupported/unreadable diagnoses can exit 0;
+inspect `classification`. Missing targets and missing WAL sidecars are not
+created. No values, migration, backup, repository preflight or auto-upgrade are
+accessed. Live-file races and SQLite coordination are not a filesystem freeze;
+see the [doctor contract](docs/commands/config.md#read-only-global-schema-doctor).
+
 `--offline` and `LIBRA_READ_POLICY=offline|local` intentionally allow local-only
 object access with a warning, not remote synchronization. Complete process or
 repo-local `vault.env.LIBRA_STORAGE_*` values can make Global storage config

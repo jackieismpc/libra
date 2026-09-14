@@ -192,6 +192,15 @@ structured report is always present.
 | `LBR-CONFIG-001` | Required Global/System configuration has a future schema or unsupported receipt. Upgrade Libra; never edit SQLite receipts manually. Use `--offline` / `LIBRA_READ_POLICY=offline|local` only for intentional local-only object access, not remote synchronization. Existing JSON fields remain stable; `config_scope`, `schema_ledger`, and `schema_reason` identify the issue without values or untrusted receipt names. |
 | `LBR-UPGRADE-001` | The reserved upgrade settings file (`{LIBRA_HOME}/upgrade/settings.json`) is unreadable or corrupt; rewrite it with `libra config set --global upgrade.mode <auto\|manual\|off>`. Unsupported `upgrade.*` config spellings are usage errors (`LBR-CLI-002`). |
 
+`libra config doctor --global-schema` is a read-only diagnostic, so an
+unsupported/unreadable classification is a successful report, not
+`LBR-CONFIG-001`. Check `data.classification` in JSON (`report_version=1`),
+not only the exit code. `repair_eligible` is always false: even recognized
+`2026090801` does not attest its writer. Invalid doctor arguments use
+`LBR-CLI-002`. Missing WAL sidecars cause a conservative `unreadable` report
+without creating them; see [the doctor contract](commands/config.md#read-only-global-schema-doctor)
+for live-file race limits. Do not manually edit migration receipts.
+
 ### Conflict
 
 | Stable code | Meaning |

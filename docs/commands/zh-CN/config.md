@@ -55,6 +55,39 @@ scoped get/list、默认值级联与 remote preflight 不写入 barrier；配置
 
 全局路径为 `LIBRA_CONFIG_GLOBAL_DB` 或 `~/.libra/config.db`，系统路径为 `LIBRA_CONFIG_SYSTEM_DB` 或 `/etc/libra/config.db`。完整的进程环境／repo-local 存储配置可以证明无需 GlobalConfig，但不能绕过 remote/cloud 对 SystemConfig 默认值的兼容性检查。只有在明确需要本地对象访问时才使用 `--offline` 或 `LIBRA_READ_POLICY=offline|local`，不能借此绕过远端同步安全检查。
 
+## 只读 global schema doctor
+
+使用 `libra config doctor --global-schema`，或
+`libra --json config doctor --global-schema`，只检查全局 schema 元数据。
+路径为 `LIBRA_CONFIG_GLOBAL_DB` 或 `~/.libra/config.db`；无需仓库，不读取配置值、
+vault、System/Repository DB，不运行迁移、写 barrier、创建备份或触发自动升级／恢复。
+缺失目标保持缺失。冗余 `--global` 可用；`--local`、`--system`、值／操作参数、
+`--repair`、`--confirm` 均拒绝。
+
+JSON envelope 的 `data.report_version=1`；human 与 JSON 使用同一报告，包含
+`scope`、`role`、`path_source`、configured/canonical path、`exists`、`size_bytes`、
+UTC `modified_at_utc` 和 `configuration`／`legacy` ledger。
+每个 ledger 提供 `observed_version`、`latest_version`、`readable`、`verified_name`；
+版本使用字符串，避免 `i64::MAX` 的 JSON 数值精度丢失。null 表示缺失或不可用，
+不表示健康。仅显示通过 manifest 校验的 receipt 名称，不输出任意 receipt 文本或配置值。
+
+`classification` 包括 `absent`、`compatible`、`upgrade_required`、
+`unsupported_future`、`unsupported_receipt`、`unreadable`、`changed_during_inspection`。
+成功完成诊断仍以 0 退出，包括不支持的库；自动化必须检查 classification，不能仅看退出码。
+`issue` 只报告已证明不支持的 ledger/version；非法参数仍使用现有 CLI usage error。
+`producer_disposition` 区分已登记但未归因的 Repository receipt、合法配置 barrier 与未知来源。
+当前 manifest 将 `2026090801` 识别为 `operation_v2_branch_convergence`，但 receipt 或 mtime
+不能证明历史 writer PID/binary。**本版本 `repair_eligible` 始终为 `false`**。
+不支持状态应升级到 producer-compatible build；禁止手工编辑 SQLite receipt，
+doctor 也不是 remote-sync bypass。
+
+使用标准 SQLite 只读 snapshot，不能以 `immutable` 跳过 live DB 的锁和变化检测。
+WAL-mode 缺失正常 WAL/SHM 文件时，保守报告 `unreadable`，不打开 SQLite 来创建这些文件。
+不要手工创建 sidecar；可在所属应用正常维护这些文件时重试，或诊断另行取得的 SQLite-consistent snapshot。
+稳定目标的主 DB/WAL 内容及 mtime 不变；前后检查文件 identity、size、mtime，发现变化时报告
+`changed_during_inspection`。检查并非文件系统锁，外部 rotation 可能与它竞态，SQLite 协调文件可能变化；
+OS access time 与 SHM 协调状态不保证恒定。即使检查通过也不提供 repair 权限。
+
 ## 选项
 
 ### 子命令

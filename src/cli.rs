@@ -1607,7 +1607,7 @@ fn command_preflight(command: &Commands, structured_output: bool) -> CliResult<C
             ))
         }
         // Config global/system scopes don't require a repository.
-        Commands::Config(cfg) if cfg.global || cfg.system => Ok(CommandPreflight::none()),
+        Commands::Config(cfg) if cfg.global || cfg.system || command::config::is_schema_doctor_request(cfg) => Ok(CommandPreflight::none()),
         // W4-02: `--control stdio` is a client-only JSON-RPC transport — no
         // repository/hash-kind preflight.
         Commands::Code(code_args) if code_args.control == ControlMode::Stdio => {
@@ -1699,6 +1699,7 @@ impl CommandScope {
 fn command_scope(command: &Commands) -> CommandScope {
     use CommandScope::{Composite, ReadOnly, Repository, Worktree};
     match command {
+        Commands::Config(args) if command::config::is_schema_doctor_request(args) => ReadOnly,
         // ── Worktree: HEAD / index / working files of THIS worktree ───────
         Commands::Add(_)
         | Commands::Rm(_)
@@ -2033,7 +2034,8 @@ fn command_has_existing_operation_boundary(command: &Commands) -> bool {
 }
 
 fn config_command_is_read_only(args: &command::config::ConfigArgs) -> bool {
-    args.get
+    command::config::is_schema_doctor_request(args)
+        || args.get
         || args.get_all
         || args.list
         || args.get_regexp
@@ -2718,6 +2720,7 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     // dispatch-specific mutation code runs. The actual operation transaction
     // is owned by the command/Agent boundary; keeping this call at the
     // central parse seam prevents a new surface from bypassing classification.
+    let schema_doctor = matches!(&args.command, Commands::Config(cfg) if command::config::is_schema_doctor_request(cfg));
     let operation_class = operation_class_for_command(&args.command);
     let use_central_operation_boundary = !command_has_existing_operation_boundary(&args.command);
     let is_stash_pop = matches!(&args.command, Commands::Stash(Stash::Pop { .. }));
@@ -2755,8 +2758,12 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     // must be resolved before any repo preflight or user command runs. Inert
     // (no I/O) until release keys are provisioned; a fatal, unrecoverable
     // transaction exits here rather than running the user's command.
-    crate::internal::upgrade::orchestrator::startup_recovery_gate().await?;
-    enforce_global_config_schema_policy(&args.command).await?;
+    // Diagnosis must not mutate the installation or inspect other DB scopes,
+    // including when its own argument validation will reject the invocation.
+    if !schema_doctor {
+        crate::internal::upgrade::orchestrator::startup_recovery_gate().await?;
+        enforce_global_config_schema_policy(&args.command).await?;
+    }
     if let Commands::Tag(tag_args) = &args.command {
         command::tag::validate_cli_args(tag_args)?;
     }
@@ -2897,7 +2904,7 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     // is inert (no I/O) until keys are provisioned. The explicit `libra
     // upgrade` command is exempt: it runs the same pipeline itself, and a
     // background install racing the interactive one would be confusing.
-    if !matches!(args.command, Commands::Upgrade(_)) {
+    if !schema_doctor && !matches!(args.command, Commands::Upgrade(_)) {
         run_auto_upgrade_check_hook(&output).await;
     }
 

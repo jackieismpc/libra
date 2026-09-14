@@ -40,6 +40,8 @@ use crate::{
     },
 };
 
+mod doctor;
+
 /// Cached database connection for Global scope, paired with the resolved DB path.
 static GLOBAL_CONFIG_CONN: Lazy<Mutex<Option<(PathBuf, DatabaseConnection)>>> =
     Lazy::new(|| Mutex::new(None));
@@ -66,6 +68,7 @@ const EXAMPLES: &str = r#"EXAMPLES:
     libra config generate-ssh-key --remote origin      Generate SSH key for remote
     libra config generate-gpg-key                      Generate GPG signing key
     libra config list --name-only                      List all key names
+    libra config doctor --global-schema                 Diagnose global schema without values or writes
     libra config path                                  Show config DB path"#;
 
 /// Configuration scope that determines where values are stored and retrieved.
@@ -428,6 +431,12 @@ pub struct ConfigArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum ConfigCommand {
+    /// Diagnose global schema metadata without reading configuration values
+    Doctor {
+        /// Inspect only the global configuration schema (required)
+        #[clap(long, required = true)]
+        global_schema: bool,
+    },
     /// Set a configuration value
     Set {
         /// Configuration key (dotted format, e.g. user.name)
@@ -577,11 +586,57 @@ pub async fn execute_safe(args: ConfigArgs, output: &OutputConfig) -> CliResult<
     execute_inner(args, output).await
 }
 
+/// The exact diagnostic variant, including flag combinations that will be
+/// refused. Refusal must not run a migration or auto-upgrade before validation.
+pub fn is_schema_doctor_request(args: &ConfigArgs) -> bool {
+    matches!(args.command, Some(ConfigCommand::Doctor { .. }))
+}
+
+fn validate_schema_doctor_args(args: &ConfigArgs) -> CliResult<()> {
+    let requested = matches!(
+        args.command,
+        Some(ConfigCommand::Doctor {
+            global_schema: true
+        })
+    );
+    if !requested
+        || args.local
+        || args.system
+        || args.get
+        || args.get_all
+        || args.unset
+        || args.unset_all
+        || args.list
+        || args.add
+        || args.import
+        || args.get_regexp
+        || args.show_origin
+        || args.remove_section
+        || args.rename_section
+        || args.null
+        || args.value_type.is_some()
+        || args.type_bool
+        || args.type_int
+        || args.type_path
+        || args.key.is_some()
+        || args.valuepattern.is_some()
+        || args.default.is_some()
+    {
+        return Err(CliError::command_usage(
+            "use libra config doctor --global-schema without value, action, type, --local or --system options",
+        ).with_stable_code(StableErrorCode::CliInvalidArguments));
+    }
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Dispatch logic
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()> {
+    if is_schema_doctor_request(&args) {
+        validate_schema_doctor_args(&args)?;
+    }
     let scope = get_scope(&args);
     let use_cascade = !has_explicit_scope(&args);
 
@@ -603,6 +658,7 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
     }
 
     match cmd {
+        ResolvedCommand::Doctor => doctor::execute(output).await,
         ResolvedCommand::Set {
             key,
             value,
@@ -1119,6 +1175,7 @@ fn upgrade_list_entry(name_only: bool, with_origin: bool) -> CliResult<Option<Co
 
 #[derive(Debug)]
 enum ResolvedCommand {
+    Doctor,
     Set {
         key: String,
         value: Option<String>,
@@ -1215,6 +1272,7 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
     // If an explicit subcommand was provided, use it directly
     if let Some(ref cmd) = args.command {
         return Ok(match cmd {
+            ConfigCommand::Doctor { .. } => ResolvedCommand::Doctor,
             ConfigCommand::Set {
                 key,
                 value,

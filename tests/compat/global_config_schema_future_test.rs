@@ -14,6 +14,460 @@ const ENV_SECRET_VALUE: &str = "ENV_STORAGE_SECRET_SHOULD_NOT_LEAK";
 const INSTALL_COMMAND: &str =
     "curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh | sh";
 
+fn doctor_data(fixture: &CliFixture) -> serde_json::Value {
+    let output = fixture.run(
+        &fixture.root,
+        &["--json", "config", "doctor", "--global-schema"],
+    );
+    assert!(output.status.success(), "{}", stderr_text(&output));
+    assert!(!stderr_text(&output).contains(SECRET_VALUE));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(SECRET_VALUE));
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let data = envelope["data"].clone();
+    assert_eq!(data["report_version"], 1);
+    assert_eq!(data["action"], "doctor");
+    assert_eq!(data["repair_eligible"], false);
+    data
+}
+
+fn file_fingerprint(path: &Path) -> (Vec<u8>, std::time::SystemTime) {
+    (
+        fs::read(path).unwrap(),
+        fs::metadata(path).unwrap().modified().unwrap(),
+    )
+}
+
+fn directory_files(path: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(path).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            files.extend(directory_files(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files.sort();
+    files
+}
+
+#[test]
+fn config_doctor_command_exists() {
+    let fixture = CliFixture::new();
+    let help = fixture.run(&fixture.root, &["config", "doctor", "--help"]);
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("--global-schema"));
+    assert_eq!(doctor_data(&fixture)["classification"], "absent");
+    for args in [
+        vec!["config", "doctor"],
+        vec!["config", "doctor", "--global-schema", "--local"],
+        vec!["config", "doctor", "--global-schema", "--system"],
+        vec!["config", "doctor", "--global-schema", "--repair"],
+        vec![
+            "config",
+            "doctor",
+            "--global-schema",
+            "--confirm",
+            "/invalid",
+        ],
+        vec!["config", "--unset", "doctor", "--global-schema"],
+        vec!["config", "--type", "int", "doctor", "--global-schema"],
+        vec![
+            "config",
+            "--default",
+            "secret-default",
+            "doctor",
+            "--global-schema",
+        ],
+        vec!["config", "doctor", "--global-schema", "--null"],
+    ] {
+        let output = fixture.run(&fixture.root, &args);
+        assert!(!output.status.success(), "unexpected success: {args:?}");
+        assert!(!fixture.global_db.exists(), "{args:?} created global DB");
+        assert!(!fixture.system_db.exists(), "{args:?} created system DB");
+    }
+    let redundant = fixture.run(
+        &fixture.root,
+        &["config", "doctor", "--global-schema", "--global"],
+    );
+    assert!(redundant.status.success(), "{}", stderr_text(&redundant));
+    for flag in [
+        "--get",
+        "--get-all",
+        "--unset-all",
+        "--list",
+        "--add",
+        "--import",
+        "--get-regexp",
+        "--show-origin",
+        "--remove-section",
+        "--rename-section",
+        "--bool",
+        "--int",
+        "--path",
+    ] {
+        let output = fixture.run(
+            &fixture.root,
+            &["config", flag, "doctor", "--global-schema"],
+        );
+        assert!(!output.status.success(), "{flag}");
+        assert!(
+            stderr_text(&output).contains("LBR-CLI-002"),
+            "{flag}: {}",
+            stderr_text(&output)
+        );
+        assert!(!fixture.global_db.exists() && !fixture.system_db.exists());
+    }
+}
+
+#[test]
+fn config_doctor_uses_global_role() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    configuration_base_fixture(
+        &fixture.global_db,
+        libra::internal::db::DatabaseRole::GlobalConfig,
+    );
+    fixture.command(&fixture.root, &[]);
+    fs::write(&fixture.system_db, b"unreadable system canary").unwrap();
+    let repo_db = fixture.repo.join(".libra/libra.db");
+    fs::write(&repo_db, b"unreadable repository canary").unwrap();
+    let system_before = file_fingerprint(&fixture.system_db);
+    let repo_before = file_fingerprint(&repo_db);
+    let data = doctor_data(&fixture);
+    assert_eq!(data["scope"], "global");
+    assert_eq!(data["role"], "global_config");
+    assert_eq!(data["classification"], "compatible");
+    assert_eq!(data["path_source"], "LIBRA_CONFIG_GLOBAL_DB");
+    assert_eq!(data["configured_path"], fixture.global_db.to_str().unwrap());
+    let inside = fixture.run(
+        &fixture.repo,
+        &["--json", "config", "doctor", "--global-schema"],
+    );
+    assert!(inside.status.success(), "{}", stderr_text(&inside));
+    assert_eq!(file_fingerprint(&fixture.system_db), system_before);
+    assert_eq!(file_fingerprint(&repo_db), repo_before);
+    let default = fixture
+        .command(
+            &fixture.root,
+            &["--json", "config", "doctor", "--global-schema"],
+        )
+        .env_remove("LIBRA_CONFIG_GLOBAL_DB")
+        .output()
+        .unwrap();
+    assert!(default.status.success());
+    let default: serde_json::Value = serde_json::from_slice(&default.stdout).unwrap();
+    assert_eq!(default["data"]["path_source"], "home");
+    assert_eq!(default["data"]["configured_path"], data["configured_path"]);
+
+    let cli = include_str!("../../src/cli.rs")
+        .split_whitespace()
+        .collect::<String>();
+    assert!(cli.contains("if!schema_doctor{crate::internal::upgrade::orchestrator::startup_recovery_gate().await?;enforce_global_config_schema_policy(&args.command).await?;}"));
+    assert!(cli.contains("if!schema_doctor&&!matches!(args.command,Commands::Upgrade(_))"));
+}
+
+#[test]
+fn config_doctor_reports_receipt() {
+    let fixture = CliFixture::new();
+    configuration_base_fixture(
+        &fixture.global_db,
+        libra::internal::db::DatabaseRole::GlobalConfig,
+    );
+    known_repository_receipts(&fixture.global_db);
+    let data = doctor_data(&fixture);
+    assert_eq!(
+        data["configuration"]["observed_version"],
+        fixture.latest_schema_version.to_string()
+    );
+    assert_eq!(data["legacy"]["observed_version"], "2026090801");
+    assert_eq!(data["legacy"]["latest_version"], "2026090801");
+    assert_eq!(
+        data["legacy"]["verified_name"],
+        "operation_v2_branch_convergence"
+    );
+    fixture.success(
+        &fixture.root,
+        &["config", "set", "--global", "test.doctor", "value"],
+    );
+    let barrier = doctor_data(&fixture);
+    assert_eq!(barrier["legacy"]["observed_version"], i64::MAX.to_string());
+    assert_eq!(barrier["classification"], "compatible");
+    assert_eq!(
+        barrier["producer_disposition"],
+        "configuration_barrier_unattested"
+    );
+}
+
+#[test]
+fn config_doctor_reports_producer_disposition() {
+    let fixture = CliFixture::new();
+    configuration_base_fixture(
+        &fixture.global_db,
+        libra::internal::db::DatabaseRole::GlobalConfig,
+    );
+    known_repository_receipts(&fixture.global_db);
+    let data = doctor_data(&fixture);
+    assert_eq!(
+        data["producer_disposition"],
+        "known_repository_receipt_unattested"
+    );
+    assert_eq!(data["classification"], "compatible");
+    fixture_sql(
+        &fixture.global_db,
+        "DROP TABLE configuration_schema_versions",
+    );
+    assert_eq!(doctor_data(&fixture)["classification"], "upgrade_required");
+    fixture_sql(
+        &fixture.global_db,
+        "INSERT INTO schema_versions VALUES (1, 'SECRET_SCHEMA_FUTURE_SHOULD_NOT_LEAK', 'fixture')",
+    );
+    let unknown = doctor_data(&fixture);
+    assert_eq!(unknown["classification"], "unsupported_receipt");
+    assert_eq!(unknown["issue"]["version"], "1");
+    assert_eq!(unknown["producer_disposition"], "unattributed");
+    assert!(unknown["legacy"]["verified_name"].is_null());
+}
+
+#[test]
+fn config_doctor_reports_mtime() {
+    let fixture = CliFixture::new();
+    configuration_base_fixture(
+        &fixture.global_db,
+        libra::internal::db::DatabaseRole::GlobalConfig,
+    );
+    let before = fs::metadata(&fixture.global_db).unwrap();
+    let data = doctor_data(&fixture);
+    let utc =
+        chrono::DateTime::parse_from_rfc3339(data["modified_at_utc"].as_str().unwrap()).unwrap();
+    let actual: chrono::DateTime<chrono::Utc> = before.modified().unwrap().into();
+    assert_eq!(utc.with_timezone(&chrono::Utc), actual);
+    assert_eq!(data["size_bytes"], before.len());
+    assert_eq!(
+        data["canonical_path"],
+        fixture.global_db.canonicalize().unwrap().to_str().unwrap()
+    );
+}
+
+#[test]
+fn config_doctor_preserves_db_fingerprint() {
+    let fixture = CliFixture::new();
+    configuration_base_fixture(
+        &fixture.global_db,
+        libra::internal::db::DatabaseRole::GlobalConfig,
+    );
+    let before = file_fingerprint(&fixture.global_db);
+    doctor_data(&fixture);
+    assert_eq!(file_fingerprint(&fixture.global_db), before);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let writer = raw_config_fixture(&fixture.global_db).await;
+        writer.execute_unprepared("PRAGMA journal_mode=WAL; INSERT INTO config_kv(key,value,encrypted) VALUES ('test.wal','wal-secret',0)").await.unwrap();
+        let wal = fixture.global_db.with_file_name("config.db-wal");
+        let before_db = file_fingerprint(&fixture.global_db);
+        let before_wal = file_fingerprint(&wal);
+        assert_eq!(doctor_data(&fixture)["classification"], "compatible");
+        assert_eq!(file_fingerprint(&fixture.global_db), before_db);
+        assert_eq!(file_fingerprint(&wal), before_wal);
+        writer.close().await.unwrap();
+    });
+    // A cleanly closed WAL database has no WAL: opening it read-only normally
+    // creates an empty WAL. Doctor must refuse that open, not use immutable.
+    let wal = fixture.global_db.with_file_name("config.db-wal");
+    let shm = fixture.global_db.with_file_name("config.db-shm");
+    assert!(!wal.exists());
+    assert!(!shm.exists());
+    let before = file_fingerprint(&fixture.global_db);
+    assert_eq!(doctor_data(&fixture)["classification"], "unreadable");
+    assert!(!wal.exists());
+    assert!(!shm.exists());
+    assert_eq!(file_fingerprint(&fixture.global_db), before);
+    for kind in ["missing_shm", "directory_wal", "directory_shm"] {
+        doctor_sidecar_refusal(kind);
+    }
+    #[cfg(unix)]
+    for kind in ["symlink_wal", "symlink_shm"] {
+        doctor_sidecar_refusal(kind);
+    }
+}
+
+fn doctor_sidecar_refusal(kind: &str) {
+    let fixture = CliFixture::new();
+    configuration_base_fixture(
+        &fixture.global_db,
+        libra::internal::db::DatabaseRole::GlobalConfig,
+    );
+    fixture_sql(&fixture.global_db, "PRAGMA journal_mode=WAL");
+    fixture.command(&fixture.root, &[]);
+    let wal = fixture.global_db.with_file_name("config.db-wal");
+    let shm = fixture.global_db.with_file_name("config.db-shm");
+    assert!(!wal.exists() && !shm.exists());
+    let outside = fixture.root.join("sidecar-canary");
+    fs::write(&outside, b"sidecar secret canary").unwrap();
+    match kind {
+        "directory_wal" => fs::create_dir(&wal).unwrap(),
+        #[cfg(unix)]
+        "symlink_wal" => std::os::unix::fs::symlink(&outside, &wal).unwrap(),
+        _ => fs::write(&wal, b"").unwrap(),
+    }
+    match kind {
+        "directory_shm" => fs::create_dir(&shm).unwrap(),
+        #[cfg(unix)]
+        "symlink_shm" => std::os::unix::fs::symlink(&outside, &shm).unwrap(),
+        _ => {}
+    }
+    let before = file_fingerprint(&fixture.global_db);
+    let outside_before = file_fingerprint(&outside);
+    let files = directory_files(&fixture.root);
+    assert_eq!(
+        doctor_data(&fixture)["classification"],
+        "unreadable",
+        "{kind}"
+    );
+    assert_eq!(file_fingerprint(&fixture.global_db), before, "{kind}");
+    assert_eq!(file_fingerprint(&outside), outside_before, "{kind}");
+    assert_eq!(directory_files(&fixture.root), files, "{kind}");
+}
+
+#[test]
+fn config_doctor_creates_no_backup() {
+    let fixture = CliFixture::new();
+    configuration_base_fixture(
+        &fixture.global_db,
+        libra::internal::db::DatabaseRole::GlobalConfig,
+    );
+    // Prepare the harness-owned directories before taking the inventory.
+    fixture.command(&fixture.root, &[]);
+    let files = directory_files(&fixture.root);
+    doctor_data(&fixture);
+    assert_eq!(directory_files(&fixture.root), files);
+}
+
+#[test]
+fn config_doctor_absent_target_stays_absent() {
+    let fixture = CliFixture::new();
+    let target = fixture.root.join("never-created/nested/config.db");
+    let output = fixture
+        .command(
+            &fixture.root,
+            &["--json", "config", "doctor", "--global-schema"],
+        )
+        .env("LIBRA_CONFIG_GLOBAL_DB", &target)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr_text(&output));
+    let data: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(data["data"]["exists"], false);
+    assert_eq!(data["data"]["classification"], "absent");
+    assert!(!target.parent().unwrap().exists());
+    assert!(!fixture.global_db.exists());
+}
+
+#[test]
+fn config_doctor_diagnoses_future_without_schema_write() {
+    let fixture = CliFixture::new();
+    fixture.write_future_global_config();
+    let before = file_fingerprint(&fixture.global_db);
+    let data = doctor_data(&fixture);
+    assert_eq!(data["classification"], "unsupported_future");
+    assert_eq!(
+        data["configuration"]["observed_version"],
+        fixture.future_schema_version.to_string()
+    );
+    assert_eq!(file_fingerprint(&fixture.global_db), before);
+    fixture_sql(
+        &fixture.global_db,
+        "CREATE TABLE schema_versions (wrong_column TEXT)",
+    );
+    // Auxiliary legacy metadata failure must not hide a proven own-role future.
+    assert_eq!(
+        doctor_data(&fixture)["classification"],
+        "unsupported_future"
+    );
+    fs::write(
+        &fixture.global_db,
+        b"not a database: SECRET_SCHEMA_FUTURE_SHOULD_NOT_LEAK",
+    )
+    .unwrap();
+    let before = file_fingerprint(&fixture.global_db);
+    assert_eq!(doctor_data(&fixture)["classification"], "unreadable");
+    assert_eq!(file_fingerprint(&fixture.global_db), before);
+}
+
+#[test]
+fn config_doctor_docs_describe_known_unsupported() {
+    for (path, text) in [
+        ("config EN", include_str!("../../docs/commands/config.md")),
+        (
+            "config zh",
+            include_str!("../../docs/commands/zh-CN/config.md"),
+        ),
+        ("errors", include_str!("../../docs/error-codes.md")),
+        ("compatibility", include_str!("../../COMPATIBILITY.md")),
+        (
+            "role map",
+            include_str!("../../docs/development/internal/database-migration-scope.md"),
+        ),
+    ] {
+        for anchor in [
+            "config doctor --global-schema",
+            "repair_eligible",
+            "2026090801",
+        ] {
+            assert!(text.contains(anchor), "{path} missing {anchor}");
+        }
+    }
+    for text in [
+        include_str!("../../docs/commands/config.md"),
+        include_str!("../../docs/commands/zh-CN/config.md"),
+    ] {
+        for anchor in ["WAL", "SHM", "unreadable", "rotation", "immutable"] {
+            assert!(
+                text.contains(anchor),
+                "missing doctor safety boundary: {anchor}"
+            );
+        }
+    }
+}
+
+#[test]
+fn config_doctor_human_redacts_values() {
+    let fixture = CliFixture::new();
+    fixture.write_future_global_config();
+    let output = fixture.run(&fixture.root, &["config", "doctor", "--global-schema"]);
+    assert!(output.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        stderr_text(&output)
+    );
+    assert!(text.contains("unsupported_future"));
+    assert!(text.contains("repair_eligible: false"));
+    assert!(!text.contains(SECRET_VALUE));
+    assert!(!text.contains("vault.env"));
+}
+
+#[test]
+fn config_doctor_json_redacts_values() {
+    let fixture = CliFixture::new();
+    fixture.write_future_global_config();
+    let data = doctor_data(&fixture);
+    assert!(!data.to_string().contains(SECRET_VALUE));
+    fixture_sql(
+        &fixture.global_db,
+        "DELETE FROM configuration_schema_versions; INSERT INTO configuration_schema_versions VALUES (1, 'SECRET_SCHEMA_FUTURE_SHOULD_NOT_LEAK', 'fixture'); DROP TABLE config_kv",
+    );
+    let data = doctor_data(&fixture);
+    assert_eq!(data["classification"], "unsupported_receipt");
+    assert!(!data.to_string().contains(SECRET_VALUE));
+    fixture_sql(
+        &fixture.global_db,
+        "DELETE FROM configuration_schema_versions; INSERT INTO configuration_schema_versions VALUES (2026090601, 'configuration_base', 'fixture')",
+    );
+    // Schema-only fixture: there is no value table to query or vault to open.
+    assert_eq!(doctor_data(&fixture)["classification"], "compatible");
+}
+
 fn fixture_sql(path: &Path, sql: &str) {
     tokio::runtime::Runtime::new()
         .expect("fixture runtime")
