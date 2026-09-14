@@ -2708,6 +2708,7 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     // central parse seam prevents a new surface from bypassing classification.
     let operation_class = operation_class_for_command(&args.command);
     let use_central_operation_boundary = !command_has_existing_operation_boundary(&args.command);
+    let is_stash_pop = matches!(&args.command, Commands::Stash(Stash::Pop { .. }));
     // Read-only commands must not charge their census diagnostic to the
     // active logfile; `logfile info` reports rolled-file sizes exactly.
     if !matches!(
@@ -2906,7 +2907,12 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     // rather than twenty call sites drifting apart.
     let control_boundary = match sequencer_control_for(&args.command).await {
         Some(control) => {
-            crate::internal::sequencer::begin_control_operation(control, &utf8_argv).await?
+            crate::internal::sequencer::begin_control_operation(
+                control,
+                &utf8_argv,
+                use_central_operation_boundary,
+            )
+            .await?
         }
         None => None,
     };
@@ -3184,12 +3190,16 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
         )
         && use_central_operation_boundary
     {
-        let command_name = utf8_argv
-            .iter()
-            .skip(1)
-            .find(|argument| !argument.starts_with('-'))
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string());
+        let command_name = if is_stash_pop {
+            "stash pop".to_string()
+        } else {
+            utf8_argv
+                .iter()
+                .skip(1)
+                .find(|argument| !argument.starts_with('-'))
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string())
+        };
         let meta = crate::internal::operation::OperationMetaV2 {
             command_name: Some(command_name),
             description: Some("CLI mutation".to_string()),
@@ -3214,7 +3224,13 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     } else {
         match control_operation_id {
             Some(operation_id) => {
-                crate::internal::operation::with_operation_id(operation_id, command_future).await
+                let future =
+                    crate::internal::operation::with_operation_id(operation_id, command_future);
+                if let Some(boundary) = control_boundary.as_ref() {
+                    boundary.run_with_repository_ref_lease(future).await
+                } else {
+                    future.await
+                }
             }
             None => command_future.await,
         }

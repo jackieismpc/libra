@@ -2267,8 +2267,9 @@ enum AddCheckout {
 /// order matches ordinary repository mutations and restore.
 async fn acquire_worktree_ref_lease()
 -> WorktreeResult<crate::internal::operation::middleware::ScopeLease> {
-    let scope =
-        crate::internal::worktree_scope::WorktreeScope::request_scope().ok_or_else(|| {
+    let scope = crate::internal::worktree_scope::WorktreeScope::request_scope()
+        .or_else(|| crate::internal::worktree_scope::RequestScope::resolve(util::cur_dir()))
+        .ok_or_else(|| {
             WorktreeError::OperationBlocked(
                 "cannot acquire repository ref lease outside a pinned worktree".to_string(),
             )

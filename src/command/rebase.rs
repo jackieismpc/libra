@@ -2365,8 +2365,15 @@ async fn run_sandboxed_rebase_exec(
         use_linux_sandbox_bwrap: true,
         ..Default::default()
     };
+    // Rebase --exec may invoke Libra again inside this operation. Its parent
+    // still owns the repository ref lease, so descendants inherit this marker
+    // and avoid waiting on the lease held by their own parent.
+    let command = format!(
+        "export {}=1; {command}",
+        crate::internal::operation::middleware::REPOSITORY_REF_LEASE_HELD_ENV,
+    );
     run_shell_command(
-        command,
+        &command,
         &cwd,
         Some(15 * 60 * 1000),
         1024 * 1024,

@@ -18,8 +18,11 @@ use serde_json::json;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub(crate) const REPOSITORY_REF_LEASE_HELD_ENV: &str = "LIBRA_INTERNAL_REPOSITORY_REF_LEASE_HELD";
+
 tokio::task_local! {
     static CURRENT_OPERATION_ID: String;
+    static CURRENT_REPOSITORY_REF_LEASE: ();
 }
 
 /// Return the operation id active for the current async command.
@@ -33,6 +36,15 @@ pub(crate) async fn with_operation_id<T>(
     future: impl Future<Output = T>,
 ) -> T {
     CURRENT_OPERATION_ID.scope(operation_id, future).await
+}
+
+pub(crate) fn repository_ref_lease_is_held() -> bool {
+    CURRENT_REPOSITORY_REF_LEASE.try_with(|_| ()).is_ok()
+        || std::env::var_os(REPOSITORY_REF_LEASE_HELD_ENV).is_some_and(|value| value == "1")
+}
+
+pub(crate) async fn with_repository_ref_lease<T>(future: impl Future<Output = T>) -> T {
+    CURRENT_REPOSITORY_REF_LEASE.scope((), future).await
 }
 
 mod lease;
@@ -145,16 +157,24 @@ pub(crate) fn command_may_mutate_shared_refs(command_name: &str) -> bool {
 }
 
 fn operation_needs_repository_lease(meta: &OperationMetaV2, class: MutationClass) -> bool {
-    class == MutationClass::ExternalOrUnknown
-        || meta.command_name.as_deref().map_or_else(
-            || {
-                matches!(
-                    class,
-                    MutationClass::RepoMutation | MutationClass::SequencerMutation
-                )
-            },
-            command_may_mutate_shared_refs,
-        )
+    if class == MutationClass::ExternalOrUnknown {
+        return true;
+    }
+    let Some(command_name) = meta.command_name.as_deref() else {
+        return matches!(
+            class,
+            MutationClass::RepoMutation | MutationClass::SequencerMutation
+        );
+    };
+    let mut parts = command_name.split_ascii_whitespace();
+    if parts.next() == Some("stash") && parts.next() == Some("pop") {
+        // The stash entry is applied before its raw-line CAS. That critical
+        // section takes the repository lease after the pop rendezvous, so two
+        // worktrees can both apply and exactly one can win the shared-stack
+        // delete.
+        return false;
+    }
+    command_may_mutate_shared_refs(command_name)
 }
 
 #[derive(Debug, Error)]
@@ -380,11 +400,12 @@ where
     // Repository-wide ref transitions take the common lease before the
     // worktree lease, matching restore's lock order. Worktree-only edits keep
     // their existing concurrency across linked worktrees.
-    let _repository_lease = if operation_needs_repository_lease(&meta, class) {
-        Some(ScopeLease::acquire_repository(scope, &repo_id, shared_repository_value).await?)
-    } else {
-        None
-    };
+    let _repository_lease =
+        if operation_needs_repository_lease(&meta, class) && !repository_ref_lease_is_held() {
+            Some(ScopeLease::acquire_repository(scope, &repo_id, shared_repository_value).await?)
+        } else {
+            None
+        };
     let lease_permissions = LeaseFilePermissions::from_shared_repository(
         shared_repository.as_ref().map(|entry| entry.value.as_str()),
     )?;
@@ -432,7 +453,14 @@ where
                 .to_string(),
         ));
     }
-    let pre_refs = capture_reference_state(&db).await?;
+    let pre_refs = capture_reference_state_with_repository_lease(
+        &db,
+        scope,
+        &repo_id,
+        shared_repository_value,
+        _repository_lease.is_some(),
+    )
+    .await?;
 
     // The pointer records the last captured workspace, so a changed disk
     // state on entry is an external mutation that must become its own DAG
@@ -581,7 +609,13 @@ where
         now_millis(),
     )
     .await?;
-    let value = match with_operation_id(txn.op_id.clone(), f(&mut txn)).await {
+    let operation_future = with_operation_id(txn.op_id.clone(), f(&mut txn));
+    let operation_result = if _repository_lease.is_some() {
+        with_repository_ref_lease(operation_future).await
+    } else {
+        operation_future.await
+    };
+    let value = match operation_result {
         Ok(value) => value,
         Err(error) => {
             persist_failed_operation(
@@ -640,7 +674,14 @@ where
         .await?;
         return Err(OperationError::ExternalUnverified);
     }
-    let post_refs = capture_reference_state(&db).await?;
+    let post_refs = capture_reference_state_with_repository_lease(
+        &db,
+        scope,
+        &repo_id,
+        shared_repository_value,
+        _repository_lease.is_some(),
+    )
+    .await?;
     let full_view_is_unchanged = pre.snapshot.completeness == Completeness::Full
         && post.snapshot.completeness == Completeness::Full
         && pre.content_oid == post.content_oid
@@ -835,6 +876,21 @@ async fn capture_reference_state(
     Ok(serde_json::Value::Array(references))
 }
 
+async fn capture_reference_state_with_repository_lease(
+    db: &DatabaseConnection,
+    scope: &PinnedRequestScope,
+    repo_id: &str,
+    shared_repository: Option<&str>,
+    lease_already_held: bool,
+) -> Result<serde_json::Value, OperationError> {
+    let _read_lease = if lease_already_held || repository_ref_lease_is_held() {
+        None
+    } else {
+        Some(ScopeLease::acquire_repository_wait(scope, repo_id, shared_repository).await?)
+    };
+    capture_reference_state(db).await
+}
+
 async fn append_journal(
     store: &OperationStoreV2,
     operation_id: &str,
@@ -936,6 +992,27 @@ mod tests {
             );
         }
         assert!(!command_may_mutate_shared_refs("op log"));
+    }
+
+    #[test]
+    fn stash_pop_defers_the_repository_ref_fence_until_its_stack_cas() {
+        let pop = OperationMetaV2 {
+            command_name: Some("stash pop".to_string()),
+            ..OperationMetaV2::default()
+        };
+        assert!(!operation_needs_repository_lease(
+            &pop,
+            MutationClass::RepoMutation
+        ));
+
+        let push = OperationMetaV2 {
+            command_name: Some("stash".to_string()),
+            ..OperationMetaV2::default()
+        };
+        assert!(operation_needs_repository_lease(
+            &push,
+            MutationClass::RepoMutation
+        ));
     }
 
     #[tokio::test]
