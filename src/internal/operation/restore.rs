@@ -37,6 +37,7 @@ use super::{
 };
 use crate::{
     internal::{
+        config::ConfigKv,
         head::Head,
         operation::{PointerError, facets::registry_for_scope},
         worktree_scope::WorktreeScope,
@@ -119,6 +120,20 @@ struct DryRunSnapshot {
     snapshot: WorkspaceSnapshotV2,
     storage: ClientStorage,
     _scratch: tempfile::TempDir,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RestoreInstallEntry {
+    path: String,
+    object_oid: String,
+    mode: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RestoreTransactionManifest {
+    schema_version: u8,
+    backup_paths: Vec<String>,
+    install_entries: Vec<RestoreInstallEntry>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -362,11 +377,31 @@ impl RestoreEngine {
         // writers, while the lease prevents cooperative writers from editing
         // the worktree between the freshness check and the filesystem swap.
         let _scope_guard = WorktreeScope::pin_request_scope(self.scope.workdir.clone());
-        let _repo_lease = if confirm_repo_wide && what == RestoreWhat::All {
-            Some(
-                ScopeLease::acquire_repository(&self.scope, &self.repo_id)
+        // Restoring HEAD can update a shared branch tip even when the caller
+        // restores only the current worktree's facets. Serialize every such
+        // transition against ref writers in all linked worktrees.
+        let _repo_lease = if matches!(what, RestoreWhat::All | RestoreWhat::Head) {
+            let shared_repository =
+                ConfigKv::get_with_conn(self.store.db(), "core.sharedRepository")
                     .await
-                    .map_err(|error| RestoreError::Storage(error.to_string()))?,
+                    .map_err(|error| RestoreError::Storage(error.to_string()))?;
+            if shared_repository
+                .as_ref()
+                .is_some_and(|entry| entry.encrypted)
+            {
+                return Err(RestoreError::Storage(
+                    "core.sharedRepository must be plaintext before acquiring the repository ref lease"
+                        .to_string(),
+                ));
+            }
+            Some(
+                ScopeLease::acquire_repository(
+                    &self.scope,
+                    &self.repo_id,
+                    shared_repository.as_ref().map(|entry| entry.value.as_str()),
+                )
+                .await
+                .map_err(|error| RestoreError::Storage(error.to_string()))?,
             )
         } else {
             None
@@ -468,21 +503,30 @@ impl RestoreEngine {
             return Err(self.mark_failed(&op_id, error).await);
         }
 
-        let apply_result = async {
-            self.apply_snapshot(&snapshot, what, confirm_repo_wide)
-                .await?;
-            if restore_refs {
-                self.restore_references(&view).await?;
-            }
-            Ok::<(), RestoreError>(())
-        }
-        .await;
-        if let Err(error) = apply_result {
+        if let Err(error) = self
+            .apply_snapshot(&snapshot, &current.snapshot, &view, what, confirm_repo_wide)
+            .await
+        {
+            // apply_snapshot rolls its own working-copy swap back on error;
+            // later facet failures occur before the working-copy step.
             return Err(self
                 .fail_and_rollback(
                     &op_id,
                     current.view_oid,
                     &current.snapshot,
+                    &current.snapshot,
+                    restore_refs,
+                    error,
+                )
+                .await);
+        }
+        if restore_refs && let Err(error) = self.restore_references(&view).await {
+            return Err(self
+                .fail_and_rollback(
+                    &op_id,
+                    current.view_oid,
+                    &current.snapshot,
+                    &snapshot,
                     restore_refs,
                     error,
                 )
@@ -496,6 +540,7 @@ impl RestoreEngine {
                         &op_id,
                         current.view_oid,
                         &current.snapshot,
+                        &snapshot,
                         restore_refs,
                         error,
                     )
@@ -510,6 +555,7 @@ impl RestoreEngine {
                         &op_id,
                         current.view_oid,
                         &current.snapshot,
+                        &snapshot,
                         restore_refs,
                         RestoreError::Storage(error.to_string()),
                     )
@@ -531,6 +577,7 @@ impl RestoreEngine {
                         &op_id,
                         current.view_oid,
                         &current.snapshot,
+                        &snapshot,
                         restore_refs,
                         RestoreError::Storage(error.to_string()),
                     )
@@ -548,6 +595,7 @@ impl RestoreEngine {
                     &op_id,
                     current.view_oid,
                     &current.snapshot,
+                    &snapshot,
                     restore_refs,
                     RestoreError::Storage(error.to_string()),
                 )
@@ -569,6 +617,7 @@ impl RestoreEngine {
                     &op_id,
                     current.view_oid,
                     &current.snapshot,
+                    &snapshot,
                     restore_refs,
                     error,
                 )
@@ -613,6 +662,7 @@ impl RestoreEngine {
                     &op_id,
                     current.view_oid,
                     &current.snapshot,
+                    &snapshot,
                     &current.pointer,
                     &scope_key,
                     new_generation,
@@ -631,6 +681,7 @@ impl RestoreEngine {
                     &op_id,
                     current.view_oid,
                     &current.snapshot,
+                    &snapshot,
                     &current.pointer,
                     &scope_key,
                     new_generation,
@@ -650,6 +701,7 @@ impl RestoreEngine {
                     &op_id,
                     current.view_oid,
                     &current.snapshot,
+                    &snapshot,
                     &current.pointer,
                     &scope_key,
                     new_generation,
@@ -774,16 +826,21 @@ impl RestoreEngine {
         op_id: &str,
         pre_view_oid: ObjectHash,
         snapshot: &WorkspaceSnapshotV2,
+        current_snapshot: &WorkspaceSnapshotV2,
         restore_refs: bool,
         error: RestoreError,
     ) -> RestoreError {
-        let mut rollback = self
-            .apply_snapshot(snapshot, RestoreWhat::All, true)
-            .await
-            .err();
+        let pre_view = self.store.load_view(&pre_view_oid);
+        let mut rollback = match &pre_view {
+            Ok(view) => self
+                .apply_snapshot(snapshot, current_snapshot, view, RestoreWhat::All, true)
+                .await
+                .err(),
+            Err(error) => Some(RestoreError::Storage(error.to_string())),
+        };
         if rollback.is_none() && restore_refs {
-            rollback = match self.store.load_view(&pre_view_oid) {
-                Ok(view) => self.restore_references(&view).await.err(),
+            rollback = match &pre_view {
+                Ok(view) => self.restore_references(view).await.err(),
                 Err(error) => Some(RestoreError::Storage(error.to_string())),
             };
         }
@@ -821,6 +878,7 @@ impl RestoreEngine {
         op_id: &str,
         pre_view_oid: ObjectHash,
         snapshot: &WorkspaceSnapshotV2,
+        current_snapshot: &WorkspaceSnapshotV2,
         pointer: &WorkspaceStatePointer,
         scope_key: &str,
         generation: u64,
@@ -828,13 +886,17 @@ impl RestoreEngine {
         restore_refs: bool,
         error: RestoreError,
     ) -> RestoreError {
-        let mut filesystem = self
-            .apply_snapshot(snapshot, RestoreWhat::All, true)
-            .await
-            .err();
+        let pre_view = self.store.load_view(&pre_view_oid);
+        let mut filesystem = match &pre_view {
+            Ok(view) => self
+                .apply_snapshot(snapshot, current_snapshot, view, RestoreWhat::All, true)
+                .await
+                .err(),
+            Err(error) => Some(RestoreError::Storage(error.to_string())),
+        };
         if filesystem.is_none() && restore_refs {
-            filesystem = match self.store.load_view(&pre_view_oid) {
-                Ok(view) => self.restore_references(&view).await.err(),
+            filesystem = match &pre_view {
+                Ok(view) => self.restore_references(view).await.err(),
                 Err(error) => Some(RestoreError::Storage(error.to_string())),
             };
         }
@@ -860,6 +922,127 @@ impl RestoreEngine {
                 "{error}; published rollback failed: filesystem={filesystem:?}, heads={heads:?}, pointer={pointer_restore:?}, status={status:?}"
             )),
         }
+    }
+
+    async fn restore_symbolic_head_branch_tip(
+        &self,
+        view: &RepoViewV2,
+        snapshot: &WorkspaceSnapshotV2,
+    ) -> Result<(), RestoreError> {
+        let HeadState::Symbolic { reference } = &snapshot.head else {
+            return Ok(());
+        };
+        let branch = reference.strip_prefix("refs/heads/").ok_or_else(|| {
+            RestoreError::Storage(format!(
+                "cannot restore symbolic HEAD reference {reference:?} as a local branch"
+            ))
+        })?;
+        if branch.is_empty() {
+            return Err(RestoreError::Storage(
+                "cannot restore symbolic HEAD with an empty branch name".to_string(),
+            ));
+        }
+        let bytes = self
+            .store
+            .load_object(&view.refs_facet_oid)
+            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        let references = value
+            .get("references")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                RestoreError::Storage("refs facet has no references array".to_string())
+            })?;
+        let branch_rows = references
+            .iter()
+            .filter(|entry| {
+                entry.get("kind").and_then(serde_json::Value::as_str) == Some("Branch")
+                    && entry.get("name").and_then(serde_json::Value::as_str) == Some(branch)
+                    && entry.get("remote").is_none_or(serde_json::Value::is_null)
+            })
+            .collect::<Vec<_>>();
+        if branch_rows.len() != 1 {
+            return Err(RestoreError::Storage(format!(
+                "target refs facet must contain exactly one local branch ref for {branch:?}"
+            )));
+        }
+        let commit = branch_rows[0]
+            .get("commit")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                RestoreError::Storage(format!(
+                    "target refs facet has no commit for branch {branch:?}"
+                ))
+            })?;
+        let commit_oid = ObjectHash::from_str(commit).map_err(|error| {
+            RestoreError::Storage(format!("invalid branch commit oid: {error}"))
+        })?;
+        self.store
+            .load_object(&commit_oid)
+            .map_err(|error| RestoreError::Object {
+                oid: commit_oid,
+                detail: error.to_string(),
+            })?;
+        if !self.store.is_object_type(&commit_oid, ObjectType::Commit) {
+            return Err(RestoreError::Object {
+                oid: commit_oid,
+                detail: "target branch ref does not reference a commit object".to_string(),
+            });
+        }
+
+        let txn = self
+            .store
+            .db()
+            .begin()
+            .await
+            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        if let Some(other_worktree) =
+            Head::branch_checked_out_elsewhere_result_with_conn(&txn, branch)
+                .await
+                .map_err(|error| RestoreError::Storage(error.to_string()))?
+        {
+            return Err(RestoreError::Storage(format!(
+                "cannot restore branch {branch:?}: it is checked out in worktree {other_worktree:?}"
+            )));
+        }
+        let rows = txn
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT id FROM reference WHERE kind = 'Branch' AND name = ? AND remote IS NULL",
+                [branch.into()],
+            ))
+            .await
+            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        if rows.len() > 1 {
+            return Err(RestoreError::Storage(format!(
+                "cannot restore ambiguous duplicate branch refs for {branch:?}"
+            )));
+        }
+        if let Some(row) = rows.first() {
+            let id = row
+                .try_get_by_index::<i64>(0)
+                .map_err(|error| RestoreError::Storage(error.to_string()))?;
+            txn.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                r#"UPDATE reference SET "commit" = ? WHERE id = ?"#,
+                [commit_oid.to_string().into(), id.into()],
+            ))
+            .await
+            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        } else {
+            txn.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                r#"INSERT INTO reference (name, kind, "commit", remote, worktree_id) VALUES (?, 'Branch', ?, NULL, NULL)"#,
+                [branch.into(), commit_oid.to_string().into()],
+            ))
+            .await
+            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        }
+        txn.commit()
+            .await
+            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        Ok(())
     }
 
     async fn restore_references(&self, view: &RepoViewV2) -> Result<(), RestoreError> {
@@ -1038,6 +1221,10 @@ impl RestoreEngine {
         &self,
         scope_key: &str,
     ) -> Result<(), RestoreError> {
+        // First settle any filesystem swap that was interrupted below the
+        // operation journal. The operation rollback then compares the saved
+        // pre-view with the actual on-disk snapshot after this recovery.
+        recover_restore_transactions(&self.scope.worktree_root)?;
         let operations = self
             .store
             .list_operations()
@@ -1108,6 +1295,12 @@ impl RestoreEngine {
                 .read_heads_view(&self.repo_id, scope_key)
                 .await
                 .map_err(|error| RestoreError::Storage(error.to_string()))?;
+            let generation = self
+                .store
+                .read_head_generation(&self.repo_id, scope_key)
+                .await
+                .map_err(|error| RestoreError::Storage(error.to_string()))?;
+            let current = self.capture_current_state(generation).await?;
             let published = journal.phase == JournalPhase::Publish
                 || heads.head_ids() == vec![operation.op_id.clone()];
             if published {
@@ -1121,11 +1314,6 @@ impl RestoreEngine {
                         )
                         .await);
                 }
-                let generation = self
-                    .store
-                    .read_head_generation(&self.repo_id, scope_key)
-                    .await
-                    .map_err(|error| RestoreError::Storage(error.to_string()))?;
                 let mut pointer = WorkspaceStatePointer::new(
                     operation
                         .parent_op_ids
@@ -1141,6 +1329,7 @@ impl RestoreEngine {
                         &operation.op_id,
                         operation.pre_view_oid,
                         &snapshot,
+                        &current.snapshot,
                         &pointer,
                         scope_key,
                         generation,
@@ -1157,6 +1346,7 @@ impl RestoreEngine {
                         &operation.op_id,
                         operation.pre_view_oid,
                         &snapshot,
+                        &current.snapshot,
                         restore_refs,
                         RestoreError::Storage("recovered interrupted restore".to_string()),
                     )
@@ -1200,20 +1390,15 @@ impl RestoreEngine {
     async fn apply_snapshot(
         &self,
         snapshot: &WorkspaceSnapshotV2,
+        current_snapshot: &WorkspaceSnapshotV2,
+        target_view: &RepoViewV2,
         what: RestoreWhat,
         confirm_repo_wide: bool,
     ) -> Result<(), RestoreError> {
         let _scope_guard = WorktreeScope::pin_request_scope(self.scope.workdir.clone());
         let storage = ClientStorage::init_local(self.scope.storage.join("objects"));
         let names = selected_facets(what);
-        if names.contains(&FacetName::from("working_copy")) {
-            restore_working_copy(
-                &storage,
-                &snapshot.working_copy_tree_oid,
-                &self.scope.worktree_root,
-            )?;
-        }
-        let registry = registry_for_scope(self.scope.clone(), storage)
+        let registry = registry_for_scope(self.scope.clone(), storage.clone())
             .map_err(|error| RestoreError::Facet(error.to_string()))?;
         let mut ctx = FacetRestoreCtx {
             repo_id: Some(self.repo_id.clone()),
@@ -1256,6 +1441,18 @@ impl RestoreEngine {
             Head::update_result_with_conn(self.store.db(), head, None)
                 .await
                 .map_err(|error| RestoreError::Storage(error.to_string()))?;
+            self.restore_symbolic_head_branch_tip(target_view, snapshot)
+                .await?;
+        }
+        if names.contains(&FacetName::from("working_copy")) {
+            restore_working_copy(
+                &storage,
+                &snapshot.working_copy_tree_oid,
+                &current_snapshot.working_copy_tree_oid,
+                &snapshot.index_tree_oid,
+                &current_snapshot.index_tree_oid,
+                &self.scope.worktree_root,
+            )?;
         }
         Ok(())
     }
@@ -1370,6 +1567,19 @@ fn collect_tree_entries<S: RestoreObjectSource>(
     let tree = Tree::from_bytes(&bytes, *tree_oid)
         .map_err(|error| RestoreError::Storage(error.to_string()))?;
     for item in tree.tree_items {
+        if item.name.is_empty()
+            || item.name == "."
+            || item.name == ".."
+            || item.name.contains('/')
+            || item.name.contains('\\')
+            || item.name == ".git"
+            || item.name == ".libra"
+        {
+            return Err(RestoreError::Storage(format!(
+                "invalid restore tree entry name {:?}",
+                item.name
+            )));
+        }
         let path = if prefix.is_empty() {
             item.name.clone()
         } else {
@@ -1401,14 +1611,114 @@ fn collect_manifest_paths<S: RestoreObjectSource>(
 fn restore_working_copy(
     storage: &ClientStorage,
     tree_oid: &ObjectHash,
+    current_tree_oid: &ObjectHash,
+    target_index_tree_oid: &ObjectHash,
+    current_index_tree_oid: &ObjectHash,
     root: &Path,
 ) -> Result<(), RestoreError> {
     recover_restore_transactions(root)?;
-    // Resolve every object before touching the existing worktree.  A missing
-    // blob must be a normal restore error, never a partially destructive
-    // restore.
+    // Resolve all target blobs before touching the worktree. The snapshots are
+    // the authority for managed paths: walking the filesystem here would pull
+    // ignored files, submodules, and nested metadata into the restore set.
     let mut leaves = Vec::new();
     collect_storage_tree(storage, tree_oid, Path::new(""), &mut leaves)?;
+    let current_entries = collect_tree_entries(storage, current_tree_oid, "")?;
+    let target_entries = collect_tree_entries(storage, tree_oid, "")?;
+    let target_gitlinks = collect_tree_entries(storage, target_index_tree_oid, "")?;
+    let current_gitlinks = collect_tree_entries(storage, current_index_tree_oid, "")?;
+    let protected_gitlinks = target_gitlinks
+        .iter()
+        .chain(current_gitlinks.iter())
+        .filter(|(_, (_, mode))| *mode == TreeItemMode::Commit)
+        .map(|(path, _)| path.clone())
+        .collect::<BTreeSet<_>>();
+    let changed = current_entries
+        .keys()
+        .chain(target_entries.keys())
+        .filter(|path| current_entries.get(*path) != target_entries.get(*path))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for path in &changed {
+        if protected_gitlinks.iter().any(|gitlink| {
+            path == gitlink
+                || path
+                    .strip_prefix(gitlink)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        }) {
+            return Err(RestoreError::Storage(format!(
+                "restore would modify path {path} inside or at a submodule boundary"
+            )));
+        }
+    }
+    if changed.is_empty() {
+        return Ok(());
+    }
+
+    let current_managed = current_entries.keys().cloned().collect::<BTreeSet<_>>();
+    let mut backup_paths = Vec::new();
+    for path in &changed {
+        if target_entries.contains_key(path) && !current_managed.contains(path) {
+            let destination = root.join(path);
+            match fs::symlink_metadata(&destination) {
+                Ok(metadata)
+                    if metadata.is_dir()
+                        && !metadata.file_type().is_symlink()
+                        && directory_contains_only_changed_managed_files(
+                            root,
+                            Path::new(path),
+                            &current_managed,
+                            &changed,
+                        )? => {}
+                Ok(_) => {
+                    return Err(RestoreError::Storage(format!(
+                        "restore would overwrite unmanaged worktree path {}",
+                        destination.display()
+                    )));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(RestoreError::Io(error)),
+            }
+        }
+        if !current_managed.contains(path) {
+            continue;
+        }
+        let source = root.join(path);
+        match fs::symlink_metadata(&source) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                return Err(RestoreError::Storage(format!(
+                    "managed worktree path {} is a directory; refusing to replace it",
+                    source.display()
+                )));
+            }
+            Ok(_) => backup_paths.push(path.clone()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(RestoreError::Io(error)),
+        }
+    }
+    for path in changed
+        .iter()
+        .filter(|path| target_entries.contains_key(*path))
+    {
+        validate_restore_parent_paths(root, Path::new(path), &current_managed, &changed)?;
+    }
+
+    let install_entries = changed
+        .iter()
+        .filter_map(|path| {
+            target_entries
+                .get(path)
+                .map(|(oid, mode)| RestoreInstallEntry {
+                    path: path.clone(),
+                    object_oid: oid.to_string(),
+                    mode: format!("{mode:?}"),
+                })
+        })
+        .collect::<Vec<_>>();
+    let manifest = RestoreTransactionManifest {
+        schema_version: 1,
+        backup_paths: backup_paths.clone(),
+        install_entries: install_entries.clone(),
+    };
     let transaction_root = root
         .join(".libra")
         .join(format!("operation-restore-{}", Uuid::now_v7()));
@@ -1416,11 +1726,17 @@ fn restore_working_copy(
     let backup = transaction_root.join("backup");
     fs::create_dir_all(&stage)?;
     fs::create_dir_all(&backup)?;
+    write_restore_manifest(&transaction_root, &manifest)?;
+    write_restore_phase_marker(&transaction_root, "staging")?;
 
-    let mut moved_current = Vec::new();
-    let mut installed = Vec::new();
     let result = (|| {
         for (path, mode, bytes) in &leaves {
+            let path = path
+                .to_str()
+                .ok_or_else(|| io::Error::other("restore path is not valid UTF-8"))?;
+            if !changed.contains(path) {
+                continue;
+            }
             let destination = stage.join(path);
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent)?;
@@ -1428,60 +1744,146 @@ fn restore_working_copy(
             write_restore_leaf(&destination, *mode, bytes)?;
         }
 
-        let mut entries = fs::read_dir(root)?
-            .map(|entry| entry.map(|entry| (entry.file_name(), entry.path())))
-            .collect::<Result<Vec<_>, io::Error>>()?;
-        entries.sort_by(|left, right| left.0.cmp(&right.0));
-        for (name, path) in entries {
-            if is_private_worktree_entry(&name) {
-                continue;
+        write_restore_phase_marker(&transaction_root, "backing-up")?;
+        for path in &backup_paths {
+            let source = root.join(path);
+            let destination = backup.join(path);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
             }
-            fs::rename(&path, backup.join(&name))?;
-            moved_current.push(name);
+            fs::rename(&source, &destination)?;
+            prune_empty_parent_dirs(root, Path::new(path))?;
         }
 
-        let install_result = (|| {
-            let mut staged_entries = fs::read_dir(&stage)?
-                .map(|entry| entry.map(|entry| (entry.file_name(), entry.path())))
-                .collect::<Result<Vec<_>, io::Error>>()?;
-            staged_entries.sort_by(|left, right| left.0.cmp(&right.0));
-            let manifest = staged_entries
-                .iter()
-                .map(|(name, _)| name.to_string_lossy().into_owned())
-                .collect::<Vec<_>>();
-            fs::write(
-                transaction_root.join("manifest.json"),
-                serde_json::to_vec(&manifest).map_err(io::Error::other)?,
-            )?;
-            for (name, path) in staged_entries {
-                fs::rename(&path, root.join(&name))?;
-                installed.push(name);
+        write_restore_phase_marker(&transaction_root, "installing")?;
+        for entry in &install_entries {
+            let source = stage.join(&entry.path);
+            let destination = root.join(&entry.path);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
             }
-            Ok::<(), io::Error>(())
-        })();
-        install_result?;
+            fs::rename(&source, &destination)?;
+        }
+        write_restore_phase_marker(&transaction_root, "committed")?;
         Ok::<(), io::Error>(())
     })();
 
     match result {
         Ok(()) => fs::remove_dir_all(&transaction_root).map_err(RestoreError::Io),
-        Err(primary) => {
-            let cleanup = remove_named_entries(root, &installed)
-                .and_then(|()| restore_named_entries(&backup, root, &moved_current))
-                .and_then(|()| fs::remove_dir_all(&transaction_root));
-            match cleanup {
-                Ok(()) => Err(RestoreError::Io(primary)),
-                Err(rollback) => Err(RestoreError::Storage(format!(
-                    "working-copy restore failed: {primary}; rollback failed: {rollback}"
-                ))),
-            }
-        }
+        Err(primary) => match rollback_restore_transaction(root, &transaction_root, &manifest) {
+            Ok(()) => Err(RestoreError::Io(primary)),
+            Err(rollback) => Err(RestoreError::Storage(format!(
+                "working-copy restore failed: {primary}; rollback failed: {rollback}"
+            ))),
+        },
     }
 }
 
-/// Recover a worktree swap left behind by a process interruption.  The swap
-/// only moves top-level entries into a private backup directory, so the
-/// recovery can restore the pre-swap names without guessing file contents.
+/// Return true only when replacing this directory can preserve every opaque
+/// entry. Existing files must all be snapshot-managed entries that the restore
+/// will move to its transaction backup. Empty directories and special files
+/// remain untouched by refusing the replacement.
+fn directory_contains_only_changed_managed_files(
+    root: &Path,
+    relative: &Path,
+    current_managed: &BTreeSet<String>,
+    changed: &BTreeSet<String>,
+) -> Result<bool, RestoreError> {
+    let directory = root.join(relative);
+    let mut found_entry = false;
+    for entry in fs::read_dir(&directory)? {
+        let entry = entry?;
+        found_entry = true;
+        let child_relative = relative.join(entry.file_name());
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            if !directory_contains_only_changed_managed_files(
+                root,
+                &child_relative,
+                current_managed,
+                changed,
+            )? {
+                return Ok(false);
+            }
+            continue;
+        }
+        if !(metadata.is_file() || metadata.file_type().is_symlink()) {
+            return Ok(false);
+        }
+        let key = child_relative.to_string_lossy();
+        if !current_managed.contains(key.as_ref()) || !changed.contains(key.as_ref()) {
+            return Ok(false);
+        }
+    }
+    Ok(found_entry)
+}
+
+fn validate_restore_parent_paths(
+    root: &Path,
+    path: &Path,
+    current_managed: &BTreeSet<String>,
+    changed: &BTreeSet<String>,
+) -> Result<(), RestoreError> {
+    let mut parent = PathBuf::new();
+    let components = path.components().collect::<Vec<_>>();
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        parent.push(component.as_os_str());
+        let full_path = root.join(&parent);
+        match fs::symlink_metadata(&full_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let key = parent.to_string_lossy();
+                if !current_managed.contains(key.as_ref()) || !changed.contains(key.as_ref()) {
+                    return Err(RestoreError::Storage(format!(
+                        "restore target passes through unmanaged symlink {}",
+                        full_path.display()
+                    )));
+                }
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                let key = parent.to_string_lossy();
+                if !current_managed.contains(key.as_ref()) || !changed.contains(key.as_ref()) {
+                    return Err(RestoreError::Storage(format!(
+                        "restore target passes through unmanaged file {}",
+                        full_path.display()
+                    )));
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(RestoreError::Io(error)),
+        }
+    }
+    Ok(())
+}
+
+fn write_restore_manifest(
+    transaction_root: &Path,
+    manifest: &RestoreTransactionManifest,
+) -> Result<(), io::Error> {
+    let bytes = serde_json::to_vec(manifest).map_err(io::Error::other)?;
+    let temporary = transaction_root.join("manifest.json.tmp");
+    fs::write(&temporary, bytes)?;
+    fs::rename(temporary, transaction_root.join("manifest.json"))
+}
+
+fn write_restore_phase_marker(transaction_root: &Path, phase: &str) -> Result<(), io::Error> {
+    let path = transaction_root.join(format!("phase-{phase}"));
+    if path.exists() {
+        return Ok(());
+    }
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    fs::File::open(transaction_root)?.sync_all()?;
+    Ok(())
+}
+
+/// Recover a worktree swap left behind by a process interruption. Transaction
+/// phases are immutable marker files, so a crash cannot leave a partially
+/// overwritten journal that would make a second recovery delete restored data.
 pub fn recover_restore_transactions(root: &Path) -> Result<usize, RestoreError> {
     let metadata_root = root.join(".libra");
     let mut recovered = 0;
@@ -1498,35 +1900,243 @@ pub fn recover_restore_transactions(root: &Path) -> Result<usize, RestoreError> 
             continue;
         }
         let transaction_root = entry.path();
-        let backup = transaction_root.join("backup");
-        let stage = transaction_root.join("stage");
-        let mut names = Vec::new();
-        for directory in [&backup, &stage] {
-            if let Ok(items) = fs::read_dir(directory) {
-                for item in items {
-                    names.push(item?.file_name());
-                }
-            }
-        }
         let manifest_path = transaction_root.join("manifest.json");
-        if let Ok(bytes) = fs::read(manifest_path) {
-            // The manifest is written before any staged entry is installed.
-            // If a crash leaves it truncated, the backup/stage directory scan
-            // above still contains the complete set needed for recovery.
-            if let Ok(manifest) = serde_json::from_slice::<Vec<String>>(&bytes) {
-                names.extend(manifest.into_iter().map(std::ffi::OsString::from));
+        if !manifest_path.exists() {
+            // No worktree path is moved before the manifest and backing-up
+            // marker are durable. An incomplete staging directory is disposable.
+            if transaction_root.join("phase-backing-up").exists()
+                || transaction_root.join("phase-installing").exists()
+            {
+                return Err(RestoreError::Storage(format!(
+                    "restore transaction {} has progress markers but no manifest",
+                    transaction_root.display()
+                )));
             }
+            fs::remove_dir_all(transaction_root)?;
+            recovered += 1;
+            continue;
         }
-        names.sort();
-        names.dedup();
-        remove_named_entries(root, &names)?;
-        if backup.is_dir() {
-            restore_named_entries(&backup, root, &names)?;
-        }
-        fs::remove_dir_all(transaction_root)?;
+        let bytes = fs::read(&manifest_path)?;
+        let manifest: RestoreTransactionManifest =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                RestoreError::Storage(format!(
+                    "invalid restore transaction manifest {}: {error}",
+                    manifest_path.display()
+                ))
+            })?;
+        validate_restore_manifest(&manifest)?;
+        rollback_restore_transaction(root, &transaction_root, &manifest)?;
         recovered += 1;
     }
     Ok(recovered)
+}
+
+fn validate_restore_manifest(manifest: &RestoreTransactionManifest) -> Result<(), RestoreError> {
+    if manifest.schema_version != 1 {
+        return Err(RestoreError::Storage(format!(
+            "unsupported restore transaction schema {}",
+            manifest.schema_version
+        )));
+    }
+    let mut backup_paths = BTreeSet::new();
+    for path in &manifest.backup_paths {
+        safe_restore_relative_path(Path::new(path))
+            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        if !backup_paths.insert(path) {
+            return Err(RestoreError::Storage(format!(
+                "duplicate restore backup path {path}"
+            )));
+        }
+    }
+    let mut install_paths = BTreeSet::new();
+    for entry in &manifest.install_entries {
+        safe_restore_relative_path(Path::new(&entry.path))
+            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        if !install_paths.insert(&entry.path) {
+            return Err(RestoreError::Storage(format!(
+                "duplicate restore install path {}",
+                entry.path
+            )));
+        }
+        if ObjectHash::from_str(&entry.object_oid).is_err() {
+            return Err(RestoreError::Storage(format!(
+                "invalid object id in restore manifest for {}",
+                entry.path
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn rollback_restore_transaction(
+    root: &Path,
+    transaction_root: &Path,
+    manifest: &RestoreTransactionManifest,
+) -> Result<(), RestoreError> {
+    let backup = transaction_root.join("backup");
+    let phase_installing = transaction_root.join("phase-installing").exists();
+    let phase_committed = transaction_root.join("phase-committed").exists();
+    if phase_committed {
+        fs::remove_dir_all(transaction_root)?;
+        return Ok(());
+    }
+
+    let backup_paths = manifest.backup_paths.iter().collect::<BTreeSet<_>>();
+    if phase_installing {
+        for entry in &manifest.install_entries {
+            let relative = safe_restore_relative_path(Path::new(&entry.path))
+                .map_err(|error| RestoreError::Storage(error.to_string()))?;
+            let backup_path = backup.join(&relative);
+            let backup_exists = fs::symlink_metadata(&backup_path).is_ok();
+            if backup_paths.contains(&entry.path) && !backup_exists {
+                // The original was already moved back by a prior recovery.
+                // Its absence from backup is the durable idempotence marker.
+                continue;
+            }
+            remove_installed_entry_if_matches(root, entry)?;
+            if backup_exists {
+                restore_backup_file(&backup, root, &relative)?;
+            }
+        }
+    }
+
+    for path in &manifest.backup_paths {
+        if phase_installing
+            && manifest
+                .install_entries
+                .iter()
+                .any(|entry| entry.path == *path)
+        {
+            continue;
+        }
+        let relative = safe_restore_relative_path(Path::new(path))
+            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        if fs::symlink_metadata(backup.join(&relative)).is_ok() {
+            restore_backup_file(&backup, root, &relative)?;
+        }
+    }
+    fs::remove_dir_all(transaction_root)?;
+    Ok(())
+}
+
+fn remove_installed_entry_if_matches(
+    root: &Path,
+    entry: &RestoreInstallEntry,
+) -> Result<(), RestoreError> {
+    let relative = safe_restore_relative_path(Path::new(&entry.path))
+        .map_err(|error| RestoreError::Storage(error.to_string()))?;
+    let path = root.join(relative);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(RestoreError::Io(error)),
+    };
+    if !restore_install_entry_matches(&path, &metadata, entry)? {
+        return Err(RestoreError::Storage(format!(
+            "restore recovery found a changed worktree path {}; preserving it and its backup",
+            path.display()
+        )));
+    }
+    fs::remove_file(&path)?;
+    prune_empty_parent_dirs(root, Path::new(&entry.path))?;
+    Ok(())
+}
+
+fn restore_install_entry_matches(
+    path: &Path,
+    metadata: &fs::Metadata,
+    entry: &RestoreInstallEntry,
+) -> Result<bool, RestoreError> {
+    if entry.mode == "Link" {
+        if !metadata.file_type().is_symlink() {
+            return Ok(false);
+        }
+        let target = fs::read_link(path)?;
+        let bytes = target.to_string_lossy();
+        return Ok(
+            ObjectHash::from_type_and_data(ObjectType::Blob, bytes.as_bytes()).to_string()
+                == entry.object_oid,
+        );
+    }
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    let bytes = fs::read(path)?;
+    Ok(ObjectHash::from_type_and_data(ObjectType::Blob, &bytes).to_string() == entry.object_oid)
+}
+
+fn restore_backup_file(backup: &Path, root: &Path, relative: &Path) -> Result<(), RestoreError> {
+    let source = backup.join(relative);
+    let metadata = match fs::symlink_metadata(&source) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(RestoreError::Io(error)),
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        return Err(RestoreError::Storage(format!(
+            "restore backup path {} is a directory",
+            source.display()
+        )));
+    }
+    let destination = root.join(relative);
+    match fs::symlink_metadata(&destination) {
+        Ok(_) => {
+            return Err(RestoreError::Storage(format!(
+                "restore recovery will not overwrite existing path {}",
+                destination.display()
+            )));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(RestoreError::Io(error)),
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::rename(source, &destination)?;
+    Ok(())
+}
+
+fn safe_restore_relative_path(path: &Path) -> Result<PathBuf, io::Error> {
+    use std::path::Component;
+
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) if part != ".git" && part != ".libra" => {
+                result.push(part);
+            }
+            _ => {
+                return Err(io::Error::other(format!(
+                    "invalid private restore path {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    if result.as_os_str().is_empty() {
+        return Err(io::Error::other("empty private restore path"));
+    }
+    Ok(result)
+}
+
+fn prune_empty_parent_dirs(root: &Path, path: &Path) -> Result<(), io::Error> {
+    let mut directory = root.join(path).parent().map(Path::to_path_buf);
+    while let Some(current) = directory {
+        if current == root || !current.starts_with(root) {
+            break;
+        }
+        match fs::remove_dir(&current) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(error) => return Err(error),
+        }
+        directory = current.parent().map(Path::to_path_buf);
+    }
+    Ok(())
 }
 
 fn write_restore_leaf(
@@ -1596,41 +2206,6 @@ fn collect_storage_tree(
     Ok(())
 }
 
-fn is_private_worktree_entry(name: &std::ffi::OsStr) -> bool {
-    name == ".libra" || name == ".git"
-}
-
-fn remove_named_entries(root: &Path, names: &[std::ffi::OsString]) -> Result<(), io::Error> {
-    for name in names {
-        let path = root.join(name);
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        if metadata.is_dir() && !metadata.file_type().is_symlink() {
-            fs::remove_dir_all(path)?;
-        } else {
-            fs::remove_file(path)?;
-        }
-    }
-    Ok(())
-}
-
-fn restore_named_entries(
-    backup: &Path,
-    root: &Path,
-    names: &[std::ffi::OsString],
-) -> Result<(), io::Error> {
-    for name in names {
-        let source = backup.join(name);
-        if fs::symlink_metadata(&source).is_ok() {
-            fs::rename(source, root.join(name))?;
-        }
-    }
-    Ok(())
-}
-
 fn workspace_id(scope: &PinnedRequestScope) -> String {
     scope.scope.worktree_id().unwrap_or("main").to_string()
 }
@@ -1654,6 +2229,25 @@ mod tests {
         internal::{db, operation::CapturePolicy},
         utils::client_storage::ClientStorage,
     };
+
+    fn store_test_tree(storage: &ClientStorage, items: Vec<TreeItem>) -> ObjectHash {
+        let tree = Tree::from_tree_items(items).expect("tree");
+        let bytes = tree.to_data().expect("tree bytes");
+        let oid = ObjectHash::from_type_and_data(ObjectType::Tree, &bytes);
+        storage
+            .put(&oid, &bytes, ObjectType::Tree)
+            .expect("store tree");
+        oid
+    }
+
+    fn store_empty_tree(storage: &ClientStorage) -> ObjectHash {
+        let bytes = Vec::new();
+        let oid = ObjectHash::from_type_and_data(ObjectType::Tree, &bytes);
+        storage
+            .put(&oid, &bytes, ObjectType::Tree)
+            .expect("store empty tree");
+        oid
+    }
 
     #[test]
     fn selected_all_restores_every_mutable_surface() {
@@ -1682,6 +2276,18 @@ mod tests {
         fs::create_dir_all(root.path().join(".libra")).expect("metadata dir");
         fs::write(root.path().join("keep.txt"), b"keep").expect("existing file");
         let storage = ClientStorage::init_local(root.path().join("objects"));
+        let keep = ObjectHash::from_type_and_data(ObjectType::Blob, b"keep");
+        storage
+            .put(&keep, b"keep", ObjectType::Blob)
+            .expect("keep blob");
+        let current_tree_oid = store_test_tree(
+            &storage,
+            vec![TreeItem::new(
+                TreeItemMode::Blob,
+                keep,
+                "keep.txt".to_string(),
+            )],
+        );
         let missing = ObjectHash::from_type_and_data(ObjectType::Blob, b"missing");
         let tree = Tree::from_tree_items(vec![TreeItem::new(
             TreeItemMode::Blob,
@@ -1694,7 +2300,14 @@ mod tests {
         storage
             .put(&tree_oid, &tree_bytes, ObjectType::Tree)
             .expect("tree object");
-        let result = restore_working_copy(&storage, &tree_oid, root.path());
+        let result = restore_working_copy(
+            &storage,
+            &tree_oid,
+            &current_tree_oid,
+            &tree_oid,
+            &current_tree_oid,
+            root.path(),
+        );
         assert!(result.is_err());
         assert_eq!(
             fs::read(root.path().join("keep.txt")).expect("keep file"),
@@ -1709,23 +2322,45 @@ mod tests {
         fs::create_dir_all(root.path().join(".libra")).expect("metadata dir");
         fs::write(root.path().join("old.txt"), b"old").expect("old file");
         fs::write(root.path().join(".libra/pointer"), b"private").expect("private file");
+        fs::write(root.path().join(".env"), b"secret").expect("ignored root file");
+        fs::create_dir_all(root.path().join("src/cache")).expect("ignored cache");
+        fs::write(root.path().join("src/cache/db.sqlite"), b"local data").expect("cache data");
+        fs::create_dir_all(root.path().join("vendor/.git")).expect("submodule metadata");
+        fs::write(root.path().join("vendor/.git/config"), b"submodule").expect("submodule config");
         let storage = ClientStorage::init_local(root.path().join("objects"));
+        let old = ObjectHash::from_type_and_data(ObjectType::Blob, b"old");
+        storage
+            .put(&old, b"old", ObjectType::Blob)
+            .expect("old blob");
+        let current_tree_oid = store_test_tree(
+            &storage,
+            vec![TreeItem::new(
+                TreeItemMode::Blob,
+                old,
+                "old.txt".to_string(),
+            )],
+        );
         let blob = ObjectHash::from_type_and_data(ObjectType::Blob, b"new");
         storage
             .put(&blob, b"new", ObjectType::Blob)
             .expect("blob object");
-        let tree = Tree::from_tree_items(vec![TreeItem::new(
-            TreeItemMode::Blob,
-            blob,
-            "new.txt".to_string(),
-        )])
-        .expect("tree");
-        let tree_bytes = tree.to_data().expect("tree bytes");
-        let tree_oid = ObjectHash::from_type_and_data(ObjectType::Tree, &tree_bytes);
-        storage
-            .put(&tree_oid, &tree_bytes, ObjectType::Tree)
-            .expect("tree object");
-        restore_working_copy(&storage, &tree_oid, root.path()).expect("swap");
+        let tree_oid = store_test_tree(
+            &storage,
+            vec![TreeItem::new(
+                TreeItemMode::Blob,
+                blob,
+                "new.txt".to_string(),
+            )],
+        );
+        restore_working_copy(
+            &storage,
+            &tree_oid,
+            &current_tree_oid,
+            &tree_oid,
+            &current_tree_oid,
+            root.path(),
+        )
+        .expect("swap");
         assert!(!root.path().join("old.txt").exists());
         assert_eq!(
             fs::read(root.path().join("new.txt")).expect("new file"),
@@ -1734,6 +2369,258 @@ mod tests {
         assert_eq!(
             fs::read(root.path().join(".libra/pointer")).expect("private file"),
             b"private"
+        );
+        assert_eq!(
+            fs::read(root.path().join(".env")).expect("ignored file"),
+            b"secret"
+        );
+        assert_eq!(
+            fs::read(root.path().join("src/cache/db.sqlite")).expect("cache data"),
+            b"local data"
+        );
+        assert_eq!(
+            fs::read(root.path().join("vendor/.git/config")).expect("submodule metadata"),
+            b"submodule"
+        );
+    }
+
+    #[test]
+    fn restore_refuses_to_install_files_inside_an_initialized_submodule() {
+        let root = tempdir().expect("worktree");
+        fs::create_dir_all(root.path().join(".libra")).expect("metadata dir");
+        fs::create_dir_all(root.path().join("vendor/.git")).expect("submodule metadata");
+        fs::write(root.path().join("vendor/.git/config"), b"submodule").expect("config");
+        let storage = ClientStorage::init_local(root.path().join("objects"));
+        let empty_tree = store_empty_tree(&storage);
+        let blob = ObjectHash::from_type_and_data(ObjectType::Blob, b"would overwrite submodule");
+        storage
+            .put(&blob, b"would overwrite submodule", ObjectType::Blob)
+            .expect("target blob");
+        let nested_tree = store_test_tree(
+            &storage,
+            vec![TreeItem::new(
+                TreeItemMode::Blob,
+                blob,
+                "old-file.txt".to_string(),
+            )],
+        );
+        let target_tree = store_test_tree(
+            &storage,
+            vec![TreeItem::new(
+                TreeItemMode::Tree,
+                nested_tree,
+                "vendor".to_string(),
+            )],
+        );
+        let gitlink_oid = ObjectHash::from_type_and_data(ObjectType::Commit, b"submodule commit");
+        let target_index = store_test_tree(
+            &storage,
+            vec![TreeItem::new(
+                TreeItemMode::Commit,
+                gitlink_oid,
+                "vendor".to_string(),
+            )],
+        );
+
+        let result = restore_working_copy(
+            &storage,
+            &target_tree,
+            &empty_tree,
+            &target_index,
+            &empty_tree,
+            root.path(),
+        );
+        assert!(result.is_err(), "submodule boundary must be protected");
+        assert!(!root.path().join("vendor/old-file.txt").exists());
+        assert_eq!(
+            fs::read(root.path().join("vendor/.git/config")).expect("config preserved"),
+            b"submodule"
+        );
+    }
+
+    #[test]
+    fn restore_handles_managed_directory_to_file_transition_safely() {
+        let root = tempdir().expect("worktree");
+        fs::create_dir_all(root.path().join(".libra")).expect("metadata dir");
+        fs::create_dir_all(root.path().join("dir")).expect("managed directory");
+        fs::write(root.path().join("dir/old.txt"), b"old child").expect("old child");
+        let storage = ClientStorage::init_local(root.path().join("objects"));
+        let old_child = ObjectHash::from_type_and_data(ObjectType::Blob, b"old child");
+        let replacement = ObjectHash::from_type_and_data(ObjectType::Blob, b"replacement");
+        storage
+            .put(&old_child, b"old child", ObjectType::Blob)
+            .expect("old child blob");
+        storage
+            .put(&replacement, b"replacement", ObjectType::Blob)
+            .expect("replacement blob");
+        let child_tree = store_test_tree(
+            &storage,
+            vec![TreeItem::new(
+                TreeItemMode::Blob,
+                old_child,
+                "old.txt".to_string(),
+            )],
+        );
+        let current_tree = store_test_tree(
+            &storage,
+            vec![TreeItem::new(
+                TreeItemMode::Tree,
+                child_tree,
+                "dir".to_string(),
+            )],
+        );
+        let target_tree = store_test_tree(
+            &storage,
+            vec![TreeItem::new(
+                TreeItemMode::Blob,
+                replacement,
+                "dir".to_string(),
+            )],
+        );
+        let empty_index = store_empty_tree(&storage);
+
+        restore_working_copy(
+            &storage,
+            &target_tree,
+            &current_tree,
+            &empty_index,
+            &empty_index,
+            root.path(),
+        )
+        .expect("managed transition should succeed");
+        assert_eq!(
+            fs::read(root.path().join("dir")).expect("replacement file"),
+            b"replacement"
+        );
+    }
+
+    #[test]
+    fn restore_refuses_directory_to_file_transition_with_opaque_contents() {
+        let root = tempdir().expect("worktree");
+        fs::create_dir_all(root.path().join(".libra")).expect("metadata dir");
+        fs::create_dir_all(root.path().join("dir")).expect("managed directory");
+        fs::write(root.path().join("dir/old.txt"), b"old child").expect("old child");
+        fs::write(root.path().join("dir/.private"), b"private").expect("opaque child");
+        let storage = ClientStorage::init_local(root.path().join("objects"));
+        let old_child = ObjectHash::from_type_and_data(ObjectType::Blob, b"old child");
+        let replacement = ObjectHash::from_type_and_data(ObjectType::Blob, b"replacement");
+        storage
+            .put(&old_child, b"old child", ObjectType::Blob)
+            .expect("old child blob");
+        storage
+            .put(&replacement, b"replacement", ObjectType::Blob)
+            .expect("replacement blob");
+        let child_tree = store_test_tree(
+            &storage,
+            vec![TreeItem::new(
+                TreeItemMode::Blob,
+                old_child,
+                "old.txt".to_string(),
+            )],
+        );
+        let current_tree = store_test_tree(
+            &storage,
+            vec![TreeItem::new(
+                TreeItemMode::Tree,
+                child_tree,
+                "dir".to_string(),
+            )],
+        );
+        let target_tree = store_test_tree(
+            &storage,
+            vec![TreeItem::new(
+                TreeItemMode::Blob,
+                replacement,
+                "dir".to_string(),
+            )],
+        );
+        let empty_index = store_empty_tree(&storage);
+
+        assert!(
+            restore_working_copy(
+                &storage,
+                &target_tree,
+                &current_tree,
+                &empty_index,
+                &empty_index,
+                root.path(),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(root.path().join("dir/old.txt")).expect("old child preserved"),
+            b"old child"
+        );
+        assert_eq!(
+            fs::read(root.path().join("dir/.private")).expect("opaque child preserved"),
+            b"private"
+        );
+    }
+
+    #[test]
+    fn failed_worktree_swap_rolls_back_without_touching_opaque_paths() {
+        let root = tempdir().expect("worktree");
+        fs::create_dir_all(root.path().join(".libra")).expect("metadata dir");
+        fs::write(root.path().join(".env"), b"secret").expect("ignored file");
+        fs::create_dir_all(root.path().join("src/cache")).expect("cache directory");
+        fs::write(root.path().join("src/cache/db.sqlite"), b"local data").expect("cache data");
+        fs::create_dir_all(root.path().join("vendor/.git")).expect("submodule metadata");
+        fs::write(root.path().join("vendor/.git/config"), b"submodule").expect("submodule config");
+        fs::write(root.path().join("blocker"), b"opaque file").expect("unmanaged blocker");
+
+        let storage = ClientStorage::init_local(root.path().join("objects"));
+        let current_tree_oid = store_empty_tree(&storage);
+        let first = ObjectHash::from_type_and_data(ObjectType::Blob, b"first target");
+        let nested = ObjectHash::from_type_and_data(ObjectType::Blob, b"nested target");
+        storage
+            .put(&first, b"first target", ObjectType::Blob)
+            .expect("first blob");
+        storage
+            .put(&nested, b"nested target", ObjectType::Blob)
+            .expect("nested blob");
+        let nested_tree_oid = store_test_tree(
+            &storage,
+            vec![TreeItem::new(
+                TreeItemMode::Blob,
+                nested,
+                "file.txt".to_string(),
+            )],
+        );
+        let target_tree_oid = store_test_tree(
+            &storage,
+            vec![
+                TreeItem::new(TreeItemMode::Blob, first, "aaa.txt".to_string()),
+                TreeItem::new(TreeItemMode::Tree, nested_tree_oid, "blocker".to_string()),
+            ],
+        );
+
+        assert!(
+            restore_working_copy(
+                &storage,
+                &target_tree_oid,
+                &current_tree_oid,
+                &target_tree_oid,
+                &current_tree_oid,
+                root.path(),
+            )
+            .is_err()
+        );
+        assert!(!root.path().join("aaa.txt").exists());
+        assert_eq!(
+            fs::read(root.path().join(".env")).expect("ignored file"),
+            b"secret"
+        );
+        assert_eq!(
+            fs::read(root.path().join("src/cache/db.sqlite")).expect("cache data"),
+            b"local data"
+        );
+        assert_eq!(
+            fs::read(root.path().join("vendor/.git/config")).expect("submodule metadata"),
+            b"submodule"
+        );
+        assert_eq!(
+            fs::read(root.path().join("blocker")).expect("unmanaged blocker"),
+            b"opaque file"
         );
     }
 
@@ -1745,7 +2632,18 @@ mod tests {
         fs::create_dir_all(transaction.join("stage")).expect("stage directory");
         fs::write(root.path().join("old.txt"), b"new contents").expect("installed target");
         fs::write(transaction.join("backup/old.txt"), b"old contents").expect("backup");
-        fs::write(transaction.join("manifest.json"), br#"["new.txt"]"#).expect("manifest");
+        let target = ObjectHash::from_type_and_data(ObjectType::Blob, b"new contents");
+        let manifest = RestoreTransactionManifest {
+            schema_version: 1,
+            backup_paths: vec!["old.txt".to_string()],
+            install_entries: vec![RestoreInstallEntry {
+                path: "old.txt".to_string(),
+                object_oid: target.to_string(),
+                mode: "Blob".to_string(),
+            }],
+        };
+        write_restore_manifest(&transaction, &manifest).expect("manifest");
+        write_restore_phase_marker(&transaction, "installing").expect("phase marker");
 
         assert_eq!(
             recover_restore_transactions(root.path()).expect("recover"),
@@ -1755,31 +2653,98 @@ mod tests {
             fs::read(root.path().join("old.txt")).expect("restored old file"),
             b"old contents"
         );
-        assert!(!root.path().join("new.txt").exists());
         assert!(!transaction.exists());
     }
 
     #[test]
-    fn truncated_manifest_falls_back_to_swap_directories() {
+    fn recovery_before_first_backup_preserves_original_path() {
         let root = tempdir().expect("worktree");
-        let transaction = root.path().join(".libra/operation-restore-truncated");
+        let transaction = root.path().join(".libra/operation-restore-before-backup");
+        fs::create_dir_all(transaction.join("backup")).expect("backup directory");
+        fs::create_dir_all(transaction.join("stage")).expect("stage directory");
+        fs::write(root.path().join("old.txt"), b"original contents").expect("original");
+        fs::write(transaction.join("stage/old.txt"), b"target contents").expect("staged target");
+        let target = ObjectHash::from_type_and_data(ObjectType::Blob, b"target contents");
+        let manifest = RestoreTransactionManifest {
+            schema_version: 1,
+            backup_paths: vec!["old.txt".to_string()],
+            install_entries: vec![RestoreInstallEntry {
+                path: "old.txt".to_string(),
+                object_oid: target.to_string(),
+                mode: "Blob".to_string(),
+            }],
+        };
+        write_restore_manifest(&transaction, &manifest).expect("manifest");
+        write_restore_phase_marker(&transaction, "backing-up").expect("phase marker");
+
+        assert_eq!(
+            recover_restore_transactions(root.path()).expect("recover"),
+            1
+        );
+        assert_eq!(
+            fs::read(root.path().join("old.txt")).expect("original file"),
+            b"original contents"
+        );
+        assert!(!transaction.exists());
+    }
+
+    #[test]
+    fn recovery_after_backup_was_already_restored_is_idempotent() {
+        let root = tempdir().expect("worktree");
+        let transaction = root
+            .path()
+            .join(".libra/operation-restore-already-restored");
+        fs::create_dir_all(transaction.join("backup")).expect("backup directory");
+        fs::create_dir_all(transaction.join("stage")).expect("stage directory");
+        // This is the state after recovery renamed the backup to the worktree
+        // but before it removed the transaction directory.
+        fs::write(root.path().join("old.txt"), b"original contents").expect("restored original");
+        let target = ObjectHash::from_type_and_data(ObjectType::Blob, b"target contents");
+        let manifest = RestoreTransactionManifest {
+            schema_version: 1,
+            backup_paths: vec!["old.txt".to_string()],
+            install_entries: vec![RestoreInstallEntry {
+                path: "old.txt".to_string(),
+                object_oid: target.to_string(),
+                mode: "Blob".to_string(),
+            }],
+        };
+        write_restore_manifest(&transaction, &manifest).expect("manifest");
+        write_restore_phase_marker(&transaction, "installing").expect("phase marker");
+
+        assert_eq!(
+            recover_restore_transactions(root.path()).expect("recover"),
+            1
+        );
+        assert_eq!(
+            fs::read(root.path().join("old.txt")).expect("original file"),
+            b"original contents"
+        );
+        assert!(!transaction.exists());
+    }
+
+    #[test]
+    fn corrupt_restore_manifest_fails_closed_without_deleting_data() {
+        let root = tempdir().expect("worktree");
+        let transaction = root.path().join(".libra/operation-restore-corrupt");
         fs::create_dir_all(transaction.join("backup")).expect("backup directory");
         fs::create_dir_all(transaction.join("stage")).expect("stage directory");
         fs::write(root.path().join("new.txt"), b"installed target").expect("installed target");
         fs::write(transaction.join("backup/old.txt"), b"old contents").expect("backup");
         fs::write(transaction.join("stage/new.txt"), b"staged target").expect("stage");
-        fs::write(transaction.join("manifest.json"), b"[\"new.txt\"").expect("manifest");
+        fs::write(transaction.join("manifest.json"), b"{").expect("manifest");
+        write_restore_phase_marker(&transaction, "installing").expect("phase marker");
 
+        assert!(recover_restore_transactions(root.path()).is_err());
         assert_eq!(
-            recover_restore_transactions(root.path()).expect("recover"),
-            1
+            fs::read(root.path().join("new.txt")).expect("installed target remains"),
+            b"installed target"
         );
         assert_eq!(
-            fs::read(root.path().join("old.txt")).expect("restored old file"),
+            fs::read(transaction.join("backup/old.txt")).expect("backup remains"),
             b"old contents"
         );
-        assert!(!root.path().join("new.txt").exists());
-        assert!(!transaction.exists());
+        assert!(transaction.exists());
     }
 
     #[tokio::test]

@@ -20,21 +20,47 @@ fn oid(label: &[u8]) -> ObjectHash {
 }
 
 #[test]
-fn interrupted_swap_manifest_recovers_the_worktree() {
+fn interrupted_swap_manifest_recovers_the_worktree_idempotently() {
     let root = tempdir().expect("worktree");
     let transaction = root.path().join(".libra/operation-restore-interrupted");
     fs::create_dir_all(transaction.join("backup")).expect("backup");
     fs::create_dir_all(transaction.join("stage")).expect("stage");
     fs::write(root.path().join("old.txt"), b"new").expect("installed target");
     fs::write(transaction.join("backup/old.txt"), b"old").expect("old backup");
-    fs::write(transaction.join("manifest.json"), br#"["new.txt"]"#).expect("manifest");
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "backup_paths": ["old.txt"],
+        "install_entries": [{
+            "path": "old.txt",
+            "object_oid": oid(b"new").to_string(),
+            "mode": "Blob"
+        }]
+    });
+    fs::write(
+        transaction.join("manifest.json"),
+        serde_json::to_vec(&manifest).expect("serialize manifest"),
+    )
+    .expect("manifest");
+    fs::write(transaction.join("phase-installing"), b"").expect("installing marker");
 
     assert_eq!(
         recover_restore_transactions(root.path()).expect("recover"),
         1
     );
-    assert_eq!(fs::read(root.path().join("old.txt")).expect("old"), b"old");
-    assert!(!root.path().join("new.txt").exists());
+    assert_eq!(
+        fs::read(root.path().join("old.txt")).expect("restored old"),
+        b"old"
+    );
+    assert!(!transaction.exists());
+
+    assert_eq!(
+        recover_restore_transactions(root.path()).expect("repeat recovery"),
+        0
+    );
+    assert_eq!(
+        fs::read(root.path().join("old.txt")).expect("idempotently preserved old"),
+        b"old"
+    );
 }
 
 #[test]
