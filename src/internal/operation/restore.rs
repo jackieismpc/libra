@@ -1158,6 +1158,7 @@ impl RestoreEngine {
                 }
             }
         }
+        self.protect_linked_worktree_heads(references).await?;
         let txn = self
             .store
             .db()
@@ -1214,6 +1215,66 @@ impl RestoreEngine {
         txn.commit()
             .await
             .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Refuse a repository-wide restore that would delete a linked worktree's
+    /// HEAD reference. The target refs facet is the authority for the restored
+    /// ref set, but it was captured at a point in time; a linked worktree
+    /// created after that snapshot has a HEAD row absent from the target, and a
+    /// `DELETE FROM reference` would silently unregister it.
+    ///
+    /// A HEAD row belongs to the main worktree when its `worktree_id` is `None`
+    /// and to a linked worktree otherwise. The current worktree's HEAD is
+    /// restored by this transition, so it is exempt; every other worktree whose
+    /// HEAD row is absent from the target fails the restore closed.
+    async fn protect_linked_worktree_heads(
+        &self,
+        target_references: &[serde_json::Value],
+    ) -> Result<(), RestoreError> {
+        let current_worktree = self.scope.scope.worktree_id().map(str::to_string);
+        let target_head_worktrees = target_references
+            .iter()
+            .filter(|entry| entry.get("kind").and_then(serde_json::Value::as_str) == Some("Head"))
+            .map(|entry| {
+                entry
+                    .get("worktree_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<BTreeSet<_>>();
+        let rows = self
+            .store
+            .db()
+            .query_all_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT worktree_id FROM reference WHERE kind = 'Head'",
+            ))
+            .await
+            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        let mut missing_worktrees = BTreeSet::new();
+        for row in rows {
+            let worktree_id = row
+                .try_get_by_index::<Option<String>>(0)
+                .map_err(|error| RestoreError::Storage(error.to_string()))?;
+            if worktree_id == current_worktree {
+                continue;
+            }
+            if !target_head_worktrees.contains(&worktree_id) {
+                missing_worktrees.insert(worktree_id);
+            }
+        }
+        if !missing_worktrees.is_empty() {
+            let mut listed = missing_worktrees
+                .iter()
+                .map(|id| id.as_deref().unwrap_or("(main)").to_string())
+                .collect::<Vec<_>>();
+            listed.sort();
+            return Err(RestoreError::Storage(format!(
+                "repository-wide restore would delete the HEAD of worktree(s) {} that are absent from the target snapshot; check them out of the target refs or recreate them after the restore",
+                listed.join(", ")
+            )));
+        }
         Ok(())
     }
 
@@ -2930,5 +2991,80 @@ mod tests {
                 .expect("delta count"),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn repo_wide_restore_protects_linked_worktree_heads() {
+        let root = tempdir().expect("worktree");
+        let gitdir = root.path().join(".libra");
+        fs::create_dir_all(gitdir.join("info")).expect("gitdir info");
+        let scope = crate::internal::worktree_scope::RequestScope {
+            scope: crate::internal::worktree_scope::WorktreeScope::Main,
+            workdir: root.path().to_path_buf(),
+            gitdir,
+            storage: root.path().to_path_buf(),
+            worktree_root: root.path().to_path_buf(),
+        };
+        let database = db::create_database(
+            root.path()
+                .join("libra.db")
+                .to_str()
+                .expect("database path"),
+        )
+        .await
+        .expect("database");
+        let storage = ClientStorage::init_local(root.path().join("objects"));
+        let engine = RestoreEngine::new(scope, "repo", database.clone(), storage);
+
+        // The live reference table has a linked worktree's HEAD that the target
+        // snapshot does not know about.
+        use sea_orm::{ConnectionTrait, Statement};
+        database
+            .execute_raw(Statement::from_string(
+                sea_orm::DbBackend::Sqlite,
+                "INSERT INTO reference (name, kind, \"commit\", remote, worktree_id) \
+                 VALUES ('feature', 'Head', NULL, NULL, 'wt-linked')",
+            ))
+            .await
+            .expect("linked head row");
+        database
+            .execute_raw(Statement::from_string(
+                sea_orm::DbBackend::Sqlite,
+                "INSERT INTO reference (name, kind, \"commit\", remote, worktree_id) \
+                 VALUES ('main', 'Head', NULL, NULL, NULL)",
+            ))
+            .await
+            .expect("main head row");
+
+        // Target refs facet only carries the main HEAD.
+        let target_main = serde_json::json!({
+            "id": 1, "name": "main", "kind": "Head",
+            "commit": serde_json::Value::Null, "remote": serde_json::Value::Null,
+            "worktree_id": serde_json::Value::Null,
+        });
+        let targets = vec![target_main];
+        let error = engine
+            .protect_linked_worktree_heads(&targets)
+            .await
+            .expect_err("linked worktree HEAD must be protected");
+        assert!(
+            error.to_string().contains("wt-linked"),
+            "error must name the protected worktree: {error}"
+        );
+        assert!(
+            error.to_string().contains("repository-wide restore"),
+            "error must describe the repo-wide restore hazard: {error}"
+        );
+
+        // A target that includes the linked HEAD passes.
+        let target_linked = serde_json::json!({
+            "id": 2, "name": "feature", "kind": "Head",
+            "commit": serde_json::Value::Null, "remote": serde_json::Value::Null,
+            "worktree_id": "wt-linked",
+        });
+        engine
+            .protect_linked_worktree_heads(&[target_linked])
+            .await
+            .expect("linked HEAD present in the target is allowed");
     }
 }

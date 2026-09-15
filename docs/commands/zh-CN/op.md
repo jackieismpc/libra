@@ -92,6 +92,8 @@ libra op show @{0} --view
 
 从先前捕获的 operation view 恢复受支持的 HEAD/ref 状态，而不是任意工作树或嵌套仓库内容。HEAD 和捕获的 branch refs 会重置为目标 view，本地分支中不存在于该 view 的会被 prune，因此 restore 会复现该 operation 的精确本地分支集合。恢复后的 HEAD branch 始终保留；remote-tracking refs 和 Libra-owned internal refs（locked `main`/`intent`/`traces` branches 以及保留 `libra/` namespace，例如 AI history branch `libra/intent`）永不 prune。
 
+仓库级 restore（`--what all --confirm-repo-wide`）在会删除快照中不存在的 linked worktree 的 HEAD 时拒绝执行：该 worktree 是在快照之后创建的，restore 后必须重新创建或 checkout 其 HEAD。
+
 ```bash
 libra op restore [--what <all|working-copy|index|sequencer|sparse|head>] \
   [--confirm-repo-wide] [--force] [--dry-run] <OP_REF>

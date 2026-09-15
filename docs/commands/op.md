@@ -179,6 +179,10 @@ the next mutation boundary records any on-disk drift as an external snapshot.
 - Restore resets HEAD and the branch refs captured in the target view, and
   prunes local branches that are absent from that view (the restored HEAD branch
   is always kept; remote-tracking refs are left untouched).
+- A repository-wide restore (`--what all --confirm-repo-wide`) refuses to run
+  when it would delete the HEAD of a linked worktree that is absent from the
+  target snapshot; such a worktree was created after the snapshot, and its HEAD
+  must be recreated or checked out after the restore.
 
 ### Operation-scoped execution (unreleased)
 
