@@ -315,7 +315,21 @@ impl FileHistoryStore {
                 context: "failed to serialize file history manifest".to_string(),
                 source,
             })?;
-        write_file_atomic(&path, &json)
+        write_file_atomic(&path, &json)?;
+        // The first canonical write retires the pre-CH-04 flat manifest at the
+        // session root. Leaving it in place would let a downgraded binary read
+        // a stale copy of history that no longer reflects the canonical state.
+        let legacy = self.legacy_manifest_path();
+        if legacy.exists() {
+            fs::remove_file(&legacy).map_err(|source| FileHistoryError::Io {
+                context: format!(
+                    "failed to remove legacy file history manifest {}",
+                    legacy.display()
+                ),
+                source,
+            })?;
+        }
+        Ok(())
     }
 
     fn write_snapshot_if_missing(&self, hash: &str, bytes: &[u8]) -> Result<()> {
@@ -628,7 +642,15 @@ mod tests {
         assert_eq!(manifest.batches[0].id, "legacy");
         store.save_manifest(&manifest).expect("canonical write");
         assert!(dir.path().join("file_history/manifest.json").is_file());
-        assert!(legacy.is_file());
+        assert!(
+            !legacy.exists(),
+            "the first canonical write must retire the legacy flat manifest"
+        );
+        // A second write is idempotent and leaves nothing behind.
+        store
+            .save_manifest(&manifest)
+            .expect("repeat canonical write");
+        assert!(!legacy.exists());
     }
 
     #[test]

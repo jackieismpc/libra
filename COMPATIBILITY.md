@@ -509,7 +509,9 @@ redacted rows keyed by stable operation ID, repository ID, Change ID, and
 optional intent/run/invocation IDs; they never use a mutable commit OID or
 store prompt/transcript/secret data. The legacy AI FileHistoryStore manifest
 at the session root remains readable; new writes materialize the canonical
-`file_history/manifest.json` path without introducing a new undo format.
+`file_history/manifest.json` path without introducing a new undo format, and
+the first canonical write removes the legacy flat manifest so a downgraded
+binary cannot read a stale copy.
 ## Merge strategy coverage (MG-13)
 
 Single-head merge accepts `-s ort` (the default), its behavior-equivalent
