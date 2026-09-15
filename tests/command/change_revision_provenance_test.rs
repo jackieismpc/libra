@@ -196,3 +196,77 @@ async fn cherry_pick_and_rebase_revisions_resolve_to_their_control_operations() 
     )
     .await;
 }
+
+/// The change revision for a commit is recorded only after the branch ref has
+/// advanced to that commit. The projection is a GC root, so recording it before
+/// the ref moves would anchor an unreachable commit object forever.
+///
+/// This asserts the observable invariant: every recorded revision's commit_oid
+/// equals the current tip of the branch that owns the committing HEAD, so the
+/// projection always points at a published commit rather than an orphan.
+#[tokio::test]
+async fn revision_commit_matches_the_published_branch_tip() {
+    let repo = tempdir().expect("temporary repository");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+
+    fs::write(repo.path().join("tracked.txt"), "one\n").expect("write tracked file");
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], repo.path()),
+        "stage first file",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "one", "--no-verify"], repo.path()),
+        "first commit",
+    );
+    let first_oid = head_oid(repo.path());
+
+    fs::write(repo.path().join("tracked.txt"), "two\n").expect("update tracked file");
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], repo.path()),
+        "stage second change",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "two", "--no-verify"], repo.path()),
+        "second commit",
+    );
+    let second_oid = head_oid(repo.path());
+
+    let database = open_repo_db(repo.path()).await;
+    let revisions = database
+        .query_all_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT commit_oid FROM change_revision ORDER BY commit_oid",
+        ))
+        .await
+        .expect("list revisions");
+    let recorded: Vec<String> = revisions
+        .iter()
+        .map(|row| {
+            row.try_get_by_index::<String>(0)
+                .expect("revision commit oid")
+        })
+        .collect();
+    let mut expected = vec![first_oid.clone(), second_oid.clone()];
+    expected.sort();
+    assert_eq!(
+        recorded, expected,
+        "each commit revision must match a published branch tip"
+    );
+
+    // The branch ref tip is the newest revision, so no revision references an
+    // object the branch does not reach.
+    let branch_tip = database
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT \"commit\" FROM reference WHERE kind = 'Branch' AND name = 'main' \
+             AND remote IS NULL",
+            [],
+        ))
+        .await
+        .expect("branch tip query")
+        .expect("branch row")
+        .try_get_by_index::<String>(0)
+        .expect("branch tip");
+    assert_eq!(branch_tip, second_oid);
+}
