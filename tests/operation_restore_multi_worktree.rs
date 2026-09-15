@@ -1,6 +1,6 @@
 //! OL-13 multi-worktree operation heads and reconcile contracts.
 
-use std::{collections::BTreeMap, fs, process::Command, sync::OnceLock, thread, time::Duration};
+use std::{collections::BTreeMap, fs, process::Command, sync::OnceLock};
 
 use git_internal::{
     hash::ObjectHash,

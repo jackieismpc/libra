@@ -227,7 +227,7 @@ impl ReconcileEngine {
             }
         }
         let mut merged_references: Vec<serde_json::Value> = Vec::new();
-        for (key, _) in &targets {
+        for key in targets.keys() {
             let (head, entry) = facets
                 .iter()
                 .find_map(|(head, references)| {
@@ -300,7 +300,7 @@ impl ReconcileEngine {
                 &self.repo_id,
                 &scope_key,
                 &head_ids,
-                &[reconcile_id.clone()],
+                std::slice::from_ref(&reconcile_id),
             )
             .await
         {
