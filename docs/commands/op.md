@@ -154,6 +154,24 @@ libra op restore @{1}
 libra op restore @{1} --dry-run
 ```
 
+## `libra op doctor`
+
+Diagnose operation object closure, heads, unfinished journals, and the
+workspace pointer. Read-only by default; `--fix` performs journal recovery and
+pointer rebuild, `--dry-run` only reports the planned repairs.
+
+```bash
+libra op doctor [--fix] [--dry-run]
+```
+
+`--fix` recovers interrupted operations that never reached a terminal state.
+A command that already published its head (the operation completed its mutation
+before the process died) is advanced to `success` and, when it is the current
+head, the workspace pointer is rebuilt to its captured view. A globally
+orphaned running operation (crash before head publication) is failed closed;
+the next mutation boundary records any on-disk drift as an external snapshot.
+
+
 ## Notes
 
 - `op restore` records a new `op restore` operation on success.

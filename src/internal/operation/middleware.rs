@@ -435,7 +435,7 @@ where
             Staleness::Fresh => {}
             state => {
                 return Err(OperationError::Stale(format!(
-                    "working-copy pointer is {state:?} against current heads"
+                    "working-copy pointer is {state:?} against current heads; run `libra op doctor --fix` to recover an interrupted operation"
                 )));
             }
         }

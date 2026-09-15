@@ -791,6 +791,26 @@ impl OperationStoreV2 {
             .collect())
     }
 
+    /// Whether `op_id` is referenced as a current operation head in any scope
+    /// of this repository. Used by recovery to distinguish a globally orphaned
+    /// running operation (safe to fail closed) from one another worktree still
+    /// treats as its current head (never touch from a foreign scope).
+    pub async fn operation_is_head_in_any_scope(
+        &self,
+        repo_id: &str,
+        op_id: &str,
+    ) -> Result<bool, StoreError> {
+        let row = self
+            .db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT 1 FROM operation_head WHERE repo_id = ? AND op_id = ? LIMIT 1",
+                [repo_id.to_string().into(), op_id.to_string().into()],
+            ))
+            .await?;
+        Ok(row.is_some())
+    }
+
     pub async fn read_head_generation(
         &self,
         repo_id: &str,

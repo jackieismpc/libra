@@ -1356,6 +1356,124 @@ impl RestoreEngine {
         Ok(())
     }
 
+    /// Recover interrupted non-restore operations (Command/ExternalSnapshot/
+    /// Reconcile) for this repository and scope.
+    ///
+    /// A running operation that already reached publication (its journal is at
+    /// `Publish`, or the operation is a current head) completed its mutation
+    /// before the crash — the middleware publishes the head only after the
+    /// closure and post-snapshot succeed — so it is advanced to `Success` and,
+    /// when it is the unique current head, the workspace pointer is rebuilt to
+    /// its post-view snapshot. A running operation that is not referenced as a
+    /// head in any scope is a global orphan (the crash happened before head
+    /// publication) and is failed closed; the next mutation boundary captures
+    /// any on-disk drift as an external snapshot per ADR-OL-02. Operations that
+    /// are current heads of a *different* scope are left untouched.
+    ///
+    /// Returns the number of operations advanced to a terminal state.
+    pub async fn recover_interrupted_non_restore_operations(
+        &self,
+        scope_key: &str,
+    ) -> Result<usize, RestoreError> {
+        let operations = self
+            .store
+            .list_operations()
+            .await
+            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        let journals = self
+            .store
+            .read_all_journal()
+            .await
+            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        let running_non_restore = operations
+            .into_iter()
+            .filter(|operation| {
+                operation.status == OperationStatusV2::Running
+                    && !matches!(
+                        operation.kind,
+                        OperationKind::Restore
+                            | OperationKind::Undo
+                            | OperationKind::Redo
+                            | OperationKind::Revert
+                    )
+            })
+            .collect::<Vec<_>>();
+        let mut terminalized = 0usize;
+        let mut recovered_head: Option<OperationV2> = None;
+        for operation in running_non_restore {
+            let published = journals.iter().any(|journal| {
+                journal.op_id == operation.op_id && journal.phase == JournalPhase::Publish
+            });
+            let is_current_scope_head = self
+                .store
+                .read_heads(&self.repo_id, scope_key)
+                .await
+                .map_err(|error| RestoreError::Storage(error.to_string()))?
+                .iter()
+                .any(|head| head == &operation.op_id);
+            if published || is_current_scope_head {
+                self.store
+                    .update_operation_status(&operation.op_id, OperationStatusV2::Success)
+                    .await
+                    .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                terminalized += 1;
+                if is_current_scope_head {
+                    recovered_head = Some(operation);
+                }
+                continue;
+            }
+            let head_in_other_scope = self
+                .store
+                .operation_is_head_in_any_scope(&self.repo_id, &operation.op_id)
+                .await
+                .map_err(|error| RestoreError::Storage(error.to_string()))?;
+            if !head_in_other_scope {
+                self.store
+                    .update_operation_status(&operation.op_id, OperationStatusV2::Failed)
+                    .await
+                    .map_err(|error| RestoreError::Storage(error.to_string()))?;
+                terminalized += 1;
+            }
+        }
+        if let Some(operation) = recovered_head {
+            let heads = self
+                .store
+                .read_heads(&self.repo_id, scope_key)
+                .await
+                .map_err(|error| RestoreError::Storage(error.to_string()))?;
+            if heads == vec![operation.op_id.clone()] {
+                self.rebuild_pointer_for_operation(&operation).await?;
+            }
+        }
+        Ok(terminalized)
+    }
+
+    async fn rebuild_pointer_for_operation(
+        &self,
+        operation: &OperationV2,
+    ) -> Result<(), RestoreError> {
+        let view = self
+            .store
+            .load_view(&operation.post_view_oid)
+            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        let workspace_id = workspace_id(&self.scope);
+        let Some(snapshot_oid) = view.workspaces.get(&workspace_id).copied() else {
+            return Ok(());
+        };
+        let generation = self
+            .store
+            .read_head_generation(&self.repo_id, &self.scope_key())
+            .await
+            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        let mut pointer =
+            WorkspaceStatePointer::new(operation.op_id.clone(), snapshot_oid, generation);
+        pointer.last_content_oid = Some(snapshot_oid);
+        pointer
+            .save(&self.scope)
+            .await
+            .map_err(|error| RestoreError::Storage(error.to_string()))
+    }
+
     async fn append_journal(
         &self,
         op_id: &str,

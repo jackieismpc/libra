@@ -156,6 +156,11 @@ libra op revert <OP_REF> --parent <PARENT_OP_REF> \
 libra op doctor [--fix] [--dry-run]
 ```
 
+`--fix` 会收敛中断但未达终态的 operation：已发布 head 的命令（进程崩溃前其
+mutation 已完成）被推进为 `success`，且若它是当前 head，则把 workspace pointer
+重建到其捕获的 view；全局孤儿（head 发布前崩溃）的 running operation 被 fail
+closed，下一次 mutation 边界会把磁盘漂移记录为 external snapshot。
+
 ## 示例
 
 ```bash

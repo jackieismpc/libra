@@ -249,28 +249,41 @@ impl DoctorEngine {
         }
 
         if fix && !dry_run {
-            if latest_journals
+            let engine = super::RestoreEngine::new(
+                self.scope.clone(),
+                self.repo_id.clone(),
+                self.store.db().clone(),
+                self.store.storage(),
+            );
+            let restore_recovered = if latest_journals
                 .values()
                 .any(|journal| operation_is_running(journal) && journal_belongs_to_scope(journal))
             {
-                let engine = super::RestoreEngine::new(
-                    self.scope.clone(),
-                    self.repo_id.clone(),
-                    self.store.db().clone(),
-                    self.store.storage(),
-                );
                 match engine.recover_interrupted_operations(&scope_key).await {
-                    Ok(()) => {}
-                    Err(error) if error.to_string().contains("recovered interrupted") => {}
+                    Ok(()) => false,
+                    Err(error) if error.to_string().contains("recovered interrupted") => true,
                     Err(error) => return Err(DoctorError::Storage(error.to_string())),
                 }
+            } else {
+                false
+            };
+            let non_restore_terminalized = engine
+                .recover_interrupted_non_restore_operations(&scope_key)
+                .await
+                .map_err(|error| DoctorError::Storage(error.to_string()))?;
+            if restore_recovered || non_restore_terminalized > 0 {
                 fixed.push("unfinished-journals".to_string());
-                heads = self
-                    .store
-                    .read_heads(&self.repo_id, &scope_key)
-                    .await
-                    .map_err(|error| DoctorError::Storage(error.to_string()))?;
             }
+            heads = self
+                .store
+                .read_heads(&self.repo_id, &scope_key)
+                .await
+                .map_err(|error| DoctorError::Storage(error.to_string()))?;
+            let operations = self
+                .store
+                .list_operations()
+                .await
+                .map_err(|error| DoctorError::Storage(error.to_string()))?;
             if heads.len() == 1
                 && let Some(head) = heads.first()
                 && let Some(operation) =

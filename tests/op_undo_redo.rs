@@ -9,9 +9,10 @@ use libra::{
         config::ConfigKv,
         db::{self, get_db_conn_instance_for_path},
         operation::{
-            DoctorEngine, JournalEntry, JournalPhase, OperationKind, OperationMetaV2,
-            OperationStatusV2, OperationStoreV2, OperationV2, RepoViewV2, RestoreEngine,
-            RestoreReceipt, RestoreWhat, UndoEngine, WorkspaceStatePointer,
+            DoctorEngine, JournalEntry, JournalPhase, MutationClass, OperationError, OperationKind,
+            OperationMetaV2, OperationStatusV2, OperationStoreV2, OperationV2, RepoViewV2,
+            RestoreEngine, RestoreReceipt, RestoreWhat, Staleness, UndoEngine,
+            WorkspaceStatePointer, run_with_operation,
         },
         worktree_scope::{RequestScope, WorktreeScope},
     },
@@ -824,6 +825,292 @@ async fn doctor_dry_run_does_not_repair_and_fix_rebuilds_a_missing_pointer() {
         OperationStatusV2::Failed
     );
     assert!(WorkspaceStatePointer::load(&pinned).await.is_ok());
+}
+
+/// The P1 crash window: a normal `commit`-class command crashes between the
+/// head compare-and-swap and the workspace pointer save. The head is the new
+/// Running operation while the pointer still references the parent, so every
+/// subsequent mutation refuses with a stale pointer. `op doctor --fix` must
+/// recover in one pass: advance the interrupted head to Success and rebuild
+/// the pointer to its post-view snapshot.
+#[tokio::test]
+async fn doctor_recovers_crash_between_head_cas_and_pointer_save() {
+    let _test_lock = lock_cli_repository_tests().await;
+    let repository = tempdir().expect("repository");
+    libra::utils::test::setup_with_new_libra_in(repository.path()).await;
+    fs::write(repository.path().join("a.txt"), "one\n").expect("file");
+    for args in [
+        &["add", "a.txt"][..],
+        &["commit", "-m", "first", "--no-verify"][..],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_libra"))
+            .env("LIBRA_SKIP_WEB_BUILD", "1")
+            .args(args)
+            .current_dir(repository.path())
+            .output()
+            .expect("libra command");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let pinned = RequestScope::resolve(repository.path().to_path_buf()).expect("scope");
+    let database = get_db_conn_instance_for_path(&pinned.storage.join(util::DATABASE))
+        .await
+        .expect("database");
+    let repo_id = ConfigKv::get_with_conn(&database, "libra.repoid")
+        .await
+        .expect("repo id")
+        .expect("repo id entry")
+        .value;
+    let storage = ClientStorage::init_local(pinned.storage.join("objects"));
+    let store = OperationStoreV2::new_for_repo(&repo_id, database.clone(), storage.clone());
+    let baseline_id = store
+        .read_heads(&repo_id, pinned.scope.storage_key())
+        .await
+        .expect("heads")
+        .first()
+        .cloned()
+        .expect("baseline head");
+    let baseline = store
+        .load_operation(&baseline_id)
+        .await
+        .expect("baseline")
+        .expect("baseline operation");
+    let crashed_id = "crash-between-cas-and-pointer";
+    store
+        .write_operation(&OperationV2 {
+            op_id: crashed_id.to_string(),
+            parent_op_ids: vec![baseline_id.clone()],
+            pre_view_oid: baseline.post_view_oid,
+            post_view_oid: baseline.post_view_oid,
+            kind: OperationKind::Command,
+            status: OperationStatusV2::Running,
+            metadata: OperationMetaV2 {
+                command_name: Some("commit".to_string()),
+                ..OperationMetaV2::default()
+            },
+            restores_op_id: None,
+            reverts_op_id: None,
+            predecessor_map_oid: None,
+        })
+        .await
+        .expect("crashed operation");
+    store
+        .append_journal(&JournalEntry {
+            journal_id: format!("journal-{crashed_id}"),
+            op_id: crashed_id.to_string(),
+            phase: JournalPhase::Publish,
+            pre_view_oid: Some(baseline.post_view_oid),
+            target_view_oid: Some(baseline.post_view_oid),
+            owner: "test".to_string(),
+            updated_at: 1,
+            recovery_payload: None,
+        })
+        .await
+        .expect("crashed journal");
+    store
+        .cas_update_op_heads(
+            &repo_id,
+            pinned.scope.storage_key(),
+            std::slice::from_ref(&baseline_id),
+            &[crashed_id.to_string()],
+        )
+        .await
+        .expect("advance head to the crashed operation");
+
+    // The pointer still references the baseline (parent) operation, so it is
+    // stale against the crashed head. A normal mutation must refuse.
+    let heads_view = store
+        .read_heads_view(&repo_id, pinned.scope.storage_key())
+        .await
+        .expect("heads view");
+    let pointer = WorkspaceStatePointer::load(&pinned).await.expect("pointer");
+    assert_eq!(pointer.staleness(&heads_view), Staleness::Stale);
+    let mutation = run_with_operation(
+        &pinned,
+        OperationMetaV2 {
+            command_name: Some("commit".to_string()),
+            ..OperationMetaV2::default()
+        },
+        MutationClass::RepoMutation,
+        |_| async { Ok::<_, _>(()) },
+    )
+    .await;
+    assert!(
+        matches!(mutation, Err(OperationError::Stale(ref text)) if text.contains("op doctor --fix")),
+        "stale mutation must point at the doctor recovery path: {mutation:?}"
+    );
+
+    // `op doctor --fix` recovers the interrupted head and rebuilds the pointer.
+    let engine = DoctorEngine::new(pinned.clone(), repo_id.clone(), store.clone());
+    let fixed = engine.inspect(false, true).await.expect("fix report");
+    assert!(
+        fixed.fixed.iter().any(|item| item == "unfinished-journals"),
+        "doctor must report the recovered interrupted operation: {fixed:?}"
+    );
+    assert_eq!(
+        store
+            .load_operation(crashed_id)
+            .await
+            .expect("recovered")
+            .expect("crashed op row")
+            .status,
+        OperationStatusV2::Success,
+        "a published command head that completed its mutation is advanced to Success"
+    );
+    let heads_view = store
+        .read_heads_view(&repo_id, pinned.scope.storage_key())
+        .await
+        .expect("heads view");
+    let pointer = WorkspaceStatePointer::load(&pinned).await.expect("pointer");
+    assert_eq!(
+        pointer.staleness(&heads_view),
+        Staleness::Fresh,
+        "doctor must rebuild the pointer to the recovered head"
+    );
+
+    // A normal mutation now succeeds without manual intervention.
+    let mutation = run_with_operation(
+        &pinned,
+        OperationMetaV2 {
+            command_name: Some("commit".to_string()),
+            ..OperationMetaV2::default()
+        },
+        MutationClass::RepoMutation,
+        |_| async { Ok::<_, _>(()) },
+    )
+    .await;
+    assert!(mutation.is_ok(), "post-recovery mutation must succeed");
+}
+
+/// An interrupted command that never reached publication (crash before the
+/// head CAS) is a global orphan and must be failed closed by doctor, while an
+/// unpublished running operation still referenced as a head by another scope
+/// is left untouched.
+#[tokio::test]
+async fn doctor_fails_orphaned_running_command_but_not_foreign_scope_head() {
+    let _test_lock = lock_cli_repository_tests().await;
+    let repository = tempdir().expect("repository");
+    libra::utils::test::setup_with_new_libra_in(repository.path()).await;
+    fs::write(repository.path().join("a.txt"), "one\n").expect("file");
+    for args in [
+        &["add", "a.txt"][..],
+        &["commit", "-m", "first", "--no-verify"][..],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_libra"))
+            .env("LIBRA_SKIP_WEB_BUILD", "1")
+            .args(args)
+            .current_dir(repository.path())
+            .output()
+            .expect("libra command");
+        assert!(output.status.success());
+    }
+    let pinned = RequestScope::resolve(repository.path().to_path_buf()).expect("scope");
+    let database = get_db_conn_instance_for_path(&pinned.storage.join(util::DATABASE))
+        .await
+        .expect("database");
+    let repo_id = ConfigKv::get_with_conn(&database, "libra.repoid")
+        .await
+        .expect("repo id")
+        .expect("repo id entry")
+        .value;
+    let storage = ClientStorage::init_local(pinned.storage.join("objects"));
+    let store = OperationStoreV2::new_for_repo(&repo_id, database.clone(), storage.clone());
+    let baseline_id = store
+        .read_heads(&repo_id, pinned.scope.storage_key())
+        .await
+        .expect("heads")
+        .first()
+        .cloned()
+        .expect("baseline head");
+    let baseline = store
+        .load_operation(&baseline_id)
+        .await
+        .expect("baseline")
+        .expect("baseline operation");
+
+    // Orphaned running command: crash happened before the head CAS.
+    let orphan_id = "crash-before-publish-orphan";
+    store
+        .write_operation(&OperationV2 {
+            op_id: orphan_id.to_string(),
+            parent_op_ids: vec![baseline_id.clone()],
+            pre_view_oid: baseline.post_view_oid,
+            post_view_oid: baseline.post_view_oid,
+            kind: OperationKind::Command,
+            status: OperationStatusV2::Running,
+            metadata: OperationMetaV2::default(),
+            restores_op_id: None,
+            reverts_op_id: None,
+            predecessor_map_oid: None,
+        })
+        .await
+        .expect("orphan operation");
+
+    // Running head owned by a foreign scope (e.g. a linked worktree).
+    let foreign_id = "crash-foreign-scope-head";
+    store
+        .write_operation(&OperationV2 {
+            op_id: foreign_id.to_string(),
+            parent_op_ids: vec![baseline_id.clone()],
+            pre_view_oid: baseline.post_view_oid,
+            post_view_oid: baseline.post_view_oid,
+            kind: OperationKind::Command,
+            status: OperationStatusV2::Running,
+            metadata: OperationMetaV2::default(),
+            restores_op_id: None,
+            reverts_op_id: None,
+            predecessor_map_oid: None,
+        })
+        .await
+        .expect("foreign operation");
+    store
+        .cas_update_op_heads(
+            &repo_id,
+            "foreign-scope",
+            &[],
+            std::slice::from_ref(&baseline_id),
+        )
+        .await
+        .expect("foreign baseline");
+    store
+        .cas_update_op_heads(
+            &repo_id,
+            "foreign-scope",
+            std::slice::from_ref(&baseline_id),
+            &[foreign_id.to_string()],
+        )
+        .await
+        .expect("foreign head");
+
+    let engine = DoctorEngine::new(pinned.clone(), repo_id, store.clone());
+    let fixed = engine.inspect(false, true).await.expect("fix report");
+    assert_eq!(
+        store
+            .load_operation(orphan_id)
+            .await
+            .expect("orphan")
+            .expect("orphan row")
+            .status,
+        OperationStatusV2::Failed,
+        "a globally orphaned running command is failed closed"
+    );
+    assert_eq!(
+        store
+            .load_operation(foreign_id)
+            .await
+            .expect("foreign")
+            .expect("foreign row")
+            .status,
+        OperationStatusV2::Running,
+        "a running head owned by another scope must not be touched"
+    );
+    assert!(
+        fixed.fixed.iter().any(|item| item == "unfinished-journals"),
+        "doctor must report the orphaned operation as fixed: {fixed:?}"
+    );
 }
 
 #[tokio::test]
