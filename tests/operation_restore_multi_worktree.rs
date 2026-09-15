@@ -392,6 +392,231 @@ async fn reconcile_reports_conflicting_refs_without_guessing() {
 }
 
 #[tokio::test]
+async fn reconcile_dry_run_does_not_write_objects() {
+    let directory = tempdir().expect("repository");
+    let database = db::create_database(directory.path().join("repo.db").to_str().unwrap())
+        .await
+        .expect("database");
+    let storage = ClientStorage::init_local(directory.path().join("objects"));
+    let store = OperationStoreV2::new_for_repo("repo", database, storage.clone());
+    let scope_key = ""; // WorktreeScope::Main storage key
+    let refs = refs_facet(&storage, serde_json::json!([branch_ref("main", "1111")]));
+    let (snapshot_a, _) = full_snapshot(&storage, "workspace-a");
+    let (snapshot_b, _) = full_snapshot(&storage, "workspace-b");
+
+    store
+        .cas_update_op_heads_at_generation("repo", scope_key, 0, &[], &["base".to_string()])
+        .await
+        .expect("baseline head");
+    publish_head(
+        &store,
+        "repo",
+        "workspace-a",
+        "op-a",
+        vec!["base".to_string()],
+        refs,
+        snapshot_a,
+    )
+    .await;
+    store
+        .cas_update_op_heads(
+            "repo",
+            scope_key,
+            &["base".to_string()],
+            &["op-a".to_string()],
+        )
+        .await
+        .expect("publisher a wins");
+    publish_head(
+        &store,
+        "repo",
+        "workspace-b",
+        "op-b",
+        vec!["base".to_string()],
+        refs,
+        snapshot_b,
+    )
+    .await;
+    store
+        .merge_op_heads(
+            "repo",
+            scope_key,
+            &["base".to_string()],
+            &["op-b".to_string()],
+        )
+        .await
+        .expect("retain both heads");
+
+    let objects_before = fs::read_dir(directory.path().join("objects"))
+        .expect("objects dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let pinned = scope(directory.path(), directory.path());
+    let engine = ReconcileEngine::new(pinned, "repo", store.clone());
+    let outcome = engine.reconcile(true).await.expect("dry-run reconcile");
+    assert!(matches!(outcome, ReconcileOutcome::DryRunConverged { .. }));
+
+    let objects_after = fs::read_dir(directory.path().join("objects"))
+        .expect("objects dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        objects_before, objects_after,
+        "dry-run must not write any object"
+    );
+
+    // The head set is untouched by a dry run.
+    let mut heads = store.read_heads("repo", scope_key).await.expect("heads");
+    heads.sort();
+    assert_eq!(heads, vec!["op-a".to_string(), "op-b".to_string()]);
+}
+
+#[tokio::test]
+async fn reconcile_conflict_exits_non_zero_with_stable_code() {
+    let _test_lock = lock_cli_repository_tests().await;
+    let repository = tempdir().expect("repository");
+    libra::utils::test::setup_with_new_libra_in(repository.path()).await;
+    fs::write(repository.path().join("a.txt"), "one\n").expect("file");
+    for args in [
+        &["add", "a.txt"][..],
+        &["commit", "-m", "first", "--no-verify"][..],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_libra"))
+            .env("LIBRA_SKIP_WEB_BUILD", "1")
+            .args(args)
+            .current_dir(repository.path())
+            .output()
+            .expect("libra command");
+        assert!(output.status.success());
+    }
+    let pinned = RequestScope::resolve(repository.path().to_path_buf()).expect("scope");
+    let database = get_db_conn_instance_for_path(&pinned.storage.join(util::DATABASE))
+        .await
+        .expect("database");
+    let repo_id = ConfigKv::get_with_conn(&database, "libra.repoid")
+        .await
+        .expect("repo id")
+        .expect("repo id entry")
+        .value;
+    let storage = ClientStorage::init_local(pinned.storage.join("objects"));
+    let store = OperationStoreV2::new_for_repo(&repo_id, database, storage.clone());
+    let baseline_id = store
+        .read_heads(&repo_id, pinned.scope.storage_key())
+        .await
+        .expect("heads")
+        .first()
+        .cloned()
+        .expect("baseline head");
+    let baseline = store
+        .load_operation(&baseline_id)
+        .await
+        .expect("baseline")
+        .expect("baseline operation");
+
+    // A diverging branch ref between two sibling heads must be reported as a
+    // conflict with a non-zero exit code (LBR-CONFLICT-002).
+    let baseline_view = store
+        .load_view(&baseline.post_view_oid)
+        .expect("baseline view");
+    let main_snapshot = baseline_view
+        .workspaces
+        .get("main")
+        .copied()
+        .expect("baseline main workspace snapshot");
+    let branch_ref = |commit: &str| {
+        serde_json::json!({
+            "id": 1,
+            "name": "main",
+            "kind": "Branch",
+            "commit": commit,
+            "remote": null,
+            "worktree_id": null,
+        })
+    };
+    for (op, refs) in [
+        ("reconcile-conflict-a", branch_ref("aaaa")),
+        ("reconcile-conflict-b", branch_ref("bbbb")),
+    ] {
+        let view = RepoViewV2 {
+            schema_version: 2,
+            repo_id: repo_id.clone(),
+            refs_facet_oid: refs_facet(&storage, serde_json::json!([refs])),
+            workspaces: [("main".to_string(), main_snapshot)].into_iter().collect(),
+            change_roots: Vec::new(),
+            extension_facets: Default::default(),
+        };
+        let view_oid = store.write_view_manifest(&view).expect("view manifest");
+        store
+            .write_operation(&OperationV2 {
+                op_id: op.to_string(),
+                parent_op_ids: vec![baseline_id.clone()],
+                pre_view_oid: view_oid,
+                post_view_oid: view_oid,
+                kind: OperationKind::Command,
+                status: OperationStatusV2::Success,
+                metadata: OperationMetaV2::default(),
+                restores_op_id: None,
+                reverts_op_id: None,
+                predecessor_map_oid: None,
+            })
+            .await
+            .expect("operation");
+    }
+    store
+        .cas_update_op_heads(
+            &repo_id,
+            pinned.scope.storage_key(),
+            std::slice::from_ref(&baseline_id),
+            &["reconcile-conflict-a".to_string()],
+        )
+        .await
+        .expect("publish conflict a");
+    store
+        .merge_op_heads(
+            &repo_id,
+            pinned.scope.storage_key(),
+            std::slice::from_ref(&baseline_id),
+            &["reconcile-conflict-b".to_string()],
+        )
+        .await
+        .expect("retain both conflict heads");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_libra"))
+        .env("LIBRA_SKIP_WEB_BUILD", "1")
+        .args(["op", "reconcile", "--json"])
+        .current_dir(repository.path())
+        .output()
+        .expect("reconcile");
+    assert!(
+        !output.status.success(),
+        "reconcile conflict must exit non-zero: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("LBR-CONFLICT-002"),
+        "reconcile conflict must carry the stable conflict code: {stderr}"
+    );
+
+    // The head set is preserved on conflict.
+    let mut heads = store
+        .read_heads(&repo_id, pinned.scope.storage_key())
+        .await
+        .expect("heads");
+    heads.sort();
+    assert_eq!(
+        heads,
+        vec![
+            "reconcile-conflict-a".to_string(),
+            "reconcile-conflict-b".to_string()
+        ]
+    );
+}
+
+#[tokio::test]
 async fn reconcile_nothing_to_do_on_single_head() {
     let _test_lock = lock_cli_repository_tests().await;
     let repository = tempdir().expect("repository");

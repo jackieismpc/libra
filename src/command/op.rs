@@ -386,11 +386,15 @@ async fn handle_op_reconcile(dry_run: bool, output: &OutputConfig) -> CliResult<
             other => CliError::fatal(other.to_string()),
         })?;
     let payload = OpOutput::Reconcile { outcome };
+    let conflicted = matches!(
+        &payload,
+        OpOutput::Reconcile {
+            outcome: ReconcileOutcome::Conflicted { .. }
+        }
+    );
     if output.is_json() {
-        emit_json_data("op", &payload, output)
-    } else if output.quiet {
-        Ok(())
-    } else {
+        emit_json_data("op", &payload, output)?;
+    } else if !output.quiet {
         match &payload {
             OpOutput::Reconcile { outcome } => match outcome {
                 ReconcileOutcome::NothingToReconcile => {
@@ -428,8 +432,17 @@ async fn handle_op_reconcile(dry_run: bool, output: &OutputConfig) -> CliResult<
             },
             _ => unreachable!("payload constructed above"),
         }
-        Ok(())
     }
+    if conflicted {
+        return Err(CliError::fatal(
+            "reconcile conflicts must be resolved before the head set can converge",
+        )
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+        .with_hint(
+            "inspect the conflict targets above, resolve the reference disagreement, then retry",
+        ));
+    }
+    Ok(())
 }
 
 async fn handle_op_doctor(fix: bool, dry_run: bool, output: &OutputConfig) -> CliResult<()> {

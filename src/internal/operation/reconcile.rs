@@ -247,9 +247,6 @@ impl ReconcileEngine {
         }))
         .map_err(|error| ReconcileError::Storage(error.to_string()))?;
         let refs_oid = ObjectHash::from_type_and_data(ObjectType::Blob, &refs_bytes);
-        self.store
-            .write_blob(&refs_oid, &refs_bytes, ObjectType::Blob)
-            .map_err(ReconcileError::from)?;
         let converged_view = RepoViewV2 {
             schema_version: REPO_VIEW_SCHEMA_VERSION,
             repo_id: self.repo_id.clone(),
@@ -258,16 +255,22 @@ impl ReconcileEngine {
             change_roots: Vec::new(),
             extension_facets: Default::default(),
         };
-        let converged_view_oid = self
-            .store
-            .write_view_manifest(&converged_view)
-            .map_err(ReconcileError::from)?;
 
+        // Dry-run must not write to the object store or the operation DAG; it
+        // only reports the convergence it would have produced.
         if dry_run {
             return Ok(ReconcileOutcome::DryRunConverged {
                 parents: head_ids.clone(),
             });
         }
+
+        self.store
+            .write_blob(&refs_oid, &refs_bytes, ObjectType::Blob)
+            .map_err(ReconcileError::from)?;
+        let converged_view_oid = self
+            .store
+            .write_view_manifest(&converged_view)
+            .map_err(ReconcileError::from)?;
 
         // Publish the reconcile operation with every concurrent head as an
         // explicit parent, then converge the head set to it.
