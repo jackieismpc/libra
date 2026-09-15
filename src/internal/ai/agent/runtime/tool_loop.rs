@@ -338,6 +338,89 @@ fn tool_loop_cancelled_error() -> CompletionError {
     CompletionError::ResponseError("Tool loop cancelled before a new side effect began".to_string())
 }
 
+/// Maximum number of successful mutating tool operations carried as the
+/// pending AI-operation batch to the next commit/rewrite. Beyond this the
+/// oldest entries are dropped so the batch stays bounded.
+const MAX_PENDING_AI_OPERATION_IDS: usize = 128;
+
+/// Upper bound for the serialized pending-operation id list passed through the
+/// `LIBRA_AI_PENDING_OPERATION_IDS` environment variable (64 KiB). The list is
+/// truncated to the newest ids that fit within this budget.
+const MAX_PENDING_AI_OPERATIONS_BYTES: usize = 64 * 1024;
+
+/// A successful mutating tool operation awaiting attachment to a later
+/// commit/rewrite change, with the exact working directory its pending link was
+/// persisted against so loop-end cleanup does not fall back to process cwd.
+#[derive(Clone, Debug)]
+struct PendingAiOperation {
+    operation_id: String,
+    working_dir: PathBuf,
+}
+
+/// Derive the bounded pending-operation id list passed to a child command.
+///
+/// The batch is capped by both entry count and serialized byte budget so the
+/// environment variable can never grow without bound over a long-lived loop.
+/// When truncation drops older entries, a warning is emitted once.
+fn bounded_pending_operation_ids(
+    pending: &[PendingAiOperation],
+    _operation_id: &str,
+) -> Vec<String> {
+    let mut budget = MAX_PENDING_AI_OPERATIONS_BYTES;
+    let mut newest_first = Vec::new();
+    for entry in pending.iter().rev() {
+        if newest_first.len() >= MAX_PENDING_AI_OPERATION_IDS {
+            break;
+        }
+        let size = entry.operation_id.len() + 1;
+        if size > budget {
+            break;
+        }
+        budget -= size;
+        newest_first.push(entry.operation_id.clone());
+    }
+    newest_first.reverse();
+    if newest_first.len() < pending.len() {
+        tracing::warn!(
+            pending = pending.len(),
+            bounded = newest_first.len(),
+            "pending AI operation batch exceeded its cap; older operations were dropped"
+        );
+    }
+    newest_first
+}
+
+/// Remove pending AI-operation links that a finished tool loop never attached
+/// to a change. A successful mutating tool call is expected to be consumed by a
+/// later commit; when the loop ends without one, the `change_id IS NULL` rows
+/// would otherwise accumulate for the session's lifetime.
+async fn cleanup_pending_ai_operations(pending: &[PendingAiOperation]) {
+    for entry in pending {
+        let context = AiOperationContext {
+            operation_id: entry.operation_id.clone(),
+            session_id: None,
+            run_id: None,
+            tool_invocation_id: String::new(),
+            intent_id: None,
+            repo_id: None,
+            pending_operation_ids: Vec::new(),
+        };
+        if let Err(error) =
+            crate::internal::ai::libra_vcs::remove_pending_ai_operation_link_for_tool(
+                &context,
+                &entry.working_dir,
+            )
+            .await
+        {
+            tracing::warn!(
+                %error,
+                operation_id = %entry.operation_id,
+                "failed to clean up pending AI operation link at loop end"
+            );
+        }
+    }
+}
+
 /// Run a prompt through a completion model, allowing iterative tool calls.
 ///
 /// Functional scope: the simplest entry point — starts with no history, no observer,
@@ -432,7 +515,7 @@ where
         .collect::<HashSet<_>>();
     let mut executed_tool_signatures: VecDeque<String> = VecDeque::new();
     let mut executed_tool_signature_counts: HashMap<String, usize> = HashMap::new();
-    let mut pending_ai_operation_ids = Vec::new();
+    let mut pending_ai_operations: Vec<PendingAiOperation> = Vec::new();
 
     let effective_registry = registry_with_source_tools(registry, &config).map_err(|error| {
         CompletionError::ResponseError(format!("failed to load source tools: {error}"))
@@ -452,10 +535,14 @@ where
         });
     }
 
-    loop {
-        if tool_loop_cancelled(&config) {
-            return Err(tool_loop_cancelled_error());
-        }
+    // The tool loop owns the pending AI-operation batch: successful mutating
+    // calls are attached to the next commit/rewrite, and any link the loop ends
+    // without consuming is removed once, regardless of the exit path.
+    let result = (async {
+        loop {
+            if tool_loop_cancelled(&config) {
+                return Err(tool_loop_cancelled_error());
+            }
         if turn_count >= max_turns {
             return Err(CompletionError::ResponseError(format!(
                 "Tool loop exceeded maximum turns ({max_turns})"
@@ -717,7 +804,7 @@ where
                     invocation = invocation.with_runtime_context(runtime_context);
                 }
                 if let Some(ai_operation) =
-                    ai_operation_context(&config, &call.id, &pending_ai_operation_ids)
+                    ai_operation_context(&config, &call.id, &pending_ai_operations)
                 {
                     invocation = invocation.with_ai_operation(ai_operation);
                 }
@@ -824,7 +911,10 @@ where
                     && tool_result.as_ref().is_ok_and(ToolOutput::is_success)
                     && let Some(ai_operation) = ai_operation.as_ref()
                 {
-                    pending_ai_operation_ids.push(ai_operation.operation_id.clone());
+                    pending_ai_operations.push(PendingAiOperation {
+                        operation_id: ai_operation.operation_id.clone(),
+                        working_dir: tool_working_dir.clone(),
+                    });
                 }
                 if mutates_state && let Some(cancellation) = config.cancellation.as_ref() {
                     cancellation.mark_mutation_finished();
@@ -914,7 +1004,11 @@ where
             return Err(empty_or_reasoning_only_error(&response));
         }
         return Err(empty_or_reasoning_only_error(&response));
-    }
+        }
+    })
+    .await;
+    cleanup_pending_ai_operations(&pending_ai_operations).await;
+    result
 }
 
 /// Make a provider event unique within a tool-loop run while preserving the
@@ -1115,7 +1209,7 @@ fn terminal_tool_final_text(tool_name: &str, tool_result: &Result<ToolOutput, St
 fn ai_operation_context(
     config: &ToolLoopConfig,
     call_id: &str,
-    pending_operation_ids: &[String],
+    pending_operations: &[PendingAiOperation],
 ) -> Option<AiOperationContext> {
     let usage = config.usage_context.as_ref();
     let intent_id = config
@@ -1131,7 +1225,7 @@ fn ai_operation_context(
         .map(|event_id| format!("{event_id}:tool-call:{call_id}"))
         .unwrap_or_else(|| format!("tool-call:{call_id}"));
     Some(AiOperationContext {
-        operation_id,
+        operation_id: operation_id.clone(),
         session_id: usage.and_then(|context| context.session_id.clone()),
         run_id: config.run_id.clone().or_else(|| {
             usage.and_then(|context| {
@@ -1144,7 +1238,7 @@ fn ai_operation_context(
         tool_invocation_id: call_id.to_string(),
         intent_id,
         repo_id: usage.and_then(|context| context.repo_id.clone()),
-        pending_operation_ids: pending_operation_ids.to_vec(),
+        pending_operation_ids: bounded_pending_operation_ids(pending_operations, &operation_id),
     })
 }
 
@@ -1730,6 +1824,135 @@ mod tests {
             config.goal_stop_policy.is_none(),
             "goal_stop_policy must default to None so existing callers stay on the legacy non-Goal path",
         );
+    }
+
+    #[test]
+    fn pending_ai_operation_batch_is_bounded_by_count_and_bytes() {
+        let pending = |ids: Vec<String>| {
+            ids.into_iter()
+                .map(|operation_id| PendingAiOperation {
+                    operation_id,
+                    working_dir: PathBuf::from("/tmp/repo"),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Under both caps every id is preserved, newest-last order intact.
+        let small = pending((0..10).map(|i| format!("op-{i:03}")).collect::<Vec<_>>());
+        let bounded = bounded_pending_operation_ids(&small, "current-op");
+        assert_eq!(bounded.len(), 10);
+        assert_eq!(bounded[0], "op-000");
+        assert_eq!(bounded[9], "op-009");
+
+        // Count cap: only the newest 128 survive, oldest dropped first.
+        let many = pending(
+            (0..MAX_PENDING_AI_OPERATION_IDS + 20)
+                .map(|i| format!("op-{i:04}"))
+                .collect::<Vec<_>>(),
+        );
+        let bounded = bounded_pending_operation_ids(&many, "current-op");
+        assert_eq!(bounded.len(), MAX_PENDING_AI_OPERATION_IDS);
+        assert_eq!(bounded[0], "op-0020");
+        assert_eq!(
+            bounded[MAX_PENDING_AI_OPERATION_IDS - 1],
+            format!("op-{:04}", MAX_PENDING_AI_OPERATION_IDS + 19)
+        );
+
+        // Byte cap: long ids are truncated to the newest that fit the budget,
+        // still newest-last order and strictly under the limit.
+        let long = pending(
+            (0..200)
+                .map(|i| format!("long-operation-id-{i:03}-{}", "x".repeat(100)))
+                .collect::<Vec<_>>(),
+        );
+        let bounded = bounded_pending_operation_ids(&long, "current-op");
+        assert!(!bounded.is_empty(), "at least the newest id survives");
+        assert!(
+            bounded.join(",").len() < MAX_PENDING_AI_OPERATIONS_BYTES,
+            "serialized batch must fit the byte budget"
+        );
+        assert_eq!(
+            bounded.last().map(String::as_str),
+            long.last().map(|entry| entry.operation_id.as_str()),
+            "the newest pending operation is never dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_end_cleanup_removes_unconsumed_pending_links() {
+        use sea_orm::ConnectionTrait;
+
+        use crate::internal::ai::libra_vcs::record_pending_ai_operation_link_for_tool;
+
+        let repository = tempfile::tempdir().unwrap();
+        let storage = repository.path().join(crate::utils::util::ROOT_DIR);
+        std::fs::create_dir(&storage).unwrap();
+        crate::internal::db::create_database(
+            storage.join(crate::utils::util::DATABASE).to_str().unwrap(),
+        )
+        .await
+        .unwrap()
+        .close()
+        .await
+        .unwrap();
+
+        let context = AiOperationContext {
+            operation_id: "pending-op-1".to_string(),
+            session_id: None,
+            run_id: None,
+            tool_invocation_id: "call-1".to_string(),
+            intent_id: None,
+            repo_id: Some("target-repository".to_string()),
+            pending_operation_ids: Vec::new(),
+        };
+        record_pending_ai_operation_link_for_tool(&context, repository.path())
+            .await
+            .expect("record pending link");
+
+        // The pending link exists before cleanup.
+        let storage =
+            crate::utils::util::try_get_storage_path(Some(repository.path().to_path_buf()))
+                .unwrap();
+        let database = crate::internal::db::get_db_conn_instance_for_path(
+            &storage.join(crate::utils::util::DATABASE),
+        )
+        .await
+        .unwrap();
+        let before = database
+            .query_all_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Sqlite,
+                "SELECT operation_id FROM ai_operation_link WHERE operation_id = ? AND change_id IS NULL",
+                ["pending-op-1".to_string().into()],
+            ))
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(before, 1, "the pending link must exist before cleanup");
+
+        cleanup_pending_ai_operations(&[PendingAiOperation {
+            operation_id: "pending-op-1".to_string(),
+            working_dir: repository.path().to_path_buf(),
+        }])
+        .await;
+
+        let after = database
+            .query_all_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Sqlite,
+                "SELECT operation_id FROM ai_operation_link WHERE operation_id = ? AND change_id IS NULL",
+                ["pending-op-1".to_string().into()],
+            ))
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(
+            after, 0,
+            "loop-end cleanup must remove the unconsumed pending link"
+        );
+
+        crate::internal::db::reset_db_conn_instance_for_path(
+            &storage.join(crate::utils::util::DATABASE),
+        )
+        .await;
     }
 
     /// `goal_stop_policy` accepts a `GoalBound { goal_id }` policy
