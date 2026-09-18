@@ -70,7 +70,6 @@ for any other non-roster agent — return an actionable unsupported error.
 | `session show <id>` | Show a captured session, including a non-sensitive retryable checkpoint-capture diagnostic when the last Codex Stop failed |
 | `session stop <id>` | Mark a captured session as stopped |
 | `session resume <id>` | Mark a stopped captured session active again |
-| `session promote <id>` | Promote a captured session into Libra intent metadata |
 | `session derive-tool-calls <id>` | Derive tool-call records from a captured session |
 | `checkpoint list` | List captured checkpoints |
 | `checkpoint show <id>` | Show checkpoint metadata |

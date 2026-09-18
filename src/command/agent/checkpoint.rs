@@ -18,7 +18,7 @@ use serde::Serialize;
 use super::{CheckpointListArgs, CheckpointRewindArgs, CheckpointShowArgs, CheckpointSubcommand};
 use crate::{
     command::load_object,
-    internal::{ai::history::parse_content_hash, db::get_db_conn_instance},
+    internal::{ai::traces::parse_content_hash, db::get_db_conn_instance},
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         object::read_git_object_bounded,

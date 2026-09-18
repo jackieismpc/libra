@@ -20,7 +20,7 @@ libra clone [OPTIONS] <REMOTE_REPO> [LOCAL_PATH]
 
 配置 schema 兼容性按角色判定。`libra clone` 在信任配置前，以只读方式检查 GlobalConfig 与 SystemConfig 元数据。真正的配置 future schema，或未注册／名称不匹配的迁移 receipt，在命令需要该作用域时以 `LBR-CONFIG-001` fail-closed。当前 manifest 已知的 Repository-only receipt（包括 `2026090801`）不会使配置库被误判为 future，受支持的配置值仍可读取。本 build 能识别 configuration-owned legacy-reader barrier；详见[配置兼容性](config.md#配置-schema-兼容性)。
 
-全局路径为 `LIBRA_CONFIG_GLOBAL_DB` 或 `~/.libra/config.db`，系统路径为 `LIBRA_CONFIG_SYSTEM_DB` 或 `/etc/libra/config.db`。完整的进程环境／repo-local 存储设置可以证明无需 GlobalConfig（`cloud` 还须满足 D1 设置），但不能证明无需 SystemConfig 默认值。诊断只说明受影响的 scope、ledger 与版本，不输出配置值或未信任 receipt 名称。
+全局路径为 `LIBRA_CONFIG_GLOBAL_DB` 或 XDG 配置目录（`$XDG_CONFIG_HOME/libra/config.db`，默认 `<home>/.config/libra/config.db`），在自动迁移前回退到 legacy `<home>/.libra/config.db`；系统路径为 `LIBRA_CONFIG_SYSTEM_DB` 或 `/etc/libra/config.db`。完整的进程环境／repo-local 存储设置可以证明无需 GlobalConfig（`cloud` 还须满足 D1 设置），但不能证明无需 SystemConfig 默认值。诊断只说明受影响的 scope、ledger 与版本，不输出配置值或未信任 receipt 名称。
 
 本阶段对未知／不支持的状态只有升级路径，不执行自动修复。安装兼容的较新 Libra：
 `curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh | sh`。
@@ -30,30 +30,13 @@ libra clone [OPTIONS] <REMOTE_REPO> [LOCAL_PATH]
 
 ### `<REMOTE_REPO>`（必需）
 
-要克隆的远程仓库 URL。支持 SSH（`git@host:user/repo.git`）和 HTTPS（`https://host/user/repo.git`）协议，也支持本地文件系统路径。`libra+cloud://` 发布源会被识别并严格校验。恢复开始前，克隆域名必须已在本地配置；否则 Libra 返回 `LBR-AUTH-001`，并且不会创建目标目录。已配置的云源会在创建目标目录前解析 D1 site、repository 行、已发布 refs、选中/默认 revision、对象索引和 R2 对象可用性。随后恢复会初始化本地 Libra 仓库，从 R2 下载已索引的 Git 对象，恢复 refs 元数据，写入 origin 云配置，并检出选中/默认 revision。云源绝不会回退到通用 Git discovery。
+要克隆的远程仓库 URL。支持 SSH（`git@host:user/repo.git`）和 HTTPS（`https://host/user/repo.git`）协议，也支持本地文件系统路径。原 Cloudflare 发布站点恢复源已随 Publish 产品拆除；再使用该源会得到用法错误（退出码 129），并提示改用 git remote 或 `libra cloud` 做仓库备份。对应的 clone-domain 配置键已冷冻，不再读取。
 
 ```bash
 libra clone git@github.com:user/repo.git
 libra clone https://github.com/user/repo.git
 libra clone /path/to/local/repo
-libra clone libra+cloud://code.example.com/kepler-ledger
-libra clone libra+cloud://code.example.com/repo/rp_8f4c1b
-libra clone "libra+cloud://code.example.com/kepler-ledger?ref=refs/tags/v1.0.0"
-libra clone "libra+cloud://code.example.com/kepler-ledger?revision=latest"
 ```
-
-对于 `libra+cloud://`，authority 是已配置的克隆域名。路径必须是 `/<slug>` 或 `/repo/<repo_id>`。只允许一个选择器：`?ref=<branch|tag|full-ref>` 或 `?revision=<oid|latest>`。
-首个 Cloudflare 恢复表面不接受 Git 传输整形标志：`--branch`、`--depth`、`--single-branch`、`--bare`、`--mirror`、`--filter`、`--shallow-since` 和 `--shallow-exclude` 会在查找 clone-domain 配置之前、创建目标目录之前返回 `LBR-CLI-002`。请在源 URL 上使用 `?ref=<branch|tag|full-ref>` 选择检出目标。
-
-必需的 clone-domain 配置键：
-
-```text
-cloud.clone_domains.<domain>.account_id
-cloud.clone_domains.<domain>.d1_database_id
-cloud.clone_domains.<domain>.r2_bucket
-```
-
-云站点解析还要求 `LIBRA_D1_API_TOKEN`；Libra 先读取 `vault.env.LIBRA_D1_API_TOKEN`，再读取导出的环境变量，因此 CLI 可以在开始恢复前查询配置的 D1 数据库。
 
 ### `[LOCAL_PATH]`
 
@@ -66,7 +49,6 @@ libra clone git@github.com:user/repo.git my-dir
 ### `-b, --branch <NAME>`
 
 检出 `<NAME>`，而不是远程 HEAD。该分支必须存在于远程；否则会报 “remote branch not found” 错误。
-对于 `libra+cloud://` 源，请改为在 URL 中使用 `?ref=<branch|tag|full-ref>`；`--branch` 会在恢复开始前被拒绝。
 
 ```bash
 libra clone -b develop git@github.com:user/repo.git
@@ -74,7 +56,7 @@ libra clone -b develop git@github.com:user/repo.git
 
 ### `--single-branch`
 
-只获取通向单个分支 tip 的历史（HEAD，或 `-b` 给出的分支）。当大型仓库只需要一个分支时，可减少传输量。只有 Git 远程支持这种传输优化；`libra+cloud://` 恢复会拒绝它，因为恢复出的本地仓库必须保留所有已发布 refs。
+只获取通向单个分支 tip 的历史（HEAD，或 `-b` 给出的分支）。当大型仓库只需要一个分支时，可减少传输量。只有 Git 远程支持这种传输优化。
 
 ```bash
 libra clone --single-branch -b main git@github.com:user/repo.git
@@ -91,7 +73,6 @@ libra clone --single-branch --no-single-branch git@github.com:user/repo.git
 ### `--bare`
 
 创建没有工作树的裸仓库。目标目录会直接成为对象存储。适用于中心/服务端仓库。
-裸 Cloudflare 恢复不属于首个恢复表面；`libra+cloud://` 当前会显式拒绝 `--bare`。
 
 ```bash
 libra clone --bare git@github.com:user/repo.git
@@ -99,7 +80,7 @@ libra clone --bare git@github.com:user/repo.git
 
 ### `--mirror`
 
-建立源仓库的镜像（类似 `git clone --mirror`）。隐含 `--bare`，把已获取的分支原样映射到 `refs/heads/*`、tag 保留在 `refs/tags/*`——不保留任何 `refs/remotes/*` tracking ref——并写入 `remote.<name>.mirror=true` 标记。适用于服务端托管或备份仓库。不支持 `libra+cloud://` 源（以 `LBR-CLI-002` 拒绝）。
+建立源仓库的镜像（类似 `git clone --mirror`）。隐含 `--bare`，把已获取的分支原样映射到 `refs/heads/*`、tag 保留在 `refs/tags/*`——不保留任何 `refs/remotes/*` tracking ref——并写入 `remote.<name>.mirror=true` 标记。适用于服务端托管或备份仓库。
 
 相对 Git 的收窄：(1) Git 原样镜像 `refs/*:refs/*`；Libra 只镜像其 fetch 传输的内容——每个已获取分支提升到 `refs/heads/*`、tag 保留，但 Libra 不获取的命名空间（如 `refs/notes/*`）不镜像。(2) 由于 Libra 的 fetch 把 `refs/heads/mr/*` 与 `refs/mr/*` 折叠进同一 tracking 命名空间，这类 ref 会被镜像为 `refs/heads/mr/*`（不保留出处）。(3) `mirror=true` 仅为标记——不写 `+refs/*:refs/*` refspec，且 `libra fetch` 尚不感知镜像，故刷新镜像不是自动的。
 
@@ -109,7 +90,7 @@ libra clone --mirror git@github.com:user/repo.git repo-mirror.git
 
 ### `--filter <spec>` / `--shallow-since <date>` / `--shallow-exclude <rev>`
 
-Git 用于*减少*传输内容的 fetch 整形标志：`--filter`（如 `blob:none`）是部分克隆，`--shallow-since`/`--shallow-exclude` 按日期或排除 ref 限定浅历史。**Libra 没有 partial-clone/promisor 支持，其 fetch 也只支持 `--depth` 浅历史**，故这些标志被接受但**忽略并告警**——即不应用该优化（克隆仍会取回这些标志本会裁剪掉的内容，仅在同时给出 `--depth` 时按 `--depth` 限定）。不带 `--depth` 时即为**完整克隆**——是被过滤/按日期限定克隆结果的正确超集，故结果始终可用；这与 Git 自身在服务器无法处理 `--filter` 时告警并回退到完整克隆一致。`--shallow-exclude` 可多次给出。不支持 `libra+cloud://` 源（与 `--depth` 一样以 `LBR-CLI-002` 拒绝）。
+Git 用于*减少*传输内容的 fetch 整形标志：`--filter`（如 `blob:none`）是部分克隆，`--shallow-since`/`--shallow-exclude` 按日期或排除 ref 限定浅历史。**Libra 没有 partial-clone/promisor 支持，其 fetch 也只支持 `--depth` 浅历史**，故这些标志被接受但**忽略并告警**——即不应用该优化（克隆仍会取回这些标志本会裁剪掉的内容，仅在同时给出 `--depth` 时按 `--depth` 限定）。不带 `--depth` 时即为**完整克隆**——是被过滤/按日期限定克隆结果的正确超集，故结果始终可用；这与 Git 自身在服务器无法处理 `--filter` 时告警并回退到完整克隆一致。`--shallow-exclude` 可多次给出。
 
 ```bash
 libra clone --filter blob:none git@github.com:user/repo.git
@@ -127,8 +108,8 @@ libra clone -l /path/to/source /path/to/dest
 ### `--depth <N>`
 
 创建浅克隆，将历史截断到指定提交数。`N` 必须是正整数。
-只有 Git 远程支持浅传输。Cloudflare 恢复会拒绝 `--depth`，因为它必须下载完整的已发布对象集合。
-本地 Libra 源同样会以 `LBR-REPO-002` 拒绝 `--depth`：该传输路径不能声明 shallow boundary，若接受会留下缺父提交的克隆。此 fail-closed 行为是已接受的终态（开发兼容登记 D20 决策），不是待补缺口。
+只有 Git 远程支持浅传输。
+本地 Libra 源会以 `LBR-REPO-002` 拒绝 `--depth`：该传输路径不能声明 shallow boundary，若接受会留下缺父提交的克隆。此 fail-closed 行为是已接受的终态（开发兼容登记 D20 决策），不是待补缺口。
 
 ```bash
 libra clone --depth 1 git@github.com:user/repo.git
@@ -178,7 +159,7 @@ libra clone --no-checkout git@github.com:user/repo.git
 
 ### `-o`, `--origin <NAME>`
 
-用 `<NAME>` 命名远端（及其 `refs/remotes/<NAME>/*` 跟踪引用），取代默认的 `origin`，对齐 `git clone -o`。分支跟踪配置（`branch.<branch>.remote`）与 `remote.<NAME>.url` 都使用所选名称。该选项适用于标准克隆；`libra+cloud` 克隆始终使用 `origin`。
+用 `<NAME>` 命名远端（及其 `refs/remotes/<NAME>/*` 跟踪引用），取代默认的 `origin`，对齐 `git clone -o`。分支跟踪配置（`branch.<branch>.remote`）与 `remote.<NAME>.url` 都使用所选名称。该选项适用于标准克隆。
 
 ```bash
 libra clone -o upstream git@github.com:user/repo.git
@@ -307,9 +288,9 @@ warning: You appear to have cloned an empty repository.
 - `branch` 是实际检出的分支；远程没有 refs 时为 `null`
 - `gitignore_converted` 列出从 `.gitignore` 转换写出的 `.libraignore` 文件（工作区相对路径）；始终存在（裸克隆或源无 `.gitignore` 时为空）
 - 使用 `--depth` 时，`shallow` 为 `true`
-- 普通 Git/本地克隆会省略 `source_kind` 和 `cloud_site`；`libra+cloud://` 克隆会加入它们，包含 clone domain、site id、slug、repo id、选中 ref 和恢复的 revision
+- 普通 Git/本地克隆会省略 `source_kind` 和 `cloud_site`
 - init 中的 `ref_format` 和 `converted_from` 被有意排除
-- `objects_fetched` / `bytes_received` 给出 Git 源 fetch pack 的对象数与字节大小；`libra+cloud://` 恢复（从 R2 下载索引对象而非 pack 流）会省略这两个字段
+- `objects_fetched` / `bytes_received` 给出 Git 源 fetch pack 的对象数与字节大小
 
 ## 设计动机
 
@@ -327,7 +308,7 @@ Libra 使用 `.libraignore` 作为忽略策略。非裸克隆期间，每个检�
 
 ### 用 `--depth` 进行浅克隆
 
-浅克隆对于 CI/CD 流水线和不需要完整历史的大型 monorepo 很重要。Libra 对能协商 shallow boundary 的 Git 远程支持 `--depth N`：历史会截断到指定提交数。depth 值在解析时校验（必须是正整数），并传递到 fetch 协议层。本地 Libra 源维持 fail-closed 返回 `LBR-REPO-002`（已决终态，见开发兼容登记 D20）。对于 `--shallow-since`/`--shallow-exclude`（以及 partial-clone 的 `--filter`）：Libra 的 fetch 只支持 `--depth`、无 partial-clone/promisor 支持，故这些 flag 按 no-op 接受——忽略并告警；**不应用该优化**，历史仅在同时给出 `--depth` 时按 `--depth` 限定，不带 `--depth` 时即为完整克隆（被过滤/浅克隆结果的正确超集）。每个给出的 flag 追加一条 warning（与 Git 在服务器不支持 `--filter` 时告警回退到完整克隆一致）；对 `libra+cloud://` 则与 `--depth` 一样拒绝。
+浅克隆对于 CI/CD 流水线和不需要完整历史的大型 monorepo 很重要。Libra 对能协商 shallow boundary 的 Git 远程支持 `--depth N`：历史会截断到指定提交数。depth 值在解析时校验（必须是正整数），并传递到 fetch 协议层。本地 Libra 源维持 fail-closed 返回 `LBR-REPO-002`（已决终态，见开发兼容登记 D20）。对于 `--shallow-since`/`--shallow-exclude`（以及 partial-clone 的 `--filter`）：Libra 的 fetch 只支持 `--depth`、无 partial-clone/promisor 支持，故这些 flag 按 no-op 接受——忽略并告警；**不应用该优化**，历史仅在同时给出 `--depth` 时按 `--depth` 限定，不带 `--depth` 时即为完整克隆（被过滤/浅克隆结果的正确超集）。每个给出的 flag 追加一条 warning（与 Git 在服务器不支持 `--filter` 时告警回退到完整克隆一致）。
 
 ### `--sparse` 被有意不支持
 

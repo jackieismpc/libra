@@ -859,3 +859,34 @@ async fn init_refuses_to_initialize_inside_the_libra_home() {
         "no repository layout may be written into the Libra home"
     );
 }
+
+/// ADR-GCX-01: the XDG global configuration directory is reserved per-user
+/// state; `libra init` must refuse it just like the Libra home.
+#[tokio::test]
+async fn init_refuses_to_initialize_inside_the_global_config_dir() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("fake-home");
+    let config_dir = home.join(".config").join("libra");
+    fs::create_dir_all(&config_dir).unwrap();
+
+    let xdg_config = home.join(".config");
+    let envs = [
+        ("HOME", home.to_str().unwrap()),
+        ("USERPROFILE", home.to_str().unwrap()),
+        ("XDG_CONFIG_HOME", xdg_config.to_str().unwrap()),
+    ];
+    let output = run_libra_command_with_env(&["init"], &config_dir, &envs);
+    assert!(
+        !output.status.success(),
+        "initializing inside the global config directory must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Libra home") && stderr.contains("global configuration"),
+        "the refusal must name the per-user state directory: {stderr}"
+    );
+    assert!(
+        !config_dir.join("objects").exists(),
+        "no repository layout may be written into the global config directory"
+    );
+}

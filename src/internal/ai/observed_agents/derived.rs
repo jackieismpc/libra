@@ -75,7 +75,7 @@
 
 use serde_json::Value;
 
-use crate::internal::ai::{orchestrator::types::ToolCallRecord, session::SessionState};
+use crate::internal::ai::{session::SessionState, tool_call_record::ToolCallRecord};
 
 /// Walk `session.metadata["normalized_events"]` and return one
 /// [`ToolCallRecord`] per `tool_use` lifecycle event. Returns an empty

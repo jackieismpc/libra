@@ -25,7 +25,6 @@ use sea_orm::{ConnectionTrait, Statement};
 
 use crate::{
     command,
-    command::code::ControlMode,
     internal::{config::ConfigKv, db},
     utils,
     utils::{
@@ -61,8 +60,8 @@ Command Groups:
     ", lfs, ls-files, check-ignore, check-attr, check-mailmap, worktree
   History Inspection      log, shortlog, show, show-ref, format-patch, ls-remote, ls-tree, diff, grep, blame, describe, notes, archive, revision
   Commit And Branching    commit, branch, switch, checkout, tag, merge, mergetool, rebase, reset, cherry-pick, revert, am, rerere, metadata
-  Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, publish, credential, bundle, auth, login, logout, whoami
-  AI And Automation       code, automation, usage, graph, sandbox, agent, review, investigate, service
+  Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, credential, bundle, auth, login, logout, whoami
+  AI And Automation       automation, sandbox, agent, review, investigate, service
   Maintenance And Plumbing fsck, maintenance, repack, logfile, upgrade, cat-file, hash-object, write-tree, read-tree, update-index, update-ref, merge-file, merge-base, apply, mailinfo, diff-tree, diff-index, diff-files, fast-export, fast-import, replace, verify-pack, rev-parse, rev-list, symbolic-ref, reflog, bisect, for-each-ref, commit-tree, file, alternates, deps
 
 Help Topics:
@@ -721,19 +720,9 @@ enum Commands {
     Open(command::open::OpenArgs),
     #[command(about = "Cloud backup and restore operations (D1/R2)")]
     Cloud(command::cloud::CloudArgs),
-    #[command(about = "Manage read-only Cloudflare Worker publishing")]
-    Publish(command::publish::PublishArgs),
 
-    #[command(about = "Launch an interactive AI coding session (Web Code UI default)")]
-    Code(command::code::CodeArgs),
     #[command(about = "Manage AI automation rules and history")]
     Automation(command::automation::AutomationArgs),
-    #[command(about = "Report AI provider/model usage")]
-    Usage(command::usage::UsageArgs),
-    #[command(
-        about = "Inspect an AI thread version graph (JSON/machine output; interactive view in Web Code UI)"
-    )]
-    Graph(command::graph::GraphArgs),
     #[command(about = "Inspect AI sandbox diagnostics")]
     Sandbox(command::sandbox::SandboxArgs),
     #[command(about = "Manage external-agent capture (Claude Code, Gemini, …)")]
@@ -1618,34 +1607,12 @@ fn command_preflight(command: &Commands, structured_output: bool) -> CliResult<C
         }
         // Config global/system scopes don't require a repository.
         Commands::Config(cfg) if cfg.global || cfg.system || command::config::is_schema_doctor_request(cfg) => Ok(CommandPreflight::none()),
-        // W4-02: `--control stdio` is a client-only JSON-RPC transport — no
-        // repository/hash-kind preflight.
-        Commands::Code(code_args) if code_args.control == ControlMode::Stdio => {
-            Ok(CommandPreflight::none())
-        }
-        Commands::Code(code_args) => {
-            let working_dir = command::code::resolve_code_preflight_working_dir(code_args)?;
-            let storage = utils::util::try_get_storage_path(Some(working_dir.clone()))
-                .map_err(|error| repo_resolution_error(error, Some(&working_dir)))?;
-            Ok(CommandPreflight::repo(storage))
-        }
-        Commands::Graph(graph_args) => {
-            // W5-08: bare (non-JSON) `libra graph` is the removed interactive
-            // entry. Skip repository preflight so the handler's stable
-            // removal refusal is deterministic and independent of repository
-            // state — no repo resolution/maintenance runs for a call that is
-            // always refused.
-            if !structured_output {
-                return Ok(CommandPreflight::none());
-            }
-            let storage = utils::util::try_get_storage_path(graph_args.repo.clone())
-                .map_err(|error| repo_resolution_error(error, graph_args.repo.as_deref()))?;
-            Ok(CommandPreflight::repo(storage))
-        }
         Commands::Agent(command::agent::AgentArgs {
             command: command::agent::AgentSubcommand::Graph(graph_args),
         }) => {
-            // W5-08: same removal-refusal ordering as `Commands::Graph`.
+            // W5-08: bare (non-JSON) `libra agent graph` is the removed
+            // interactive entry. Skip repository preflight so the
+            // handler's stable removal refusal is deterministic.
             if !structured_output {
                 return Ok(CommandPreflight::none());
             }
@@ -1750,10 +1717,6 @@ fn command_scope(command: &Commands) -> CommandScope {
         // These run tools that edit the working tree.
         | Commands::Automation(_)
         | Commands::Sandbox(_) => Composite,
-        // W4-02: client-only control transport — repository scope.
-        Commands::Code(args) if args.control == ControlMode::Stdio => Repository,
-        // Launch paths (observe/write/MCP/`--stdio`) can mutate via tools.
-        Commands::Code(_) => Composite,
 
         // ── Advisory stores: only their MUTATING subcommands ──────────────
         Commands::SparseView(args) => {
@@ -1878,7 +1841,6 @@ fn command_scope(command: &Commands) -> CommandScope {
         | Commands::PackObjects(_)
         | Commands::Bundle(_)
         | Commands::Cloud(_)
-        | Commands::Publish(_)
         // The agent surface keeps its state in the repository database. The
         // parts that DO edit files go through `code` / task worktrees, which
         // take a workspace lease of their own; `agent`, `review` and
@@ -1921,8 +1883,6 @@ fn command_scope(command: &Commands) -> CommandScope {
         | Commands::Mailinfo(_)
         | Commands::VerifyPack(_)
         | Commands::Completions(_)
-        | Commands::Usage(_)
-        | Commands::Graph(_)
         | Commands::Open(_)
         | Commands::Whoami(_) => ReadOnly,
     }
@@ -2015,7 +1975,7 @@ async fn operation_class_for_command(
                 MutationClass::LibraStateMutation
             }
         },
-        Commands::Agent(_) | Commands::Review(_) | Commands::Investigate(_) | Commands::Code(_) => {
+        Commands::Agent(_) | Commands::Review(_) | Commands::Investigate(_) => {
             MutationClass::LibraStateMutation
         }
         _ => match command_scope(command) {
@@ -2042,7 +2002,6 @@ fn command_has_existing_operation_boundary(command: &Commands) -> bool {
             | Commands::HashObject(_)
             | Commands::IndexPack(_)
             | Commands::Service(_)
-            | Commands::Code(_)
             | Commands::Agent(_)
             | Commands::Review(_)
             | Commands::Investigate(_)
@@ -2209,8 +2168,7 @@ fn command_holds_shared_maintenance_lock(command: &Commands) -> bool {
     //   which defers destructive pruning for its (clamped) TTL.
     if matches!(
         command,
-        Commands::Code(_)
-            | Commands::Automation(_)
+        Commands::Automation(_)
             | Commands::Sandbox(_)
             | Commands::Service(_)
             | Commands::Agent(_)
@@ -2806,7 +2764,24 @@ fn classify_parse_error(argv: &[std::ffi::OsString], err: &clap::Error) -> CliEr
         return cli_error;
     }
     if let Some(cmd) = is_top_level_unknown_command(argv, err) {
-        let hints = top_level_unknown_command_hints(err);
+        let mut hints = top_level_unknown_command_hints(err);
+        if cmd == "code" {
+            hints.push(
+                "`libra code` was removed; capture external agents with `libra agent`.".to_string(),
+            );
+        }
+        if cmd == "usage" {
+            hints.push(
+                "`libra usage` was removed; provider usage stats only served the deleted developer agent and `agent_usage_stats` is frozen."
+                    .to_string(),
+            );
+        }
+        if cmd == "publish" {
+            hints.push(
+                "`libra publish` was removed; the read-only Cloudflare site host went with Code. Use `libra cloud` for repository backup."
+                    .to_string(),
+            );
+        }
         let mut cli_error = CliError::unknown_command(format!(
             "libra: '{cmd}' is not a libra command. See 'libra --help'."
         ));
@@ -3280,12 +3255,9 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
                 })?;
             }
             Commands::Clone(cmd_args) => command::clone::execute_safe(cmd_args, &output).await?,
-            Commands::Code(cmd_args) => command::code::execute(cmd_args, &output).await?,
             Commands::Automation(cmd_args) => {
                 command::automation::execute_safe(cmd_args, &output).await?
             }
-            Commands::Usage(cmd_args) => command::usage::execute_safe(cmd_args, &output).await?,
-            Commands::Graph(cmd_args) => command::graph::execute_safe(cmd_args, &output).await?,
             Commands::Sandbox(cmd_args) => {
                 command::sandbox::execute_safe(cmd_args, &output).await?
             }
@@ -3489,9 +3461,6 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
                 command::worktree::execute_safe(cmd_args, &output).await?
             }
             Commands::Cloud(cmd_args) => command::cloud::execute_safe(cmd_args, &output).await?,
-            Commands::Publish(cmd_args) => {
-                command::publish::execute_safe(cmd_args, &output).await?
-            }
             Commands::Agent(cmd_args) => command::agent::execute_safe(cmd_args, &output).await?,
             Commands::Review(cmd_args) => {
                 command::agent::review::execute_safe(cmd_args, &output).await?
@@ -3633,8 +3602,6 @@ fn report_background_index_update_outcome(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use serial_test::serial;
 
     use super::*;
@@ -4102,42 +4069,6 @@ mod tests {
         }
 
         set_max_connections(DEFAULT_MAX_CONNECTIONS);
-    }
-
-    /// Scenario: `libra code --repo <path>` should perform repository preflight
-    /// against `<path>`, *not* the process CWD. The test arranges for the CWD to be
-    /// outside any repo, sets `--repo` to a freshly-initialised one, and confirms
-    /// preflight resolves that repository instead of reporting "not a libra
-    /// repository" from the process CWD. This guards a regression where preflight
-    /// was hitting CWD before honoring `--repo`.
-    #[tokio::test(flavor = "current_thread")]
-    #[serial(cwd, env)]
-    async fn code_repo_flag_uses_target_repo_during_preflight() {
-        let root = tempfile::tempdir().expect("failed to create test root");
-        let repo = root.path().join("linked");
-        let outside = root.path().join("outside");
-        fs::create_dir_all(&repo).expect("failed to create repo dir");
-        fs::create_dir_all(&outside).expect("failed to create outside dir");
-        test::setup_with_new_libra_in(&repo).await;
-
-        let _guard = test::ChangeDirGuard::new(&outside);
-        let repo_arg = repo
-            .to_str()
-            .expect("temporary repo path should be valid UTF-8");
-        let cli = Cli::try_parse_from(["libra", "code", "--repo", repo_arg]).unwrap();
-        let preflight =
-            command_preflight(&cli.command, false).expect("--repo should drive preflight");
-
-        let expected_storage = repo
-            .join(".libra")
-            .canonicalize()
-            .expect("test repository storage should exist");
-        assert_eq!(
-            preflight.storage.as_deref(),
-            Some(expected_storage.as_path())
-        );
-        assert!(preflight.upgrade_schema);
-        assert!(preflight.set_hash_kind);
     }
 
     /// Scenario: `libra help error-codes` (and its `errors` alias) should bypass

@@ -1556,10 +1556,99 @@ async fn test_config_scope_path_logic() {
     assert_eq!(config::ConfigScope::Local.get_config_path(), None);
     {
         let _global = EnvVarGuard::unset("LIBRA_CONFIG_GLOBAL_DB");
+        let home = tempdir().unwrap();
+        let _home = EnvVarGuard::set("HOME", home.path().as_os_str());
+        let _profile = EnvVarGuard::set("USERPROFILE", home.path().as_os_str());
+        let _xdg = EnvVarGuard::unset("XDG_CONFIG_HOME");
         // This pure path query performs no I/O against the default location.
         let actual = config::ConfigScope::Global.get_config_path();
-        let expected = dirs::home_dir().map(|home| home.join(".libra").join("config.db"));
+        let expected = Some(home.path().join(".config").join("libra").join("config.db"));
         assert_eq!(actual, expected);
+    }
+    assert_eq!(std::env::var_os("LIBRA_CONFIG_GLOBAL_DB"), inherited);
+}
+
+/// ADR-GCX-06: the `--json` path output adds the source/legacy fields for the
+/// global scope while keeping the existing `path`/`exists` contract.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn test_config_path_json_reports_source_and_legacy_fields() {
+    let temp = tempdir().unwrap();
+    let home = temp.path().join("fake-home");
+    let config_dir = home.join(".config").join("libra");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let db = config_dir.join("config.db");
+    std::fs::write(&db, b"").unwrap();
+
+    let xdg_config = home.join(".config");
+    let envs = [
+        ("HOME", home.to_str().unwrap()),
+        ("USERPROFILE", home.to_str().unwrap()),
+        ("XDG_CONFIG_HOME", xdg_config.to_str().unwrap()),
+        ("LIBRA_CONFIG_GLOBAL_DB", ""),
+    ];
+    let output = run_libra_command_with_env(
+        &["--json", "config", "path", "--global"],
+        temp.path(),
+        &envs,
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(doc["data"]["action"], "path");
+    assert_eq!(doc["data"]["scope"], "global");
+    assert_eq!(doc["data"]["path"], db.to_str().unwrap());
+    assert_eq!(doc["data"]["exists"], true);
+    assert_eq!(doc["data"]["source"], "xdg");
+    assert_eq!(doc["data"]["migration_pending"], false);
+    assert_eq!(doc["data"]["legacy_exists"], false);
+    assert_eq!(
+        doc["data"]["legacy_path"],
+        home.join(".libra/config.db").to_str().unwrap()
+    );
+}
+
+/// ADR-GCX-01: until the automatic migration lands, an existing legacy
+/// `<home>/.libra/config.db` stays the active database (read and write on one
+/// file); the XDG path takes over as soon as it exists.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn test_config_scope_path_legacy_fallback_until_migrated() {
+    use libra::internal::config::global_config_resolution;
+
+    let inherited = std::env::var_os("LIBRA_CONFIG_GLOBAL_DB");
+    let home = tempdir().unwrap();
+    let legacy_dir = home.path().join(".libra");
+    std::fs::create_dir_all(&legacy_dir).unwrap();
+    let legacy_db = legacy_dir.join("config.db");
+    std::fs::write(&legacy_db, b"").unwrap();
+    {
+        let _global = EnvVarGuard::unset("LIBRA_CONFIG_GLOBAL_DB");
+        let _home = EnvVarGuard::set("HOME", home.path().as_os_str());
+        let _profile = EnvVarGuard::set("USERPROFILE", home.path().as_os_str());
+        let _xdg = EnvVarGuard::unset("XDG_CONFIG_HOME");
+
+        let pending = global_config_resolution().expect("legacy resolution");
+        assert_eq!(pending.path, legacy_db);
+        assert_eq!(pending.source.as_str(), "legacy");
+        assert!(pending.migration_pending);
+        assert!(pending.legacy_exists);
+        assert_eq!(
+            config::ConfigScope::Global.get_config_path(),
+            Some(legacy_db.clone())
+        );
+
+        // The XDG file wins once it appears (post-migration state).
+        let new_dir = home.path().join(".config").join("libra");
+        std::fs::create_dir_all(&new_dir).unwrap();
+        std::fs::write(new_dir.join("config.db"), b"").unwrap();
+        let migrated = global_config_resolution().expect("migrated resolution");
+        assert_eq!(migrated.path, new_dir.join("config.db"));
+        assert!(!migrated.migration_pending);
+        assert_eq!(migrated.source.as_str(), "home");
     }
     assert_eq!(std::env::var_os("LIBRA_CONFIG_GLOBAL_DB"), inherited);
 }

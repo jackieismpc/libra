@@ -32,9 +32,9 @@ use std::fs;
 use libra::internal::ai::{
     context_budget::{
         ContextAttachmentStore, ContextBudget, ContextFrameBuilder, ContextFrameCandidate,
-        ContextFrameKind, ContextFrameSource, ContextSegmentBudget, ContextSegmentKind,
-        ContextTrustLevel, PRUNE_PROTECTED_TOOLS, PruneResult, SAFETY_MARGIN_TOKENS,
-        TOOL_OUTPUT_MAX_CHARS, TruncationPolicy, prune_inline_tool_output,
+        ContextFrameEvent, ContextFrameKind, ContextFrameSource, ContextSegmentBudget,
+        ContextSegmentKind, ContextTrustLevel, PRUNE_PROTECTED_TOOLS, PruneResult,
+        SAFETY_MARGIN_TOKENS, TOOL_OUTPUT_MAX_CHARS, TruncationPolicy, prune_inline_tool_output,
     },
     runtime::event::Event,
     session::{
@@ -179,7 +179,8 @@ fn dispatcher_prune_path_keeps_jsonl_bytes_identical_and_pruned_in_prompt() {
     // exactly what the model would receive.
     let replay = jsonl.load_context_replay().expect("replay must succeed");
     assert_eq!(replay.frames.len(), 1, "expect exactly one persisted frame");
-    let loaded = &replay.frames[0];
+    let loaded: ContextFrameEvent =
+        serde_json::from_value(replay.frames[0].clone()).expect("context frame payload");
     let mut rendered_prompt = String::new();
     let mut resolved_via_attachment_store = false;
     for segment in &loaded.segments {

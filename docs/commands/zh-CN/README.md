@@ -126,19 +126,19 @@ porcelain 输出、冲突处理或 plumbing 语法等特定 Git-compatible 表�
 |------|------|------|------|
 | `libra cloud` | | 通过 Cloudflare D1/R2 执行云备份和恢复操作 | [cloud.md](cloud.md) |
 | `libra cache` | | 检查 tiered-storage / LRU cache 配置（type、threshold、budget） | [cache.md](cache.md) |
-| `libra publish` | | 管理只读 Cloudflare Worker 发布 | [publish.md](publish.md) |
+| `libra publish` | | 已移除。仓库备份请用 `libra cloud` | [publish.md](publish.md) |
 | `libra worktree` | `wt` | 管理附加到仓库的多个工作树 | [worktree.md](worktree.md) |
 
 ### AI 与开发
 
 | 命令 | 别名 | 说明 | 文档 |
 |------|------|------|------|
-| `libra code` | | 带 AI agent、Web 服务器和 MCP 集成的交互式 Web Code UI | [code.md](code.md) |
-| `libra code-control` | | **已在 W5 breaking 发布中删除** — 请用 `libra code --control stdio`（breaking-change 迁移说明） | [code-control.md](code-control.md) |
+| `libra code` | | 已移除。外部 agent 捕获请用 `libra agent` | [code.md](code.md) |
+| `libra code-control` | | 已随 `libra code` 移除。请用 `libra agent` | [code-control.md](code-control.md) |
 | Codex data storage | | 将 `libra code --provider codex` 连接到 Codex app-server，并持久化 Codex 会话数据 | [codex-data-storage.md](codex-data-storage.md) |
 | `libra automation` | | 列出、运行和检查 AI automation rules | [automation.md](automation.md) |
-| `libra usage` | | 报告并修剪 AI provider/model 使用聚合 | [usage.md](usage.md) |
-| `libra graph` | | 检查 Libra Code thread version graph（`--json`/`--machine`；交互式 TUI 入口已在 W5 breaking 发布中删除，请用 Web Code UI） | [graph.md](graph.md) |
+| `libra usage` | | 已移除。用量统计只服务已拆除的开发 agent | [usage.md](usage.md) |
+| `libra graph` | | 已移除。捕获图请用 `libra --json agent graph <session>` | [graph.md](graph.md) |
 | `libra sandbox` | | 检查 AI sandbox diagnostics，包括 OS backend 可用性和 downgrade warnings | [sandbox.md](sandbox.md) |
 | `libra agent` | | 管理外部 agent 捕获、checkpoints、hooks 和 RPC adapters | [agent.md](agent.md) |
 

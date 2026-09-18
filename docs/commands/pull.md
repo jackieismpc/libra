@@ -73,7 +73,10 @@ not make a configuration store future; its supported values remain readable.
 The configuration-owned legacy-reader barrier is recognized by this build;
 see [configuration compatibility](config.md#configuration-schema-compatibility).
 
-Global configuration uses `LIBRA_CONFIG_GLOBAL_DB` or `~/.libra/config.db`;
+Global configuration uses `LIBRA_CONFIG_GLOBAL_DB` or the XDG configuration
+directory (`$XDG_CONFIG_HOME/libra/config.db`, defaulting to
+`<home>/.config/libra/config.db`), falling back to the legacy
+`<home>/.libra/config.db` until it is migrated;
 system configuration uses `LIBRA_CONFIG_SYSTEM_DB` or `/etc/libra/config.db`.
 Complete process/repo-local storage settings can make GlobalConfig unnecessary
 (`cloud` must also satisfy its D1 settings). They do not prove that SystemConfig

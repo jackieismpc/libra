@@ -445,6 +445,7 @@ mod tests {
         "settings.json",      // EXTERNAL provider settings (e.g. Claude Code's
         // .claude/settings.json) written by `agent enable` — not a .libra surface
         "file_history.json", // legacy AI file-undo manifest, persisted state rather than configuration
+        "redaction_report.json", // E4 checkpoint sidecar (rule-hit stats only), not configuration
     ];
 
     /// Extract config-file name literals from the PRODUCTION half of one
@@ -592,10 +593,6 @@ mod tests {
                 );
             }
         }
-        literals_of(
-            &fs::read_to_string(manifest_dir.join("src/command/publish.rs")).unwrap(),
-            &mut literals,
-        );
 
         for surface in CODE_AGENT_CONFIG_OWNERSHIP {
             if surface.kind != SurfaceKind::File {

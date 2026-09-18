@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.22.49"
+version = "0.23.1"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -255,10 +255,6 @@ path = "tests/compat/all_production_unwrap_guard.rs"
 [[test]]
 name = "compat_agent_run_non_exhaustive_guard"
 path = "tests/compat/agent_run_non_exhaustive_guard.rs"
-
-[[test]]
-name = "compat_agent_docs_contract"
-path = "tests/compat/agent_docs_contract.rs"
 
 [[test]]
 name = "compat_help_examples_banner"
@@ -582,21 +578,6 @@ required-features = ["keyring"]
 name = "agent_live_gate_test"
 path = "tests/agent_live_gate_test.rs"
 required-features = ["test-live-agent"]
-
-[[test]]
-name = "ai_agent_test"
-path = "tests/ai_agent_test.rs"
-required-features = ["test-live-ai"]
-
-[[test]]
-name = "ai_chat_agent_test"
-path = "tests/ai_chat_agent_test.rs"
-required-features = ["test-live-ai"]
-
-[[test]]
-name = "ai_ollama_live_gate_test"
-path = "tests/ai_ollama_live_gate_test.rs"
-required-features = ["test-live-ai"]
 
 [[test]]
 name = "compat_serial_registry"

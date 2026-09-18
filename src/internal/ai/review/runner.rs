@@ -72,11 +72,11 @@ use super::{
     },
 };
 use crate::internal::ai::{
-    agent::runtime::{
-        WorkspaceIsolationConfig, sub_agent_dispatcher::materialize_isolated_workspace,
-    },
     agent_run::AgentRunId,
-    orchestrator::workspace::{FuseProvisionState, SubAgentWorkspace},
+    workspace_isolation::{
+        FuseProvisionState, SubAgentWorkspace, WorkspaceIsolationConfig,
+        materialize_isolated_workspace,
+    },
 };
 
 /// Default concurrent-reviewer cap per run (`agent.md:519-525`
@@ -945,8 +945,8 @@ pub fn cancel_orphaned_run(store: &ReviewRunStore, run_id: &str) -> io::Result<O
 
 /// The canonical base this repo's isolated workspaces are materialized
 /// under: `<storage>/worktrees/tasks`, where `<storage>` is the
-/// `.libra` directory the store's `sessions` root lives in (mirrors
-/// `orchestrator::workspace::task_worktree_base_dir`). `None` when the
+/// `.libra` directory the store's `sessions` root lives in (same
+/// layout as isolated task worktrees). `None` when the
 /// store has no parent (degenerate root path) — every removal is then
 /// refused.
 fn task_worktree_base_for_store(store: &ReviewRunStore) -> Option<PathBuf> {
@@ -1418,7 +1418,7 @@ impl ReviewWorkspaceGuard {
 
 impl Drop for ReviewWorkspaceGuard {
     fn drop(&mut self) {
-        use crate::internal::ai::orchestrator::types::TaskWorkspaceBackend;
+        use crate::internal::ai::workspace_isolation::TaskWorkspaceBackend;
 
         let Some(workspace) = self.workspace.take() else {
             return;

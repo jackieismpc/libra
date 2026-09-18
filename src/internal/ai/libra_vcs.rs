@@ -9,8 +9,8 @@ use std::path::Path;
 use serde_json::json;
 
 use crate::internal::ai::{
-    runtime::hardening::{BlastRadius, SafetyDecision},
-    tools::AiOperationContext,
+    hardening::{BlastRadius, SafetyDecision},
+    operation_context::AiOperationContext,
 };
 
 pub const ALLOWED_COMMANDS: &[&str] = &[

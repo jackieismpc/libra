@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::{
-    command::code_control_files::{
+    command::control_lock::{
         CONTROL_INFO_VERSION, ControlInfo, ControlPaths, ControlScopePolicy, acquire_control_lock,
         cleanup_control_files, current_pid_starttime, ensure_control_token_file,
         ensure_scope_takeover_allowed, pid_is_live, resolve_control_scope,

@@ -32,10 +32,10 @@ use libra::internal::ai::{
         CompletionUsage, CompletionUsageSummary, Text,
     },
     context_budget::{
-        CompactionAgentError, CompactionReason, ContextAttachmentStore, ContextBudget,
-        ContextFrameBuilder, ContextFrameCandidate, ContextFrameEvent, ContextFrameKind,
-        ContextFrameSource, ContextHandoffParseError, ContextSegmentBudget, ContextSegmentKind,
-        ContextTrustLevel, TruncationPolicy, compaction_event_for_handoff,
+        CompactionAgentError, CompactionEvent, CompactionReason, ContextAttachmentStore,
+        ContextBudget, ContextFrameBuilder, ContextFrameCandidate, ContextFrameEvent,
+        ContextFrameKind, ContextFrameSource, ContextHandoffParseError, ContextSegmentBudget,
+        ContextSegmentKind, ContextTrustLevel, TruncationPolicy, compaction_event_for_handoff,
         embedded_compaction_system_prompt, parse_handoff_template, prune_inline_tool_output,
         run_compaction,
     },
@@ -228,7 +228,8 @@ async fn s5_e2e_prune_then_compact_persists_event_and_parseable_handoff() {
     // store, then run prune on each resolved string.
     let replay = jsonl.load_context_replay().expect("replay must succeed");
     assert_eq!(replay.frames.len(), 1, "expect one persisted frame");
-    let loaded = &replay.frames[0];
+    let loaded: ContextFrameEvent =
+        serde_json::from_value(replay.frames[0].clone()).expect("context frame payload");
     let mut rendered_prompt = String::new();
     for segment in &loaded.segments {
         let resolved: String = match (&segment.attachment, &segment.content) {
@@ -355,7 +356,9 @@ async fn s5_e2e_prune_then_compact_persists_event_and_parseable_handoff() {
         1,
         "exactly one CompactionEvent must round-trip through the JSONL store"
     );
-    let persisted_event = &replay_after_compact.compactions[0];
+    let persisted_event: CompactionEvent =
+        serde_json::from_value(replay_after_compact.compactions[0].clone())
+            .expect("compaction payload");
     assert_eq!(persisted_event.frame_id, frame.frame_id);
     assert_eq!(persisted_event.summary, event.summary);
     assert_eq!(persisted_event.event_kind(), "compaction_event");
@@ -523,7 +526,8 @@ async fn s5_e2e_schema_mismatch_after_prune_blocks_event_persistence() {
     // re-invoked here so a regression in the *order* of phases
     // (e.g. compact before prune) trips this test as well.
     let replay = jsonl.load_context_replay().expect("replay must succeed");
-    let loaded = &replay.frames[0];
+    let loaded: ContextFrameEvent =
+        serde_json::from_value(replay.frames[0].clone()).expect("context frame payload");
     let mut rendered_prompt = String::new();
     for segment in &loaded.segments {
         let resolved: String = match (&segment.attachment, &segment.content) {

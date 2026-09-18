@@ -25,7 +25,7 @@ branch-policy 层（1.13），本项刻意零执行——避免 lore.md §3.6 �
   version … is newer than this Libra binary supports"，实测确认）——这是刻意
   的防护（旧二进制不静默读写它不理解的 schema），不是静默容忍；升级二进制即
   恢复。新 Libra 打开旧库：幂等增量迁移自动补齐。运维注意：任何新二进制的
-  运行（包括测试/冒烟）都会顺带升级它连接到的库——含**全局** `~/.libra/config.db`
+  运行（包括测试/冒烟）都会顺带升级它连接到的库——含**全局**配置库（`<XDG_CONFIG_HOME 或 ~/.config>/libra/config.db`，或迁移前的 legacy `~/.libra/config.db`）
   （config 级联读会触达）——升级后旧二进制将无法读取全局身份等配置，须同步
   更新安装的二进制（本项落地时实测踩中，`cp target/release/libra ~/.libra/bin/`
   即恢复）。

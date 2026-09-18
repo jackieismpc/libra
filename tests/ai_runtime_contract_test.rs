@@ -2892,7 +2892,7 @@ fn plan_execution_repair_loop() {
             turn_id: "plan-repair-gate-1".to_string(),
             predecessor_interaction_id: String::new(),
             supersedes_predecessor: false,
-            repair: PlanExecutionRepairState::AwaitingUser {
+            repair: serde_json::to_value(PlanExecutionRepairState::AwaitingUser {
                 interaction_id: "repair-after-restart".to_string(),
                 route: ExecutionFailureRevision::PlanRevision,
                 evidence: libra::internal::ai::runtime::ExecutionFailureEvidence {
@@ -2901,7 +2901,8 @@ fn plan_execution_repair_loop() {
                     attempt: 2,
                     max_attempts: 2,
                 },
-            },
+            })
+            .expect("encode repair gate"),
         })
         .expect("persist repair gate");
     assert!(
@@ -3472,7 +3473,7 @@ async fn plan_execution_repair_cancel_resolves_runtime_gate_and_durable_marker()
             turn_id: "repair-control-turn".to_string(),
             predecessor_interaction_id: String::new(),
             supersedes_predecessor: false,
-            repair,
+            repair: serde_json::to_value(&repair).expect("encode repair gate"),
         })
         .expect("persist repair gate before parking it");
 

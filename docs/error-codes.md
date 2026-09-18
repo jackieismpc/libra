@@ -61,7 +61,7 @@ Set `LIBRA_FINE_EXIT_CODES=1` to re-enable the legacy fine-grained exit codes (2
 
 - `branch -d` / `--delete` refusals (not fully merged, missing branch, currently checked-out branch) exit **1**. Codes stay `LBR-REPO-003` or `LBR-CLI-003`.
 
-Bridge `LBR-AGENT-024..038` errors are **frame errors**: `libra agent bridge --stdio` answers them as JSON-RPC 2.0 error frames on stdout and keeps serving the next NDJSON line — the bridge process does not exit with `128`. Their exit-code column is marked `frame` accordingly. `LBR-AGENT-039..040` are normal controlled `review --fix` or `investigate fix` CLI outcomes and exit `128`.
+Bridge `LBR-AGENT-024..038` errors are **frame errors**: `libra agent bridge --stdio` answers them as JSON-RPC 2.0 error frames on stdout and keeps serving the next NDJSON line — the bridge process does not exit with `128`. Their exit-code column is marked `frame` accordingly. `LBR-AGENT-039..040` remain reserved for the retired controlled-fix execution outcomes and still map to exit `128`.
 
 ## Migration From Fine-Grained Exit Codes
 
@@ -129,8 +129,6 @@ structured report is always present.
 | `128` | `LBR-AGENT-007` | `internal` | External agent IO exceeded hard caps or failed redaction; output withheld fail-closed | a binary floods stderr past the 64 KiB cap |
 | `128` | `LBR-AGENT-008` | `internal` | Hook envelope failed validation before checkpoint persistence | a provider hook posts malformed JSON to `libra agent hooks` |
 | `128` | `LBR-AGENT-009` | `internal` | Agent checkpoint store inconsistent across ref/DB/object-index | `agent_checkpoint` row points at a missing traces object; run `libra agent doctor` |
-| `128` | `LBR-AGENT-010` | `internal` | `review --fix` or `investigate fix` could not discover or authorize an active `libra code --control write` AgentRuntime | either fix command with no live authorized Code control session |
-| `128` | `LBR-AGENT-011` | `internal` | Untrusted seed content was rejected before it could enter either controlled fix admission or another mutating workflow | an issue-link, review finding, investigation topic, stance, or finding attempting to drive a mutating fix |
 | `128` | `LBR-AGENT-012` | `internal` | External agent RPC transport failed (invoke timeout, broken pipe/unexpected exit, or malformed JSON-RPC frame); invocation withheld fail-closed | a trusted `libra-agent-*` binary exits before answering the invoked method |
 | `128` | `LBR-AGENT-013` | `internal` | Raw (un-redacted) checkpoint access/export denied without `--allow-raw`; redacted `--detail`/`--transcript` output stays available; the refusal is audited in `agent_audit_log` | `libra agent checkpoint export --raw` (or equivalent) without `--allow-raw` |
 | `128` | `LBR-AGENT-014` | `internal` | A `review`/`investigate` run was refused because the shared run queue is full — more than `agent.max_concurrent_runs` runs are active and the wait queue is at its cap (10) | starting an 11th queued `libra review`/`libra investigate` run while the concurrency budget is saturated |
@@ -264,8 +262,6 @@ evidence on uncertainty. See [repair recovery](commands/config.md#confirmed-lega
 | `LBR-AGENT-007` | External agent IO exceeded hard caps or failed redaction; output withheld fail-closed |
 | `LBR-AGENT-008` | Hook envelope failed validation before checkpoint persistence |
 | `LBR-AGENT-009` | Agent checkpoint store inconsistent across ref/DB/object-index |
-| `LBR-AGENT-010` | `review --fix` or `investigate fix` could not discover or authorize an active `libra code --control write` AgentRuntime |
-| `LBR-AGENT-011` | Untrusted seed content was rejected before it could enter either controlled fix admission or another mutating workflow |
 | `LBR-AGENT-012` | External agent RPC transport failed (invoke timeout, broken pipe/unexpected exit, or malformed JSON-RPC frame); invocation withheld fail-closed |
 | `LBR-AGENT-013` | Raw (un-redacted) checkpoint access/export denied without `--allow-raw`; redacted `--detail`/`--transcript` output stays available; the refusal is audited in `agent_audit_log` |
 | `LBR-AGENT-014` | A `review`/`investigate` run was refused because the shared run queue is full (over `agent.max_concurrent_runs` active and the wait queue at its cap) |

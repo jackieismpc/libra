@@ -3,7 +3,7 @@ mod matrix_alignment_support;
 use std::{fs, process::Command};
 
 use matrix_alignment_support::{
-    assert_contains, cli_commands, code_router_routes, command_development_public_commands,
+    assert_contains, cli_commands, command_development_public_commands,
     command_development_unpublished_docs, compatibility_commands, declared_cargo_targets,
     declared_features, plan_features, plan_test_targets, quarantine_tests, read_repo_file,
     repo_root,
@@ -181,123 +181,46 @@ fn integration_test_plan_references_existing_targets_and_features() {
 
 #[test]
 fn docs_consistency_covers_code_command_router_contracts() {
-    let web_mod = read_repo_file("src/internal/ai/web/mod.rs");
     let code_doc = read_repo_file("docs/commands/code.md");
     let code_control_doc = read_repo_file("docs/commands/code-control.md");
-    let integration_plan = read_repo_file("docs/development/integration/integration-test-plan.md");
-    let agent_doc = read_repo_file("docs/development/tracing/agent.md");
+    let zh_code_doc = read_repo_file("docs/commands/zh-CN/code.md");
     let workflow = read_repo_file(".github/workflows/base.yml");
     let compatibility = read_repo_file("COMPATIBILITY.md");
-    let source_and_docs = [
-        web_mod.as_str(),
-        read_repo_file("src/internal/ai/web/code_ui.rs").as_str(),
-        code_doc.as_str(),
-        code_control_doc.as_str(),
-    ]
-    .join("\n");
+    let development_readme = read_repo_file("docs/development/commands/README.md");
 
-    let routes = code_router_routes(&web_mod);
-    assert!(
-        !routes.is_empty(),
-        "expected to extract /api/code routes from src/internal/ai/web/mod.rs"
-    );
-    for route in routes {
-        assert_contains(&code_doc, &route, "docs/commands/code.md");
-    }
-
-    for header in [
-        "X-Libra-Control-Token",
-        "X-Code-Controller-Token",
-        "X-Libra-Browser-Bootstrap",
-    ] {
-        assert_contains(&code_doc, header, "docs/commands/code.md");
-        assert_contains(&source_and_docs, header, "source/docs control contract");
-    }
-
-    for code in [
-        "CONTROL_DISABLED",
-        "LOOPBACK_REQUIRED",
-        "MISSING_CONTROL_TOKEN",
-        "INVALID_CONTROL_TOKEN",
-        "MISSING_BROWSER_BOOTSTRAP",
-        "INVALID_BROWSER_BOOTSTRAP",
-        "MISSING_CONTROLLER_TOKEN",
-        "INVALID_CONTROLLER_TOKEN",
-        "CONTROLLER_CONFLICT",
-        "SESSION_BUSY",
-        "INTERACTION_NOT_ACTIVE",
-        "PLAN_REPAIR_RETRY_LIMIT_REACHED",
-    ] {
-        assert_contains(&source_and_docs, code, "source/docs control error contract");
-    }
-
-    for flag in [
-        "--control",
-        "--control-token-file",
-        "--control-info-file",
-        "--control-url",
-        "--control stdio",
-    ] {
-        assert_contains(&code_doc, flag, "docs/commands/code.md");
-    }
-
-    // W3-13: keep the public mode/provider split for env-file/approval-ttl
-    // pinned in the compatibility matrix (non-Codex web accept; Codex/--stdio reject).
-    let code_row = compatibility
-        .lines()
-        .find(|line| line.starts_with("| code |"))
-        .expect("COMPATIBILITY.md must include a `code` row");
-    for needle in [
-        "--env-file",
-        "--approval-ttl",
-        "non-Codex",
-        "--web",
-        "codex",
-        "--stdio",
+    for (path, body) in [
+        ("docs/commands/code.md", &code_doc),
+        ("docs/commands/code-control.md", &code_control_doc),
+        ("docs/commands/zh-CN/code.md", &zh_code_doc),
     ] {
         assert!(
-            code_row.contains(needle),
-            "COMPATIBILITY.md code row must document W3-13 web flag parity ({needle}); row={code_row}"
+            body.contains("## Examples") || body.contains("## Common Commands"),
+            "{path} must keep an Examples / Common Commands heading"
+        );
+        assert!(
+            !body.contains("/api/code"),
+            "{path} must not document a live /api/code surface"
         );
     }
-
-    for (body, needle, context) in [
-        // W5-01: the shim is removed; its doc is now a migration note pointing
-        // at the canonical client, and the JSON-RPC method reference moved to
-        // docs/commands/code.md.
-        (
-            code_control_doc.as_str(),
-            "libra code --control stdio",
-            "docs/commands/code-control.md",
-        ),
-        (
-            code_doc.as_str(),
-            "diagnostics.get",
-            "docs/commands/code.md",
-        ),
-        (
-            integration_plan.as_str(),
-            "test-provider",
-            "docs/development/integration/integration-test-plan.md",
-        ),
-        (
-            integration_plan.as_str(),
-            "code_ui_scenarios",
-            "docs/development/integration/integration-test-plan.md",
-        ),
-        (
-            agent_doc.as_str(),
-            "diagnostics_redaction_test",
-            "docs/development/tracing/agent.md",
-        ),
-    ] {
-        assert_contains(body, needle, context);
-    }
+    assert_contains(&code_doc, "has been removed", "docs/commands/code.md");
+    assert_contains(&code_doc, "libra agent", "docs/commands/code.md");
     assert_contains(
-        &workflow,
-        "Run Code UI automation scenarios",
-        ".github/workflows/base.yml",
+        &code_control_doc,
+        "is now gone",
+        "docs/commands/code-control.md",
     );
+
+    assert!(
+        !compatibility
+            .lines()
+            .any(|line| line.starts_with("| code |")),
+        "COMPATIBILITY.md must not keep a live top-level `code` row"
+    );
+    assert!(
+        !development_readme.contains("[`code`]("),
+        "docs/development/commands/README.md must not list `code` as a public command"
+    );
+
     assert_contains(
         &workflow,
         "Check Rustdoc intra-doc links",
@@ -312,30 +235,6 @@ fn docs_consistency_covers_code_command_router_contracts() {
         !workflow.contains("paths-ignore:"),
         ".github/workflows/base.yml must run the compatibility guards for workflow and command-documentation-only pull requests",
     );
-    assert!(
-        !workflow.contains("RUST_LOG:"),
-        "Run Code UI automation scenarios must not set global RUST_LOG in CI"
-    );
-    for target in [
-        "--test code_codex_default_web_test",
-        "--test ai_code_ui_headless_test",
-        "--test code_codex_runtime_test",
-    ] {
-        assert_contains(&workflow, target, ".github/workflows/base.yml");
-    }
-
-    for path in [
-        "tests/harness/scenario.rs",
-        "tests/diagnostics_redaction_test.rs",
-        "tests/code_codex_default_web_test.rs",
-        "tests/ai_code_ui_headless_test.rs",
-        "tests/code_codex_runtime_test.rs",
-    ] {
-        assert!(
-            repo_root().join(path).exists(),
-            "required path is missing: {path}"
-        );
-    }
 }
 
 #[test]
@@ -364,87 +263,23 @@ fn w203_revision_receipt_and_network_boundary_stay_aligned() {
     let headless_tests = read_repo_file("tests/ai_code_ui_headless_test.rs");
     let compat_tests = read_repo_file("tests/compat/matrix_alignment.rs");
 
-    for (body, context) in [
-        (&code_doc, "docs/commands/code.md"),
-        (&zh_code_doc, "docs/commands/zh-CN/code.md"),
+    for (path, body) in [
+        ("docs/commands/code.md", &code_doc),
+        ("docs/commands/zh-CN/code.md", &zh_code_doc),
     ] {
-        for needle in [
-            "intent_revision",
-            "interaction_id",
-            "sidecar_digest",
-            "intent_revision_consumption",
-            "kind: \"intent_revision_consumed\"",
-            "PHASE1_WORKSPACE_CHANGED",
-            "PLAN_EXECUTION_NOT_AVAILABLE",
-            "PLAN_REVISION_NOTE_REQUIRED",
-            "workspaceDrifted",
-            "workspaceWarning",
-            "metadata-v1:<sha256>",
-            "Claiming",
-        ] {
-            assert_contains(body, needle, context);
-        }
-    }
-    for needle in [
-        "but never the raw note",
-        "That exclusion applies to the workflow terminal and consumption",
-        "It does not redact ordinary",
-        "determinate pre-write validation/retry signals",
-        "30-second cooperative work budget",
-        "128 MiB",
-        "Paths are streamed and counted",
-        "blocking filesystem operation",
-        "final EOF step",
-        "Each new binding is",
-        "metadata-only signal is advisory",
-        "fall back to content comparison using",
-        "explicit direct",
-        "exactly one successful",
-        "Padded or otherwise non-exact spellings",
-        "one shared, linear\n`ValidatedIntentRevisionReceiptIndex`",
-        "exactly 5,000 events and 700 receipts",
-        "Path-name\nenumeration remains an ignore-aware walk",
-        "`openat`/`fstatat`/`readlinkat`",
-        "`FILE_FLAG_OPEN_REPARSE_POINT`",
-        "`FSCTL_GET_REPARSE_POINT`",
-        "Other platforms fail closed",
-        "process-lifetime Phase 1 writer lease",
-        "different lock from the\nshort-lived workflow append lock",
-        "only one\nindependently constructed persistence graph",
-    ] {
-        assert_contains(&code_doc, needle, "docs/commands/code.md privacy boundary");
-    }
-    for needle in [
-        "绝不写入原始 note 或 HMAC key",
-        "这个排除",
-        "它不会清除普通 transcript",
-        "pre-write\n校验/重试信号",
-        "30 秒 cooperative work budget",
-        "累计 128 MiB 编码路径名",
-        "路径会先流式计数并受限",
-        "单次阻塞式文件系统",
-        "包括最终 EOF",
-        "每个新\nbinding 都在同一稳定区间内",
-        "仅 metadata 变化时该信号只是提示",
-        "回退到精确 content",
-        "恰好一次成功调用",
-        "不精确写法的 `/intent cancel`",
-        "共享、线性的 `ValidatedIntentRevisionReceiptIndex`",
-        "5,000 个 events 与 700 张 receipts",
-        "路径名枚举仍由 ignore-aware\nwalker 完成",
-        "`openat`/`fstatat`/`readlinkat`",
-        "`FILE_FLAG_OPEN_REPARSE_POINT`",
-        "`FSCTL_GET_REPARSE_POINT`",
-        "其他平台因为不支持安全",
-        "进程生命周期的\nPhase 1 writer lease",
-        "只能构造一个独立 persistence graph",
-    ] {
-        assert_contains(
-            &zh_code_doc,
-            needle,
-            "docs/commands/zh-CN/code.md privacy boundary",
+        assert!(
+            body.contains("## Examples") || body.contains("## Common Commands"),
+            "{path} must keep an Examples heading after the public Code CLI was removed"
+        );
+        assert!(
+            !body.contains("/api/code")
+                && !body.contains("PLAN_EXECUTION_NOT_AVAILABLE")
+                && !body.contains("intent_revision"),
+            "{path} must not keep a live Code product contract"
         );
     }
+    assert_contains(&code_doc, "has been removed", "docs/commands/code.md");
+    assert_contains(&zh_code_doc, "已移除", "docs/commands/zh-CN/code.md");
 
     assert_contains(
         &jsonl,
@@ -573,16 +408,6 @@ fn w203_revision_receipt_and_network_boundary_stay_aligned() {
         assert_contains(&code_ui, needle, description);
     }
     assert_contains(
-        &code_doc,
-        "| `PLAN_EXECUTION_NOT_AVAILABLE` | 409 |",
-        "docs/commands/code.md public 409 row",
-    );
-    assert_contains(
-        &zh_code_doc,
-        "| `PLAN_EXECUTION_NOT_AVAILABLE` | 409 |",
-        "docs/commands/zh-CN/code.md public 409 row",
-    );
-    assert_contains(
         &error_codes,
         "| `PLAN_EXECUTION_NOT_AVAILABLE` | `409` |",
         "docs/error-codes.md public 409 row",
@@ -619,23 +444,6 @@ fn w203_revision_receipt_and_network_boundary_stay_aligned() {
     ] {
         assert_contains(&error_codes, needle, "docs/error-codes.md W2-03 semantics");
     }
-    for (body, context) in [
-        (&code_doc, "docs/commands/code.md public error table"),
-        (
-            &zh_code_doc,
-            "docs/commands/zh-CN/code.md public error table",
-        ),
-    ] {
-        for needle in [
-            "| `PHASE1_WORKSPACE_CHANGED` | 409 |",
-            "| `PLAN_REVISION_NOTE_REQUIRED` | 400 |",
-            "| `SESSION_BUSY` | 409 |",
-            "| `INVALID_QUERY_PARAM` | 400 |",
-        ] {
-            assert_contains(body, needle, context);
-        }
-    }
-
     for needle in [
         "workspace_snapshot_fingerprint",
         "workspace_snapshot_metadata_fingerprint",
@@ -720,35 +528,12 @@ fn w203_revision_receipt_and_network_boundary_stay_aligned() {
         assert_contains(&headless, needle, "Web Execute consumes exact authority");
     }
 
-    for needle in [
-        "Phase 1 Plan revision and Plan/network-policy gates are durable in the Web workflow",
-        "IntentSpec revision uses Prepared/Active/Claiming/Consuming authority",
-        "exactly one successful draft submission and a durable replacement-review marker",
-        "retain an exact content fingerprint for Execute and add a `metadata-v1:<sha256>` resume/pre-write signal token",
-        "A metadata-only warning may pass Execute's exact identity/content recheck; stale Execute returns `PHASE1_WORKSPACE_CHANGED`, preserves the gate, and performs no mutation",
-        "new bindings capture metadata-before/exact-before/exact-after/metadata-after and reject any mismatch",
-        "older contexts without the token remain readable and fall back to exact content comparison",
-        "30-second / 1,000,000-traversed-entry / 128-MiB-encoded-path-name cooperative work budgets",
-        "directories count before a bounded manifest is sorted",
-        "blocking filesystem calls plus final EOF fail closed after control returns",
-        "one shared linear `ValidatedIntentRevisionReceiptIndex`",
-        "5,000-event/700-receipt regression permits at most four indexed relationship visits per event",
-        "A valid receipt permanently closes its exact retry lineage",
-        "restart heals stale cancel/replacement browser projection without rerunning the provider",
-        "Fresh explicit-direct input, including padded `/intent cancel`, receives `SESSION_BUSY`",
-        "Modify input above 16 KiB is rejected with `INVALID_QUERY_PARAM` before Claiming",
-        "Path-name enumeration remains an ignore-aware walk and is not read authority",
-        "Unix authoritative reads use pinned root/parent descriptors with `openat`/`fstatat`/`readlinkat`",
-        "Windows uses pinned handles, `FILE_FLAG_OPEN_REPARSE_POINT`, final-path/file-identity checks, and `FSCTL_GET_REPARSE_POINT`",
-        "unsupported platforms fail closed",
-        "Empty revision notes return `PLAN_REVISION_NOTE_REQUIRED` and remain unconsumed",
-        "Network Allow admits confirmed plan execution onto the serialized AgentRuntime queue; mutating tools still require approval/sandbox/ACL, and classified failures enter the W2-11 repair loop. The catalogued `PLAN_EXECUTION_NOT_AVAILABLE` 409 is retained for older clients and is no longer produced on Allow",
-        "persistent regular-file OS append lock is never age-reclaimed or unlinked",
-        "distinct process-lifetime Phase 1 writer lease is acquired before reload/fold",
-        "It is not the append lock or browser controller lease",
-    ] {
-        assert_contains(&compatibility, needle, "COMPATIBILITY.md code row");
-    }
+    assert!(
+        !compatibility
+            .lines()
+            .any(|line| line.starts_with("| code |")),
+        "COMPATIBILITY.md must not keep a public `| code |` row after the Code CLI was removed"
+    );
     for needle in [
         "W2-04 confirmed-plan execution in the default Web runtime",
         "IntentSpec revision uses Prepared/Active/Claiming/Consuming authority",

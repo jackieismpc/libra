@@ -38,8 +38,9 @@ differ from the existing repository, and `--from-git-repository` is rejected on 
 already-initialized repository.
 
 Initializing a repository whose storage root is the Libra home itself (`$LIBRA_HOME`,
-default `~/.libra`) is refused. The Libra home stores per-user state — the global
-config database (`~/.libra/config.db`), vault keys, and binaries — and must never mix
+default `~/.libra`), or a path inside the global configuration directory
+(`<XDG_CONFIG_HOME or ~/.config>/libra`), is refused. These directories store
+per-user state — the global config database, vault keys, and binaries — and must never mix
 in repository data, which lives in a project's own `.libra/libra.db` (or a dedicated
 bare repository directory).
 If `LIBRA_HOME` and the global config location differ, both directories are reserved.

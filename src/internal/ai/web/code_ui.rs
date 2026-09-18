@@ -2482,47 +2482,29 @@ mod tests {
         let doc_path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/commands/code.md");
         let doc = std::fs::read_to_string(&doc_path).expect("read docs/commands/code.md");
-        let mut doc_pairs: Vec<(String, u16)> = Vec::new();
-        for line in doc.lines() {
-            // Markdown table rows look like `| \`CODE\` | 403 | gate description |`.
-            // Skip header / separator rows and any row whose first
-            // cell isn't a backtick-wrapped identifier.
-            let trimmed = line.trim_start();
-            if !trimmed.starts_with('|') {
-                continue;
-            }
-            let cells: Vec<&str> = trimmed.split('|').map(str::trim).collect();
-            // Expected shape: ["", code, status, description, ""].
-            if cells.len() < 4 {
-                continue;
-            }
-            let code_cell = cells[1];
-            if !(code_cell.starts_with('`') && code_cell.ends_with('`')) {
-                continue;
-            }
-            let code = code_cell.trim_matches('`');
-            // Reject the header separator (`| --- | --- | --- |`).
-            if code.is_empty() || code.chars().all(|c| c == '-' || c.is_whitespace()) {
-                continue;
-            }
-            let status: u16 = match cells[2].parse() {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            doc_pairs.push((code.to_string(), status));
-        }
+        assert!(
+            doc.contains("has been removed"),
+            "docs/commands/code.md must remain a removal stub after the public Code CLI was deleted"
+        );
+        assert!(
+            !doc.contains("LOOPBACK_REQUIRED") && !doc.contains("/api/code"),
+            "docs/commands/code.md must not keep a live Code UI API error table"
+        );
         let source_pairs: Vec<(String, u16)> = code_ui_error_codes()
             .iter()
             .map(|(code, status)| ((*code).to_string(), *status))
             .collect();
         assert!(
-            !doc_pairs.is_empty(),
-            "Code UI API error table not found in docs/commands/code.md",
+            !source_pairs.is_empty(),
+            "code_ui_error_codes() must stay non-empty while the web runtime still exists"
         );
-        assert_eq!(
-            doc_pairs, source_pairs,
-            "docs/commands/code.md Code UI API error table is out of sync with code_ui_error_codes(); regenerate the table to match (order matters — the table mirrors the runtime gate ordering).",
-        );
+        let mut seen = std::collections::BTreeSet::new();
+        for (code, _) in &source_pairs {
+            assert!(
+                seen.insert(code.as_str()),
+                "code_ui_error_codes() must not repeat {code}"
+            );
+        }
     }
 
     #[test]

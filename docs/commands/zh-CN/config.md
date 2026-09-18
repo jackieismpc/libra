@@ -28,7 +28,7 @@ libra config --rename-section <old-name> <new-name>
 
 ## 说明
 
-`libra config` 跨三个 scope 读写配置值：**local**（仓库级，存储在 `.libra/libra.db`）、**global**（用户级，存储在 `~/.libra/config.db`）和 **system**（机器级，存储在 `/etc/libra/config.db`；级联优先级最低，仅纯配置——无 vault）。各数据库都使用 SQLite 和 `config_kv` 表。
+`libra config` 跨三个 scope 读写配置值：**local**（仓库级，存储在 `.libra/libra.db`）、**global**（用户级，存储在 `<XDG_CONFIG_HOME 或 ~/.config>/libra/config.db`；既有的 legacy `~/.libra/config.db` 在自动迁移版本发布前继续有效）和 **system**（机器级，存储在 `/etc/libra/config.db`；级联优先级最低，仅纯配置——无 vault）。各数据库都使用 SQLite 和 `config_kv` 表。
 
 不同于 Git 的明文 INI 文件或 jj 的 TOML 文件，Libra 将配置存储在事务型数据库中，并集成 vault 加密。敏感值（API keys、tokens、SSH 私钥）会使用 AES-256-GCM 自动静态加密。
 
@@ -53,20 +53,24 @@ GlobalConfig 与 SystemConfig 使用独立的配置 ledger `configuration_schema
 
 scoped get/list、默认值级联与 remote preflight 不写入 barrier；配置级联以只读方式查询，不创建缺失的库。此兼容性迁移只能前滚，旧 binary 必须升级；禁止通过删除 receipt 或手工编辑 SQLite 强行降级。识别受支持的 Repository receipt 不等于允许自动 repair；本版本对未知／不支持的状态仅提供升级路径。
 
-全局路径为 `LIBRA_CONFIG_GLOBAL_DB` 或 `~/.libra/config.db`，系统路径为 `LIBRA_CONFIG_SYSTEM_DB` 或 `/etc/libra/config.db`。完整的进程环境／repo-local 存储配置可以证明无需 GlobalConfig，但不能绕过 remote/cloud 对 SystemConfig 默认值的兼容性检查。只有在明确需要本地对象访问时才使用 `--offline` 或 `LIBRA_READ_POLICY=offline|local`，不能借此绕过远端同步安全检查。
+全局路径为 `LIBRA_CONFIG_GLOBAL_DB` 或 XDG 配置目录（`$XDG_CONFIG_HOME/libra/config.db`，默认 `<home>/.config/libra/config.db`，各平台一致）；当只存在 legacy `<home>/.libra/config.db` 时，它仍是活动文件，因此读写不会分裂到两个库。`LIBRA_CONFIG_GLOBAL_DB` 是逐字覆写，同时禁用 XDG 默认与 legacy 回退。系统路径为 `LIBRA_CONFIG_SYSTEM_DB` 或 `/etc/libra/config.db`。完整的进程环境／repo-local 存储配置可以证明无需 GlobalConfig，但不能绕过 remote/cloud 对 SystemConfig 默认值的兼容性检查。只有在明确需要本地对象访问时才使用 `--offline` 或 `LIBRA_READ_POLICY=offline|local`，不能借此绕过远端同步安全检查。
 
 ## 只读 global schema doctor
 
 使用 `libra config doctor --global-schema`，或
 `libra --json config doctor --global-schema`，只检查全局 schema 元数据。
-路径为 `LIBRA_CONFIG_GLOBAL_DB` 或 `~/.libra/config.db`；无需仓库，不读取配置值、
+路径为解析后的 global 配置路径（env 覆写、XDG 默认或 legacy 回退）；无需仓库，不读取配置值、
 vault、System/Repository DB，不运行迁移、写 barrier、创建备份或触发自动升级／恢复。
 缺失目标保持缺失。冗余 `--global` 可用；`--local`、`--system` 和值／操作参数拒绝。
 成对的 `--repair --confirm` 选择下方独立写入流程；单独使用其中任意选项均失败。
 
 JSON envelope 的 `data.report_version=1`；human 与 JSON 使用同一报告，包含
 `scope`、`role`、`path_source`、configured/canonical path、`exists`、`size_bytes`、
-UTC `modified_at_utc` 和 `configuration`／`legacy` ledger。
+UTC `modified_at_utc`、`legacy_path`、`legacy_exists`、`migration_pending` 和
+`configuration`／`legacy` ledger。`path_source` 取值为 `LIBRA_CONFIG_GLOBAL_DB`
+（env 覆写）、`xdg`（绝对 `XDG_CONFIG_HOME`）、`home`（`<home>/.config/libra` 默认）或
+`legacy`（旧的 `<home>/.libra/config.db` 仍在使用；此时 `migration_pending` 为 true，
+`legacy_path`／`legacy_exists` 描述回退文件）。
 每个 ledger 提供 `observed_version`、`latest_version`、`readable`、`verified_name`；
 版本使用字符串，避免 `i64::MAX` 的 JSON 数值精度丢失。null 表示缺失或不可用，
 不表示健康。仅显示通过 manifest 校验的 receipt 名称，不输出任意 receipt 文本或配置值。
@@ -278,7 +282,7 @@ libra config path
 
 # 显示全局配置路径
 libra config path --global
-# Output: /home/user/.libra/config.db
+# Output: /home/user/.config/libra/config.db
 ```
 
 #### `edit`
@@ -322,7 +326,7 @@ libra config get vault.gpg.pubkey
 | 标志 | 说明 |
 |------|------|
 | `--local` | 使用仓库配置（`.libra/libra.db`）。这是写入的默认值。 |
-| `--global` | 使用全局用户配置（`~/.libra/config.db`）。 |
+| `--global` | 使用全局用户配置（`<XDG_CONFIG_HOME 或 ~/.config>/libra/config.db`）。 |
 | `--system` | 使用系统级配置（`/etc/libra/config.db`，可经 `LIBRA_CONFIG_SYSTEM_DB` 覆盖）。级联优先级最低；写入通常需要提升权限。该作用域**不**支持 vault 加密密钥（见设计动机）。 |
 
 ### 隐藏的 Git 兼容标志
@@ -478,7 +482,7 @@ libra config list --gpg-keys
 ## Scope
 
 - 默认 scope 是 local（`.libra/libra.db`）
-- `--global` 使用 `~/.libra/config.db`
+- `--global` 使用 `<XDG_CONFIG_HOME 或 ~/.config>/libra/config.db`（legacy `~/.libra/config.db` 在自动迁移前仍作为回退）
 - `--system` 使用 `/etc/libra/config.db`（可经 `LIBRA_CONFIG_SYSTEM_DB` 覆盖）；级联优先级最低，写入通常需要提升权限，且该作用域拒绝 vault 加密密钥（见设计动机）
 
 ## `code.defaultProvider` 键

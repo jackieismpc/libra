@@ -25,7 +25,7 @@ use super::{
     evaluate::evaluate,
     rule::{PermissionAction, PermissionRule, PermissionRuleset},
 };
-use crate::internal::ai::agent::profile::AgentPermissionSpec;
+use crate::internal::ai::permission_spec::AgentPermissionSpec;
 
 /// Lift an [`AgentPermissionSpec`] (allow/deny lists) into the ordered
 /// [`PermissionRuleset`] shape the runtime uses.

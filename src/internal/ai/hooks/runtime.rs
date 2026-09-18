@@ -37,8 +37,9 @@ use crate::{
         ai::{
             automation::dispatch_repo_hook_lifecycle_event_to_history,
             capture_scope::CaptureScope,
-            history::{AI_REF, HistoryManager},
+            history,
             session::{SessionState, SessionStore},
+            traces,
         },
         config::ConfigKv,
         db,
@@ -369,7 +370,7 @@ pub async fn process_hook_event_with_target(
                     .insert("persisted_at".to_string(), json!(Utc::now().to_rfc3339()));
                 session
                     .metadata
-                    .insert("history_ref".to_string(), json!(AI_REF));
+                    .insert("history_ref".to_string(), json!(history::ai_ref_name()));
                 session
                     .metadata
                     .insert("object_hash".to_string(), json!(outcome.object_hash));
@@ -1221,7 +1222,7 @@ async fn session_concurrent_active(
 /// double-inserts.
 async fn cleanup_failed_registered_checkpoint(
     conn: &sea_orm::DatabaseConnection,
-    marker: &crate::internal::ai::history::TracesInflightMarker,
+    marker: &crate::internal::ai::traces::TracesInflightMarker,
     provider_session_id: &str,
     scope: &CaptureScope,
     claim_channel: &'static str,
@@ -1274,7 +1275,7 @@ async fn cleanup_failed_registered_checkpoint(
         );
     }
     if let Some(generation) = marker.generation.as_deref()
-        && let Err(error) = crate::internal::ai::history::clear_non_cleanup_traces_inflight_marker(
+        && let Err(error) = crate::internal::ai::traces::clear_non_cleanup_traces_inflight_marker(
             conn,
             &marker.session_id,
             &marker.attempt_id,
@@ -1391,12 +1392,13 @@ async fn write_committed_checkpoint(
 ) -> Result<()> {
     use crate::internal::ai::{
         coverage_gate,
-        history::{self, CheckpointCommitParams, CheckpointScope, HistoryManager},
+        history::HistoryManager,
         observed_agents::{
             AgentKind, RedactedBytes, Redactor, TRANSCRIPT_READ_HARD_CAP_BYTES, TranscriptSource,
             agent_for, normalize_claude_transcript, normalize_codex_rollout,
             resolve_transcript_source,
         },
+        traces::{self, CheckpointCommitParams, CheckpointScope},
     };
 
     let redacted_prompt = event.prompt.as_deref();
@@ -1793,7 +1795,7 @@ async fn write_committed_checkpoint(
         subagent_discovery_warning,
     );
     let metadata = serde_json::json!({
-        "schema_version": history::CHECKPOINT_METADATA_SCHEMA_VERSION,
+        "schema_version": traces::CHECKPOINT_METADATA_SCHEMA_VERSION,
         "checkpoint_id": null, // filled in below once we have the UUID
         "session_id": libra_session_id,
         "agent_kind": agent_kind,
@@ -1861,7 +1863,7 @@ async fn write_committed_checkpoint(
 
     // Window A/B guard: session/tombstone/coverage fences and marker creation
     // commit together BEFORE stage (a). Any failure aborts object creation.
-    let marker = history::TracesInflightMarker::new(
+    let marker = traces::TracesInflightMarker::new(
         libra_session_id,
         &checkpoint_id,
         Utc::now().timestamp_millis(),
@@ -1875,7 +1877,7 @@ async fn write_committed_checkpoint(
         .map(|(owner, _, claims)| {
             claims
                 .iter()
-                .map(|claim| history::TracesCoverageFence {
+                .map(|claim| traces::TracesCoverageFence {
                     logical_turn_key: &claim.logical_turn_key,
                     owner,
                     fence_token: claim.fence_token,
@@ -1889,7 +1891,7 @@ async fn write_committed_checkpoint(
         .as_ref()
         .map(|(owner, fence_token, _)| (owner.clone(), *fence_token));
     if let Err(error) =
-        history::register_traces_write_attempt(conn, &marker, &registration_fences).await
+        traces::register_traces_write_attempt(conn, &marker, &registration_fences).await
     {
         cleanup_failed_registered_checkpoint(
             conn,
@@ -1944,11 +1946,10 @@ async fn write_committed_checkpoint(
     let storage = std::sync::Arc::new(crate::utils::client_storage::ClientStorage::init(
         objects_dir,
     ));
-    let manager = HistoryManager::new_with_ref(
+    let manager = HistoryManager::for_traces(
         storage,
         repo_path.to_path_buf(),
         std::sync::Arc::new(conn.clone()),
-        crate::internal::branch::TRACES_BRANCH,
     );
 
     // Resolve the user-branch HEAD via the typed helper so we can
@@ -2070,7 +2071,7 @@ async fn write_committed_checkpoint(
         written.tree_oid.to_string(),
         written.metadata_blob_oid.to_string(),
     ];
-    if let Err(err) = history::update_traces_inflight_marker_if_generation(
+    if let Err(err) = traces::update_traces_inflight_marker_if_generation(
         conn,
         &committed_marker,
         &written.marker_generation,
@@ -2092,7 +2093,7 @@ async fn write_committed_checkpoint(
 
     // Stage (d) complete — release the window guard (best-effort; an
     // orphaned marker expires via its TTL).
-    if let Err(err) = history::clear_non_cleanup_traces_inflight_marker(
+    if let Err(err) = traces::clear_non_cleanup_traces_inflight_marker(
         conn,
         libra_session_id,
         &checkpoint_id,
@@ -2155,11 +2156,11 @@ struct SubagentCommitPlan {
 }
 
 #[async_trait::async_trait]
-impl crate::internal::ai::history::TracesTxnExtra for SubagentCommitPlan {
+impl crate::internal::ai::traces::TracesTxnExtra for SubagentCommitPlan {
     async fn apply(
         &self,
         txn: &sea_orm::DatabaseTransaction,
-        ctx: &crate::internal::ai::history::TracesCommitCtx,
+        ctx: &crate::internal::ai::traces::TracesCommitCtx,
     ) -> Result<()> {
         use sea_orm::{ConnectionTrait, Statement};
 
@@ -2240,8 +2241,9 @@ async fn write_subagent_checkpoint(
     now: i64,
 ) -> Result<()> {
     use crate::internal::ai::{
-        history::{self, CheckpointCommitParams, CheckpointScope, HistoryManager},
+        history::HistoryManager,
         observed_agents::{RedactedBytes, Redactor},
+        traces::{self, CheckpointCommitParams, CheckpointScope},
     };
 
     // Resolve the parent `committed` checkpoint (if any) for linkage.
@@ -2357,7 +2359,7 @@ async fn write_subagent_checkpoint(
             }
         };
 
-    let marker = history::TracesInflightMarker::new(
+    let marker = traces::TracesInflightMarker::new(
         libra_session_id,
         &checkpoint_id,
         Utc::now().timestamp_millis(),
@@ -2366,7 +2368,7 @@ async fn write_subagent_checkpoint(
         .generation
         .as_deref()
         .context("new subagent checkpoint marker has no writer generation")?;
-    history::register_traces_write_attempt(conn, &marker, &[])
+    traces::register_traces_write_attempt(conn, &marker, &[])
         .await
         .context("register fail-closed subagent checkpoint attempt")?;
 
@@ -2375,7 +2377,7 @@ async fn write_subagent_checkpoint(
         .context("create objects dir for subagent checkpoint commit")
     {
         if let Some(generation) = marker.generation.as_deref() {
-            let _ = history::clear_non_cleanup_traces_inflight_marker(
+            let _ = traces::clear_non_cleanup_traces_inflight_marker(
                 conn,
                 libra_session_id,
                 &checkpoint_id,
@@ -2388,11 +2390,10 @@ async fn write_subagent_checkpoint(
     let storage = std::sync::Arc::new(crate::utils::client_storage::ClientStorage::init(
         objects_dir,
     ));
-    let manager = HistoryManager::new_with_ref(
+    let manager = HistoryManager::for_traces(
         storage,
         repo_path.to_path_buf(),
         std::sync::Arc::new(conn.clone()),
-        crate::internal::branch::TRACES_BRANCH,
     );
     let commit_plan = SubagentCommitPlan {
         checkpoint_id: checkpoint_id.clone(),
@@ -2429,7 +2430,7 @@ async fn write_subagent_checkpoint(
         Ok(written) => written,
         Err(error) => {
             if let Some(generation) = marker.generation.as_deref() {
-                let _ = history::clear_non_cleanup_traces_inflight_marker(
+                let _ = traces::clear_non_cleanup_traces_inflight_marker(
                     conn,
                     libra_session_id,
                     &checkpoint_id,
@@ -2447,7 +2448,7 @@ async fn write_subagent_checkpoint(
         written.tree_oid.to_string(),
         written.metadata_blob_oid.to_string(),
     ];
-    if let Err(err) = history::update_traces_inflight_marker_if_generation(
+    if let Err(err) = traces::update_traces_inflight_marker_if_generation(
         conn,
         &committed_marker,
         &written.marker_generation,
@@ -2461,7 +2462,7 @@ async fn write_subagent_checkpoint(
         );
     }
 
-    if let Err(err) = history::clear_non_cleanup_traces_inflight_marker(
+    if let Err(err) = traces::clear_non_cleanup_traces_inflight_marker(
         conn,
         libra_session_id,
         &checkpoint_id,
@@ -2535,10 +2536,8 @@ pub async fn insert_subagent_checkpoint_row_idempotent(
 ) -> Result<bool> {
     use sea_orm::{ConnectionTrait, Statement};
 
-    use crate::internal::ai::history;
-
     if let Some(existing_id) =
-        history::agent_checkpoint_id_for_traces_commit(conn, row.traces_commit).await?
+        traces::agent_checkpoint_id_for_traces_commit(conn, row.traces_commit).await?
     {
         tracing::info!(
             checkpoint_id = %row.checkpoint_id,
@@ -2612,10 +2611,8 @@ pub async fn insert_agent_checkpoint_row_idempotent(
 ) -> Result<bool> {
     use sea_orm::{ConnectionTrait, Statement};
 
-    use crate::internal::ai::history;
-
     if let Some(existing_id) =
-        history::agent_checkpoint_id_for_traces_commit(conn, row.traces_commit).await?
+        traces::agent_checkpoint_id_for_traces_commit(conn, row.traces_commit).await?
     {
         tracing::info!(
             checkpoint_id = %row.checkpoint_id,
@@ -3236,29 +3233,23 @@ async fn persist_session_history(
 
     let storage = Arc::new(ClientStorage::init(objects_dir));
     let db_conn = Arc::new(db::get_db_conn_instance().await.clone());
-    let history_manager = HistoryManager::new(storage, storage_path.to_path_buf(), db_conn);
-
-    if let Some(existing) = history_manager
-        .get_object_hash(AI_SESSION_TYPE, &session.id)
-        .await?
-    {
-        return Ok(PersistOutcome {
-            object_hash: existing.to_string(),
-            already_exists: true,
-        });
-    }
-
     let payload = build_ai_session_payload(session, provider);
     let blob_data = serde_json::to_vec(&normalize_json_value(payload))
         .context("failed to serialize ai_session payload")?;
     let blob_hash = write_git_object(storage_path, "blob", &blob_data)?;
-    history_manager
-        .append(AI_SESSION_TYPE, &session.id, blob_hash)
-        .await?;
+    let (object_hash, already_exists) = history::persist_ai_session(
+        storage,
+        storage_path.to_path_buf(),
+        db_conn,
+        AI_SESSION_TYPE,
+        &session.id,
+        blob_hash,
+    )
+    .await?;
 
     Ok(PersistOutcome {
-        object_hash: blob_hash.to_string(),
-        already_exists: false,
+        object_hash: object_hash.to_string(),
+        already_exists,
     })
 }
 
@@ -3332,7 +3323,7 @@ fn build_ai_session_payload(session: &SessionState, provider: &dyn HookProvider)
         "ingest_meta": {
             "source": provider.source_name(),
             "provider": provider.provider_name(),
-            "history_ref": AI_REF,
+            "history_ref": history::ai_ref_name(),
             "ingested_at": Utc::now().to_rfc3339(),
         }
     })

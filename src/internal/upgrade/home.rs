@@ -10,9 +10,11 @@
 //! 1. a non-empty `LIBRA_HOME` environment variable wins;
 //! 2. otherwise, when `LIBRA_CONFIG_GLOBAL_DB` is set (the global-config
 //!    isolation hook used by tests and sandboxes), the settings live next to
-//!    that database — its parent directory *is* the Libra home in the default
-//!    layout (`~/.libra/config.db`), so isolated environments are isolated
-//!    here too instead of silently touching the real user's upgrade state;
+//!    that database. This rule exists ONLY for explicit isolation calls: the
+//!    default layout is the XDG config directory since 2026-09-19 (GCX-01), so
+//!    it is no longer a description of where per-user state normally lives;
+//!    isolated environments must stay isolated instead of silently touching
+//!    the real user's upgrade state;
 //! 3. otherwise `$HOME/.libra` (falling back to the platform home directory
 //!    on systems where `HOME` is not set, e.g. Windows).
 //!

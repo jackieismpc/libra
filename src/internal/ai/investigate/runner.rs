@@ -45,16 +45,16 @@ pub use crate::internal::ai::review::DEFAULT_CLAUDE_REVIEW_MAX_BUDGET_USD;
 /// turn past its deadline pauses the run as `agent_failure` (retryable).
 pub use crate::internal::ai::review::DEFAULT_REVIEWER_TIMEOUT as DEFAULT_INVESTIGATOR_TIMEOUT;
 use crate::internal::ai::{
-    agent::runtime::{
-        WorkspaceIsolationConfig, sub_agent_dispatcher::materialize_isolated_workspace,
-    },
     agent_run::AgentRunId,
     observed_agents::launchable_investigate_slugs,
-    orchestrator::workspace::{FuseProvisionState, SubAgentWorkspace},
     review::{
         BoundedSinkBuffer, REVIEW_SINK_BUFFER_BYTES, REVIEW_SINK_TRUNCATION_MARKER,
         ReviewerCommand, ReviewerLaunchPlan, build_reviewer_command, drain_capped,
         findings_section, redact_for_log, redact_untrusted, scrub_controls, spawn_reviewer,
+    },
+    workspace_isolation::{
+        FuseProvisionState, SubAgentWorkspace, WorkspaceIsolationConfig,
+        materialize_isolated_workspace,
     },
 };
 
@@ -1377,7 +1377,7 @@ impl InvestigateWorkspaceGuard {
 
 impl Drop for InvestigateWorkspaceGuard {
     fn drop(&mut self) {
-        use crate::internal::ai::orchestrator::types::TaskWorkspaceBackend;
+        use crate::internal::ai::workspace_isolation::TaskWorkspaceBackend;
         let Some(workspace) = self.workspace.take() else {
             return;
         };

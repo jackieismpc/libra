@@ -259,15 +259,19 @@ fn clone_deps_of_is_rejected_for_cloud_sources() {
         ],
         work.path(),
     );
-    assert_ne!(
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
         out.status.code(),
-        Some(0),
-        "cloud --deps-of must be rejected"
+        Some(129),
+        "retired publish restore source must be refused: {stderr}"
     );
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("--deps-of"),
-        "error must name --deps-of: {}",
-        String::from_utf8_lossy(&out.stderr)
+        stderr.contains("no longer supported"),
+        "error must refuse the retired restore source: {stderr}"
+    );
+    assert!(
+        stderr.contains("libra cloud"),
+        "error must hint at git remotes / libra cloud: {stderr}"
     );
 }
 

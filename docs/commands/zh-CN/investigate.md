@@ -11,7 +11,6 @@ libra investigate show <run_id> [--json]
 libra investigate continue <run_id>
 libra investigate cancel <run_id>
 libra investigate clean [--run <run_id>] [--all]
-libra investigate fix <run_id>
 libra investigate attach <run_id> <file> [--json]
 ```
 
@@ -97,23 +96,6 @@ investigator 会被截断并打上标记）。
 按 `started_at DESC, run_id DESC` 排序。JSON envelope 携带 `schema_version`、
 `items`、`next_cursor`（不透明 token——原样回传）和 `has_more`。
 
-### `fix`
-
-`libra investigate fix <run_id>` 会先校验已有 investigation，再向一个活跃且已授权的
-`libra code --control write` runtime 提交固定的可信请求。它与
-`libra review --fix` 复用同一条串行 runtime、plan、approval、sandbox、network、ACL
-与 tool gate，不会创建第二条 mutation queue。investigation 的 topic、stances、
-findings、attachments 与 run id 都不会复制进 runtime 请求；runtime 会独立检查当前
-worktree，并如实返回新 patch 或确定性的 repair-required 结果。
-
-没有已授权 runtime 时，命令以 `LBR-AGENT-010` fail closed。原始不可信 seed 会在
-runtime discovery 前以 `LBR-AGENT-011` 被拒绝；只读证据可继续通过
-`libra investigate show <run_id>` 查看。approval 或 sandbox 拒绝仍是受控失败
-（`LBR-AGENT-039`）。执行未完整结束、interaction response 非法、超时，或在后续拒绝
-前已经观察到 mutation 时返回 `LBR-AGENT-040`；重试前应检查活跃 Code session 与
-worktree。使用 `--json` 时，成功结果的 command 为 `investigate_fix_execution`，并包含
-`run_id`、`admitted`、`execution` 与 `patch_applied`。
-
 ## Examples
 
 ```bash
@@ -161,9 +143,7 @@ libra investigate clean --all
 - `0` —— run 落在 `quorum`、`max_turns`、`timeout` 或 `cancelled`，或 PAUSE
   （`stalled` / `agent_failure`）；子命令执行成功。
 - 非零 —— 用法错误、run 落在 `error` terminal state、未知 run id、对已锁 run 的
-  并发 `continue`、`fix` 缺少已授权 runtime（`LBR-AGENT-010`）、受控 gate 被拒绝
-  （`LBR-AGENT-039`）或执行未完整结束（`LBR-AGENT-040`），或 run 队列已满
-  （`LBR-AGENT-014`）。
+  并发 `continue`，或 run 队列已满（`LBR-AGENT-014`）。
 
 ## 另请参阅
 

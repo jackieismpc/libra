@@ -362,31 +362,7 @@ pub struct PolicyViolation {
     pub path: Option<String>,
 }
 
-/// A summary of a tool call executed within a task.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct ToolDiffRecord {
-    pub path: String,
-    pub change_type: String,
-    pub diff: String,
-}
-
-/// A summary of a tool call executed within a task.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct ToolCallRecord {
-    pub tool_name: String,
-    pub action: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub arguments_json: Option<Value>,
-    #[serde(default)]
-    pub paths_read: Vec<String>,
-    #[serde(default)]
-    pub paths_written: Vec<String>,
-    pub success: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
-    #[serde(default)]
-    pub diffs: Vec<ToolDiffRecord>,
-}
+pub use crate::internal::ai::tool_call_record::{ToolCallRecord, ToolDiffRecord};
 
 /// Result of executing a single verification check.
 #[derive(Clone, Debug, Serialize, Deserialize)]

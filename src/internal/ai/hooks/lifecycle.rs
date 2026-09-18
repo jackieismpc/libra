@@ -22,7 +22,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use crate::internal::ai::{runtime::event::Event, session::SessionState};
+use crate::internal::ai::{event::Event, session::SessionState};
 
 /// Agent-agnostic lifecycle event kinds.
 ///

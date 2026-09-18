@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.23.0] — 2026-09-19
+
+### Removed: public Code, graph, usage, and Publish surfaces
+
+Breaking minor after last `0.22.x` (`0.22.49`). The public development-agent
+and read-only site-host surfaces are gone in this release:
+
+- `libra code` (including `--control stdio`)
+- `libra graph`
+- `review --fix` / `investigate --fix`
+- `agent session promote --as-intent`
+- `libra usage`
+- `libra publish`
+- `clone libra+cloud://`
+
+Keep `libra cloud`, `libra agent` capture, read-only `review` / `investigate`,
+`sandbox`, `automation`, and `service`. Repository backup stays on
+`libra cloud`; ordinary remotes replace `libra+cloud://` clone. Internal
+modules and `worker/` are still linked until later `0.23.x` cleanup and are
+not a supported user surface.
+
 ## [0.22.49] — 2026-09-18
 
 ### Fixed: signed artifact size cap for Windows release binaries

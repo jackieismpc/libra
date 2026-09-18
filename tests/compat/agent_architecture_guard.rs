@@ -19,9 +19,9 @@ fn repo_root() -> &'static Path {
 /// Capture modules must not import the internal AgentRuntime or the
 /// checkpoint-writer layers. Allowed seams: `hooks::{lifecycle,provider}`
 /// (hook contracts), `completion` (shared usage model), `session` (session
-/// context types) and — documented exception — `orchestrator::types` for
-/// the derived `ToolCallRecord` projection (`derived.rs`). Anything else
-/// from the runtime side is a boundary violation.
+/// context types), and `tool_call_record` (plan-20260920 RC-04). The
+/// former `orchestrator::types` exception for `ToolCallRecord` is closed.
+/// Anything else from the runtime side is a boundary violation.
 ///
 /// The check is AST-based (`syn`): use-trees are flattened (so grouped and
 /// nested-grouped imports cannot slip through), inline fully-qualified
@@ -87,10 +87,8 @@ fn observed_agent_modules_do_not_import_runtime_or_checkpoint_layers() {
         if candidate == "hooks::runtime" || candidate.starts_with("hooks::runtime::") {
             return Some("internal::ai::hooks::runtime".to_string());
         }
-        if (candidate == "orchestrator" || candidate.starts_with("orchestrator::"))
-            && !candidate.starts_with("orchestrator::types")
-        {
-            return Some("internal::ai::orchestrator (outside the ::types seam)".to_string());
+        if candidate == "orchestrator" || candidate.starts_with("orchestrator::") {
+            return Some("internal::ai::orchestrator".to_string());
         }
         None
     }
@@ -563,8 +561,12 @@ fn code_runtime_stays_web_owned_without_tui_or_private_plan_state() {
             "{path} must not advertise TUI as the current default"
         );
         assert!(
-            body.contains("Web Code UI") || body.contains("Web Code UI"),
-            "{path} must keep Web Code UI as the default surface"
+            body.contains("has been removed") || body.contains("已移除"),
+            "{path} must document that the public Code CLI is gone"
+        );
+        assert!(
+            !body.contains("Web Code UI"),
+            "{path} must not advertise Web Code UI as a current surface"
         );
     }
 }

@@ -8,7 +8,6 @@
 
 use std::{error::Error, sync::Arc};
 
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod apply_patch;
@@ -28,14 +27,7 @@ pub use error::{ToolError, ToolResult};
 pub use registry::{ToolHandler, ToolRegistry, ToolRegistryBuilder};
 pub use spec::{FunctionDefinition, FunctionParameters, ToolSpec, ToolSpecBuilder};
 
-pub use crate::internal::ai::sandbox::ToolRuntimeContext;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolDefinition {
-    pub name: String,
-    pub description: String,
-    pub parameters: Value,
-}
+pub use crate::internal::ai::{sandbox::ToolRuntimeContext, tool_definition::ToolDefinition};
 
 pub trait Tool: Send + Sync {
     fn name(&self) -> String {

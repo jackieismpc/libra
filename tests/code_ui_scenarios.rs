@@ -2021,7 +2021,7 @@ fn goal_task_control_baseline_session_event_kind_tag_is_goal() {
         },
     )
     .expect("baseline GoalSpec must construct");
-    let event = SessionEvent::Goal(GoalEventEnvelope::new(
+    let event = SessionEvent::goal(GoalEventEnvelope::new(
         goal_id,
         Utc::now(),
         GoalEvent::Created(spec),

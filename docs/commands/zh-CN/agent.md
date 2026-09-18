@@ -56,7 +56,6 @@ remote workspace，含生命周期状态（`provisioning`/`active`/`releasing`/
 | `session show <id>` | 显示一个已捕获会话 |
 | `session stop <id>` | 将已捕获会话标记为 stopped |
 | `session resume <id>` | 将已停止的已捕获会话重新标记为 active |
-| `session promote <id>` | 将已捕获会话提升为 Libra intent 元数据 |
 | `session derive-tool-calls <id>` | 从已捕获会话推导工具调用记录 |
 | `checkpoint list` | 列出已捕获 checkpoint |
 | `checkpoint show <id>` | 显示 checkpoint 元数据 |

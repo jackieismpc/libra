@@ -473,39 +473,24 @@ pub const MUTABLE_STATE_OWNERSHIP: &[MutableStateSurface] = &[
         rationale: "object-graph side tables (repository-wide by definition)",
     },
     MutableStateSurface {
-        table: "publish_ai_objects",
+        table: "legacy_operation_parent",
         owner: StateOwner::Repository,
-        rationale: "publish worker/site state (repository-wide)",
+        rationale: "operation-log companions (the log itself is the Composite row above)",
     },
     MutableStateSurface {
-        table: "publish_ai_versions",
+        table: "legacy_operation_view",
         owner: StateOwner::Repository,
-        rationale: "publish worker/site state (repository-wide)",
+        rationale: "operation-log companions (the log itself is the Composite row above)",
     },
     MutableStateSurface {
-        table: "publish_files",
+        table: "legacy_operation_view_ref",
         owner: StateOwner::Repository,
-        rationale: "publish worker/site state (repository-wide)",
+        rationale: "operation-log companions (the log itself is the Composite row above)",
     },
     MutableStateSurface {
-        table: "publish_refs",
+        table: "legacy_operation_view_workspace",
         owner: StateOwner::Repository,
-        rationale: "publish worker/site state (repository-wide)",
-    },
-    MutableStateSurface {
-        table: "publish_revisions",
-        owner: StateOwner::Repository,
-        rationale: "publish worker/site state (repository-wide)",
-    },
-    MutableStateSurface {
-        table: "publish_sites",
-        owner: StateOwner::Repository,
-        rationale: "publish worker/site state (repository-wide)",
-    },
-    MutableStateSurface {
-        table: "publish_sync_runs",
-        owner: StateOwner::Repository,
-        rationale: "publish worker/site state (repository-wide)",
+        rationale: "operation-log companions (the log itself is the Composite row above)",
     },
 ];
 
@@ -682,7 +667,7 @@ mod tests {
     /// Listed explicitly so a new such file is a reviewed decision.
     const NON_REPOSITORY_DDL_SOURCES: &[&str] = &[
         // The Cloudflare D1 backup mirror: a separate remote database with
-        // its own schema (`sql/publish/` + the mirror tables). Local
+        // its own schema (object/index mirror tables). Local
         // worktree scoping does not apply to it.
         "src/utils/d1_client.rs",
     ];

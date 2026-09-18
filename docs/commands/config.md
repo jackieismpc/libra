@@ -30,7 +30,7 @@ libra config --rename-section <old-name> <new-name>
 
 ## Description
 
-`libra config` reads and writes configuration values across three scopes: **local** (repository-level, stored in `.libra/libra.db`), **global** (user-level, stored in `~/.libra/config.db`), and **system** (machine-wide, stored in `/etc/libra/config.db`; lowest cascade precedence, plain config only — no vault). Each database uses SQLite with a `config_kv` table.
+`libra config` reads and writes configuration values across three scopes: **local** (repository-level, stored in `.libra/libra.db`), **global** (user-level, stored in `<XDG_CONFIG_HOME or ~/.config>/libra/config.db`; an existing legacy `~/.libra/config.db` keeps working until the automatic migration release), and **system** (machine-wide, stored in `/etc/libra/config.db`; lowest cascade precedence, plain config only — no vault). Each database uses SQLite with a `config_kv` table.
 
 Unlike Git's plaintext INI files or jj's TOML files, Libra stores configuration in a transactional database with integrated vault encryption. Sensitive values (API keys, tokens, SSH private keys) are automatically encrypted at rest using AES-256-GCM.
 
@@ -71,7 +71,12 @@ must upgrade; never delete receipts or edit SQLite to force a downgrade.
 Recognizing a supported Repository receipt is not permission for automatic
 repair. Unknown/unsupported state is upgrade-only in this release.
 
-GlobalConfig uses `LIBRA_CONFIG_GLOBAL_DB` or `~/.libra/config.db`;
+GlobalConfig uses `LIBRA_CONFIG_GLOBAL_DB` or the XDG configuration directory
+(`$XDG_CONFIG_HOME/libra/config.db`, defaulting to `<home>/.config/libra/config.db`
+on every platform); while an existing legacy `<home>/.libra/config.db` is the
+only store present it stays the active file, so reads and writes never split
+across two databases. `LIBRA_CONFIG_GLOBAL_DB` is a verbatim override and
+disables both the XDG default and the legacy fallback.
 SystemConfig uses `LIBRA_CONFIG_SYSTEM_DB` or `/etc/libra/config.db`.
 Complete process/repo-local storage configuration may make GlobalConfig
 unnecessary, but does not bypass SystemConfig compatibility for remote/cloud
@@ -82,8 +87,9 @@ safety checks.
 ## Read-only global schema doctor
 
 Run `libra config doctor --global-schema` (or `libra --json config doctor --global-schema`)
-to inspect only global schema metadata. It works outside a repository, uses
-`LIBRA_CONFIG_GLOBAL_DB` or `~/.libra/config.db`, and does not read configuration
+to inspect only global schema metadata. It works outside a repository, uses the
+resolved global config path (env override, XDG default, or the legacy fallback),
+and does not read configuration
 values, open the vault, inspect System/Repository databases, migrate a schema,
 write a barrier, create a backup, or run automatic upgrade/recovery. A missing
 target remains absent. `--global` is optional and redundant; `--local`,
@@ -92,7 +98,12 @@ options select the separate mutating workflow below; either option alone fails.
 
 The JSON envelope's `data.report_version` is `1`. The same report backs human
 output: `scope`, `role`, `path_source`, configured/canonical paths, `exists`,
-`size_bytes`, `modified_at_utc`, and `configuration`/`legacy` ledger metadata.
+`size_bytes`, `modified_at_utc`, `legacy_path`, `legacy_exists`,
+`migration_pending`, and `configuration`/`legacy` ledger metadata.
+`path_source` is `LIBRA_CONFIG_GLOBAL_DB` (env override), `xdg` (absolute
+`XDG_CONFIG_HOME`), `home` (the `<home>/.config/libra` default), or `legacy`
+(the old `<home>/.libra/config.db` is still active; `migration_pending` is then
+true and `legacy_path`/`legacy_exists` name the fallback file).
 Each ledger reports `observed_version`, `latest_version`, `readable`, and
 `verified_name`; versions are strings (including the barrier's `i64::MAX`) to
 avoid JSON number precision loss. Null metadata means absent or unavailable,
@@ -338,7 +349,7 @@ libra config path
 
 # Show global config path
 libra config path --global
-# Output: /home/user/.libra/config.db
+# Output: /home/user/.config/libra/config.db
 ```
 
 #### `edit`
@@ -382,7 +393,7 @@ These flags are global (apply to any subcommand):
 | Flag | Description |
 |------|-------------|
 | `--local` | Use repository config (`.libra/libra.db`). This is the default for writes. |
-| `--global` | Use global user config (`~/.libra/config.db`). |
+| `--global` | Use global user config (`<XDG_CONFIG_HOME or ~/.config>/libra/config.db`; the legacy `~/.libra/config.db` remains the active fallback until it is migrated). |
 | `--system` | Use system-wide config (`/etc/libra/config.db`, overridable via `LIBRA_CONFIG_SYSTEM_DB`). Lowest cascade precedence; writing it usually requires elevated privileges. Vault-encrypted secrets are **not** supported in this scope (see Design Rationale). |
 
 ### Hidden Git-Compatible Flags
@@ -539,7 +550,7 @@ Supported `--usage` values are `signing` and `encrypt`.
 ## Scope
 
 - Default scope is local (`.libra/libra.db`)
-- `--global` uses `~/.libra/config.db`
+- `--global` uses `<XDG_CONFIG_HOME or ~/.config>/libra/config.db` (the legacy `~/.libra/config.db` stays the active fallback until it is migrated)
 - `--system` uses `/etc/libra/config.db` (override with `LIBRA_CONFIG_SYSTEM_DB`); lowest cascade precedence, writes usually need elevated privileges, and vault-encrypted secrets are rejected in this scope (see Design Rationale)
 
 ## The `code.defaultProvider` Key

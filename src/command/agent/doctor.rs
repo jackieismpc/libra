@@ -105,7 +105,7 @@ use super::DoctorArgs;
 use crate::{
     internal::{
         ai::{
-            history::{self, HistoryManager},
+            history::HistoryManager,
             hooks::{
                 providers::{claude_provider, gemini_provider},
                 runtime::{
@@ -115,8 +115,8 @@ use crate::{
                 },
             },
             observed_agents::{AgentStability, PREVIEW_SPECS, STABLE_PROMOTED_SPECS},
+            traces,
         },
-        branch::TRACES_BRANCH,
         config::ConfigKv,
         db::get_db_conn_instance,
     },
@@ -860,11 +860,10 @@ async fn scan_checkpoint_store(
     let reader = ObjectReader {
         storage: Arc::new(ClientStorage::init(repo_path.join("objects"))),
     };
-    let history = HistoryManager::new_with_ref(
+    let history = HistoryManager::for_traces(
         reader.storage.clone(),
         repo_path.clone(),
         Arc::new(conn.clone()),
-        TRACES_BRANCH,
     );
     let mut findings: Vec<CheckpointFinding> = Vec::new();
     let mut plans: Vec<RepairPlan> = Vec::new();
@@ -1118,7 +1117,7 @@ async fn scan_checkpoint_store(
     };
     let mut markers = Vec::new();
     for entry in marker_entries {
-        match history::decode_and_validate_traces_inflight_marker(
+        match traces::decode_and_validate_traces_inflight_marker(
             &entry.value,
             &entry.target,
             &entry.key,
@@ -1371,7 +1370,7 @@ async fn scan_checkpoint_store(
         // A row may exist under a different checkpoint_id for the same
         // commit (e.g. an earlier repair raced a crash retry) — the same
         // probe the writer uses keeps this idempotent.
-        match history::agent_checkpoint_id_for_traces_commit(conn, &rc.commit).await {
+        match traces::agent_checkpoint_id_for_traces_commit(conn, &rc.commit).await {
             Ok(Some(_)) => continue,
             Ok(None) => {}
             Err(err) => {
@@ -1785,7 +1784,7 @@ async fn build_class2_plan(
     // claim recovery both rebuild catalog rows through
     // `rebuild_catalog_row_from_traces_ref`, so an unknown scope fails
     // closed identically everywhere.
-    let rebuilt = history::rebuild_catalog_row_from_traces_ref(history::RebuildCatalogRowInputs {
+    let rebuilt = traces::rebuild_catalog_row_from_traces_ref(traces::RebuildCatalogRowInputs {
         scope: scope.clone(),
         checkpoint_id: checkpoint_id.to_string(),
         session_id: metadata.session_id.clone(),
@@ -1818,7 +1817,7 @@ async fn build_class2_plan(
         ));
     }
     match rebuilt {
-        history::RebuiltCatalogRow::Subagent {
+        traces::RebuiltCatalogRow::Subagent {
             checkpoint_id,
             session_id,
             parent_commit,
@@ -1846,7 +1845,7 @@ async fn build_class2_plan(
                 created_at,
             },
         )),
-        history::RebuiltCatalogRow::Committed {
+        traces::RebuiltCatalogRow::Committed {
             checkpoint_id,
             session_id,
             parent_commit,

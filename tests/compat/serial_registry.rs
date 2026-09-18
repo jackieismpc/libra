@@ -2103,10 +2103,11 @@ fn nextest_groups_toml_matches_generator_and_registry() {
     // DEFER-NP-02 (executed 2026-09-17, user-directed): the TA-03 fail-closed
     // expansions carry only the in-process closed set {cwd, env, hash_kind},
     // so the union group holds exactly the genuinely external rows — the
-    // hand-keyed cloud_live (10) and workspace_failpoints (1) tests. A count
-    // drift here means a new test was keyed with an external resource (fine,
-    // but deliberate) or a fail-closed body was re-widened by hand (not fine).
-    assert_eq!(toml_fns.len(), 11, "union fn member count drifted");
+    // hand-keyed cloud_live (9 after RC-35 dropped publish_live) and
+    // workspace_failpoints (1) tests. A count drift here means a new test was
+    // keyed with an external resource (fine, but deliberate) or a fail-closed
+    // body was re-widened by hand (not fine).
+    assert_eq!(toml_fns.len(), 10, "union fn member count drifted");
     assert_eq!(toml_bins.len(), 7, "site host target count drifted");
 }
 

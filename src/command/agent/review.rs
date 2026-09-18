@@ -20,15 +20,10 @@
 //! - findings are provenance=untrusted — `review show` always renders
 //!   them through [`render_untrusted_findings`] (ANSI/control stripped),
 //!   never raw;
-//! - `--fix` sends only a fixed request to an active AgentRuntime, then relays
-//!   explicit user decisions through that runtime's existing plan, approval,
-//!   sandbox, network, and ACL gates; observed reviewer findings never enter it.
+//! - findings never enter a mutating workflow; use `libra agent` to inspect
+//!   captured sessions instead of a Code runtime fix bridge.
 
-use std::{
-    collections::BTreeMap,
-    io::{self, Write},
-    time::Duration,
-};
+use std::time::Duration;
 
 use clap::{Args, Subcommand};
 use serde::Serialize;
@@ -47,11 +42,6 @@ use crate::{
                 cancel_orphaned_run, is_launchable_reviewer, render_untrusted_findings, run_review,
             },
             run_admission::{self, RejectedAdmission},
-            runtime::{
-                ReviewFixBridgeError, ReviewFixExecutionOutcome, ReviewFixInput,
-                ReviewFixInteraction, ReviewFixInteractionResponder, ReviewFixInteractionResponse,
-                execute_review_fix,
-            },
         },
         head::Head,
     },
@@ -78,12 +68,7 @@ EXAMPLES:
     libra review cancel <run_id>                     Cancel a run (same cleanup path as Ctrl-C)
     libra review clean --run <run_id>                Remove one finished run directory
     libra review clean --all                         Remove every finished run directory
-    libra review attach <run_id> <file>              Attach an external file to a run (provenance=manual)
-
-    `libra review --fix` requires an active authorized `libra code --control write`
-    session (otherwise LBR-AGENT-010). It asks for every plan, approval, sandbox,
-    network, and ACL decision in the terminal; only the existing Code runtime may
-    apply a patch.";
+    libra review attach <run_id> <file>              Attach an external file to a run (provenance=manual)";
 
 // ---------------------------------------------------------------------------
 // Clap surface (agent.md §5 exact)
@@ -113,11 +98,7 @@ pub struct ReviewRunCliArgs {
 
     /// Review the changes since this revision (recorded scope
     /// `<rev>..HEAD`). Default scope is the last commit (HEAD~1..HEAD).
-    #[arg(
-        long,
-        value_name = "REV",
-        conflicts_with_all = ["checkpoint", "fix"]
-    )]
+    #[arg(long, value_name = "REV", conflicts_with = "checkpoint")]
     pub since: Option<String>,
 
     /// Review the content captured by an agent checkpoint (see
@@ -125,13 +106,8 @@ pub struct ReviewRunCliArgs {
     /// checkpoint's materialized transcript/metadata (read-only), never
     /// the current worktree. A missing or non-materializable checkpoint
     /// fails closed before any run is created.
-    #[arg(long, value_name = "ID", conflicts_with = "fix")]
+    #[arg(long, value_name = "ID")]
     pub checkpoint: Option<String>,
-
-    /// Prepare and execute a controlled review-fix plan in an active internal
-    /// runtime. Every runtime gate still requires an explicit user decision.
-    #[arg(long, conflicts_with_all = ["agents", "since", "checkpoint"])]
-    pub fix: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -266,243 +242,6 @@ fn build_review_prompt(target_scope: &str) -> String {
          - If the scope cannot be resolved from the snapshot, review the most \
          relevant files and state that limitation explicitly.\n"
     )
-}
-
-/// Stable refusal for a missing or unauthorized active Code runtime.
-fn fix_bridge_unavailable_error() -> CliError {
-    CliError::fatal(
-        "review --fix requires an active authorized internal AgentRuntime. Start \
-         `libra code --control write` in this repository, then retry; this command \
-         executes only through that runtime's controlled plan and approval gates",
-    )
-    .with_stable_code(StableErrorCode::AgentFixBridgeUnavailable)
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum ControlledFixCommand {
-    Review,
-    Investigate,
-}
-
-impl ControlledFixCommand {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Review => "review --fix",
-            Self::Investigate => "investigate fix",
-        }
-    }
-
-    fn unavailable_error(self) -> CliError {
-        match self {
-            Self::Review => fix_bridge_unavailable_error(),
-            Self::Investigate => CliError::fatal(
-                "investigate fix requires an active authorized internal AgentRuntime. Start \
-                 `libra code --control write` in this repository, then retry; the \
-                 investigation remains read-only via `libra investigate show <run_id>`",
-            )
-            .with_stable_code(StableErrorCode::AgentFixBridgeUnavailable),
-        }
-    }
-
-    fn untrusted_seed_error(self) -> CliError {
-        match self {
-            Self::Review => untrusted_seed_for_mutation_error(),
-            Self::Investigate => CliError::fatal(
-                "untrusted investigation topic or findings cannot enter a mutating workflow; \
-                 inspect them with `libra investigate show <run_id>`. `investigate fix` \
-                 submits only a fixed request and requires the active Code runtime's normal \
-                 plan and approval gates",
-            )
-            .with_stable_code(StableErrorCode::AgentUntrustedSeedForMutation),
-        }
-    }
-}
-
-/// External-agent seeds are never allowed through the review-fix bridge.
-fn untrusted_seed_for_mutation_error() -> CliError {
-    CliError::fatal(
-        "untrusted seed content cannot enter a mutating review-fix workflow without \
-         explicit approval; inspect the read-only review findings instead",
-    )
-    .with_stable_code(StableErrorCode::AgentUntrustedSeedForMutation)
-}
-
-fn map_fix_bridge_error(command: ControlledFixCommand, error: ReviewFixBridgeError) -> CliError {
-    match error {
-        ReviewFixBridgeError::Unavailable => command.unavailable_error(),
-        ReviewFixBridgeError::UntrustedSeed => command.untrusted_seed_error(),
-        ReviewFixBridgeError::ApprovalDenied => CliError::fatal(
-            format!(
-                "{} was denied at a tool-approval gate; no patch was applied",
-                command.label()
-            ),
-        )
-        .with_stable_code(StableErrorCode::AgentFixExecutionDenied),
-        ReviewFixBridgeError::SandboxDenied => CliError::fatal(
-            format!(
-                "{} was denied at a sandbox-approval gate; no patch was applied",
-                command.label()
-            ),
-        )
-        .with_stable_code(StableErrorCode::AgentFixExecutionDenied),
-        ReviewFixBridgeError::ExecutionFailed
-        | ReviewFixBridgeError::MutationBeforeDenial
-        | ReviewFixBridgeError::TimedOut
-        | ReviewFixBridgeError::InvalidInteractionResponse => CliError::fatal(format!(
-            "{} did not complete cleanly: {error}; inspect the active `libra code` session and worktree before retrying",
-            command.label()
-        ))
-        .with_stable_code(StableErrorCode::AgentFixExecutionFailed),
-    }
-}
-
-pub(crate) async fn drive_controlled_fix(
-    command: ControlledFixCommand,
-    working_dir: &std::path::Path,
-    input: ReviewFixInput,
-) -> CliResult<ReviewFixExecutionOutcome> {
-    execute_review_fix(working_dir, input, &TerminalReviewFixResponder { command })
-        .await
-        .map_err(|error| map_fix_bridge_error(command, error))
-}
-
-/// Terminal-only adapter for a review-fix controller lease. It never invents
-/// a decision: every option or user-input answer is read from the foreground
-/// user and is then re-validated by the Code runtime.
-struct TerminalReviewFixResponder {
-    command: ControlledFixCommand,
-}
-
-#[async_trait::async_trait]
-impl ReviewFixInteractionResponder for TerminalReviewFixResponder {
-    async fn respond(
-        &self,
-        interaction: ReviewFixInteraction,
-    ) -> Result<ReviewFixInteractionResponse, String> {
-        eprintln!(
-            "\n{} needs your decision: {}",
-            self.command.label(),
-            interaction.kind.as_str()
-        );
-        if let Some(title) = interaction.title.as_deref() {
-            eprintln!("{}", terminal_safe_text(title));
-        }
-        if let Some(prompt) = interaction.prompt.as_deref() {
-            eprintln!("{}", terminal_safe_text(prompt));
-        }
-
-        if !interaction.options.is_empty() {
-            let choices = interaction
-                .options
-                .iter()
-                .map(|option| terminal_safe_text(option))
-                .collect::<Vec<_>>()
-                .join(", ");
-            eprintln!("choices: {choices}");
-            return read_terminal_value("choose one exactly as shown: ", false, true)
-                .await
-                .map(|selected_option| ReviewFixInteractionResponse {
-                    selected_option,
-                    ..Default::default()
-                });
-        }
-
-        if interaction.questions.is_empty() {
-            return Err("the active Code session requested an empty user-input form".to_string());
-        }
-
-        let mut answers = BTreeMap::new();
-        for question in interaction.questions {
-            let prompt = terminal_safe_text(&question.prompt);
-            if !question.options.is_empty() {
-                let choices = question
-                    .options
-                    .iter()
-                    .map(|option| terminal_safe_text(option))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                eprintln!("{} choices: {}", prompt, choices);
-            }
-            let answer = read_terminal_value(
-                &format!("{prompt}: "),
-                question.is_secret,
-                !question.options.is_empty(),
-            )
-            .await?;
-            if answer.is_empty() {
-                return Err(format!(
-                    "a non-empty answer is required for '{}'",
-                    question.id
-                ));
-            }
-            answers.insert(question.id, vec![answer]);
-        }
-        Ok(ReviewFixInteractionResponse {
-            answers,
-            ..Default::default()
-        })
-    }
-}
-
-fn terminal_safe_text(text: &str) -> String {
-    const MAX_TERMINAL_TEXT_CHARS: usize = 4_096;
-    let sanitized = render_untrusted_findings(text);
-    let sanitized = sanitized.replace(['\n', '\t'], " ");
-    let mut characters = sanitized.chars();
-    let mut limited = characters
-        .by_ref()
-        .take(MAX_TERMINAL_TEXT_CHARS)
-        .collect::<String>();
-    if characters.next().is_some() {
-        limited.push('…');
-    }
-    limited
-}
-
-async fn read_terminal_value(
-    prompt: &str,
-    hide_input: bool,
-    trim_input: bool,
-) -> Result<String, String> {
-    let prompt = prompt.to_string();
-    tokio::task::spawn_blocking(move || {
-        if hide_input {
-            return rpassword::prompt_password(prompt)
-                .map(|input| normalize_terminal_input(input, trim_input))
-                .map_err(|error| format!("failed to read hidden review-fix response: {error}"))
-                .and_then(bound_terminal_input);
-        }
-        eprint!("{prompt}");
-        io::stderr()
-            .flush()
-            .map_err(|error| format!("failed to render review-fix prompt: {error}"))?;
-        let mut input = String::new();
-        let read = io::stdin()
-            .read_line(&mut input)
-            .map_err(|error| format!("failed to read review-fix response: {error}"))?;
-        if read == 0 {
-            return Err("review-fix response input closed".to_string());
-        }
-        bound_terminal_input(normalize_terminal_input(input, trim_input))
-    })
-    .await
-    .map_err(|error| format!("review-fix response task failed: {error}"))?
-}
-
-fn normalize_terminal_input(input: String, trim_input: bool) -> String {
-    if trim_input {
-        input.trim().to_string()
-    } else {
-        input.trim_end_matches(&['\r', '\n'][..]).to_string()
-    }
-}
-
-fn bound_terminal_input(input: String) -> Result<String, String> {
-    const MAX_TERMINAL_INPUT_BYTES: usize = 64 * 1024;
-    if input.len() > MAX_TERMINAL_INPUT_BYTES {
-        return Err("review-fix response exceeds the 64 KiB limit".to_string());
-    }
-    Ok(input)
 }
 
 /// PD-02 checkpoint-scoped prompt: the reviewers' workspace is the
@@ -668,46 +407,6 @@ fn run_queue_full_error(rejected: RejectedAdmission) -> CliError {
 }
 
 async fn run(args: ReviewRunCliArgs, output: &OutputConfig) -> CliResult<()> {
-    if args.fix {
-        let working_dir = std::env::current_dir().map_err(|error| {
-            CliError::fatal(format!(
-                "cannot resolve the working directory for controlled review --fix execution: {error}"
-            ))
-        })?;
-        let outcome = drive_controlled_fix(
-            ControlledFixCommand::Review,
-            &working_dir,
-            ReviewFixInput::TrustedAdmission,
-        )
-        .await?;
-        let (execution, patch_applied) = match outcome {
-            ReviewFixExecutionOutcome::PatchApplied => ("patch_applied", true),
-            ReviewFixExecutionOutcome::RepairRequired { patch_applied } => {
-                ("repair_required", patch_applied)
-            }
-        };
-        if output.is_json() {
-            let payload = serde_json::json!({
-                "schema_version": PAGE_SCHEMA_VERSION,
-                "admitted": true,
-                "execution": execution,
-                "patch_applied": patch_applied,
-            });
-            return emit_json_data("review_fix_execution", &payload, output);
-        }
-        if !output.quiet {
-            match outcome {
-                ReviewFixExecutionOutcome::PatchApplied => {
-                    println!("review --fix applied a patch through the active AgentRuntime")
-                }
-                ReviewFixExecutionOutcome::RepairRequired { patch_applied } => println!(
-                    "review --fix reached the AgentRuntime repair state; patch applied before failure: {patch_applied}"
-                ),
-            }
-        }
-        return Ok(());
-    }
-
     // Dedupe while preserving request order: duplicate slugs would race
     // on the same reviewer identity for no benefit.
     let mut agents: Vec<String> = Vec::with_capacity(args.agents.len());
@@ -1411,8 +1110,6 @@ mod tests {
             "review cancel",
             "review clean --run",
             "review clean --all",
-            "--fix",
-            "LBR-AGENT-010",
         ] {
             assert!(
                 REVIEW_EXAMPLES.contains(needle),
@@ -1476,41 +1173,6 @@ mod tests {
             1,
             "the closing delimiter must appear exactly once"
         );
-    }
-
-    #[test]
-    fn fix_flag_maps_to_lbr_agent_010() {
-        let error = fix_bridge_unavailable_error();
-        assert_eq!(
-            error.stable_code(),
-            StableErrorCode::AgentFixBridgeUnavailable
-        );
-        assert_eq!(error.stable_code().as_str(), "LBR-AGENT-010");
-        assert!(
-            error
-                .to_string()
-                .contains("active authorized internal AgentRuntime")
-        );
-    }
-
-    #[test]
-    fn review_fix_terminal_text_strips_control_sequences() {
-        let rendered = terminal_safe_text("approve\u{1b}[2J\u{07}\nforged");
-        assert_eq!(rendered, "approve� forged");
-        assert!(!rendered.contains('\u{1b}'));
-    }
-
-    #[test]
-    fn review_fix_freeform_input_preserves_meaningful_spaces() {
-        assert_eq!(
-            normalize_terminal_input("  pass phrase  \n".to_string(), false),
-            "  pass phrase  "
-        );
-        assert_eq!(
-            normalize_terminal_input("  approve  \n".to_string(), true),
-            "approve"
-        );
-        assert!(bound_terminal_input("x".repeat(64 * 1024 + 1)).is_err());
     }
 
     #[test]

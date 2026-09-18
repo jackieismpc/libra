@@ -264,14 +264,6 @@ pub enum StableErrorCode {
     /// Agent checkpoint store inconsistent across ref/DB/object-index
     /// (E10 `ERR_AGENT_CHECKPOINT_STORE_INCONSISTENT`, AG-20).
     AgentCheckpointStoreInconsistent,
-    /// `review --fix` / `investigate fix` requested but the internal
-    /// AgentRuntime fix bridge is unavailable (E10
-    /// `ERR_AGENT_FIX_BRIDGE_UNAVAILABLE`, AG-22/AG-23).
-    AgentFixBridgeUnavailable,
-    /// Untrusted seed content attempted to enter a mutating workflow
-    /// without explicit approval (E10 `ERR_AGENT_UNTRUSTED_SEED_FOR_MUTATION`,
-    /// AG-22/AG-23).
-    AgentUntrustedSeedForMutation,
     /// External agent RPC transport failed — invoke timeout, broken
     /// pipe / unexpected exit, or a malformed JSON-RPC frame — and the
     /// invocation was withheld fail-closed (E10
@@ -393,8 +385,6 @@ impl StableErrorCode {
             Self::AgentIoRedactionSecurityFailure => "LBR-AGENT-007",
             Self::AgentHookEnvelopeInvalid => "LBR-AGENT-008",
             Self::AgentCheckpointStoreInconsistent => "LBR-AGENT-009",
-            Self::AgentFixBridgeUnavailable => "LBR-AGENT-010",
-            Self::AgentUntrustedSeedForMutation => "LBR-AGENT-011",
             Self::AgentRpcTransportFailed => "LBR-AGENT-012",
             Self::AgentRawAccessDenied => "LBR-AGENT-013",
             Self::AgentRunQueueFull => "LBR-AGENT-014",
@@ -467,8 +457,6 @@ impl StableErrorCode {
             | Self::AgentIoRedactionSecurityFailure
             | Self::AgentHookEnvelopeInvalid
             | Self::AgentCheckpointStoreInconsistent
-            | Self::AgentFixBridgeUnavailable
-            | Self::AgentUntrustedSeedForMutation
             | Self::AgentRpcTransportFailed
             | Self::AgentRawAccessDenied
             | Self::AgentRunQueueFull
@@ -613,12 +601,6 @@ impl StableErrorCode {
             }
             Self::AgentCheckpointStoreInconsistent => {
                 "Agent checkpoint store inconsistent across ref/DB/object-index; run libra agent doctor."
-            }
-            Self::AgentFixBridgeUnavailable => {
-                "review/investigate --fix requires the internal AgentRuntime fix bridge, which is not available."
-            }
-            Self::AgentUntrustedSeedForMutation => {
-                "Untrusted seed content cannot enter a mutating workflow without explicit approval."
             }
             Self::AgentRpcTransportFailed => {
                 "External agent RPC transport failed (timeout, broken pipe, or malformed frame); invocation withheld fail-closed."
@@ -2226,11 +2208,6 @@ mod tests {
                 StableErrorCode::AgentCheckpointStoreInconsistent,
                 "LBR-AGENT-009",
             ),
-            (StableErrorCode::AgentFixBridgeUnavailable, "LBR-AGENT-010"),
-            (
-                StableErrorCode::AgentUntrustedSeedForMutation,
-                "LBR-AGENT-011",
-            ),
             (StableErrorCode::AgentRpcTransportFailed, "LBR-AGENT-012"),
             (StableErrorCode::AgentRawAccessDenied, "LBR-AGENT-013"),
             (StableErrorCode::AgentRunQueueFull, "LBR-AGENT-014"),
@@ -2403,8 +2380,6 @@ mod tests {
             StableErrorCode::AgentIoRedactionSecurityFailure,
             StableErrorCode::AgentHookEnvelopeInvalid,
             StableErrorCode::AgentCheckpointStoreInconsistent,
-            StableErrorCode::AgentFixBridgeUnavailable,
-            StableErrorCode::AgentUntrustedSeedForMutation,
             StableErrorCode::AgentRpcTransportFailed,
             StableErrorCode::AgentRawAccessDenied,
             StableErrorCode::AgentRunQueueFull,

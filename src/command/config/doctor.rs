@@ -11,7 +11,6 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use sea_orm::TransactionTrait;
 use serde::Serialize;
 
-use super::ConfigScope;
 use crate::{
     internal::db::{
         DatabaseRole, SchemaCompatibility,
@@ -25,6 +24,7 @@ use crate::{
 
 const ROLE: DatabaseRole = DatabaseRole::GlobalConfig;
 const UNREADABLE_HINT: &str = "Cannot safely inspect this file. Check the configured path and permissions; use a SQLite-consistent snapshot if necessary. Do not edit migration receipts manually.";
+const LEGACY_MIGRATION_HINT: &str = "Global configuration is still at the legacy path; a future release migrates it to the XDG config directory automatically. Keep the legacy file for downgrade safety.";
 
 #[derive(Serialize)]
 struct LedgerReport {
@@ -69,6 +69,9 @@ struct Report {
     exists: Option<bool>,
     size_bytes: Option<u64>,
     modified_at_utc: Option<String>,
+    legacy_path: Option<String>,
+    legacy_exists: Option<bool>,
+    migration_pending: bool,
     configuration: LedgerReport,
     legacy: LedgerReport,
     classification: &'static str,
@@ -79,22 +82,28 @@ struct Report {
 }
 
 impl Report {
-    fn new(path: Option<&Path>) -> CliResult<Self> {
+    fn new(
+        resolution: Option<&crate::internal::config::GlobalConfigResolution>,
+    ) -> CliResult<Self> {
         Ok(Self {
             report_version: 1,
             action: "doctor",
             scope: "global",
             role: "global_config",
-            path_source: if std::env::var_os("LIBRA_CONFIG_GLOBAL_DB").is_some() {
-                "LIBRA_CONFIG_GLOBAL_DB"
-            } else {
-                "home"
-            },
-            configured_path: path.map(|path| path.to_string_lossy().into_owned()),
+            path_source: resolution
+                .map(|resolution| resolution.source.as_str())
+                .unwrap_or("home"),
+            configured_path: resolution
+                .map(|resolution| resolution.path.to_string_lossy().into_owned()),
             canonical_path: None,
             exists: None,
             size_bytes: None,
             modified_at_utc: None,
+            legacy_path: resolution
+                .and_then(|resolution| resolution.legacy_path.as_ref())
+                .map(|path| path.to_string_lossy().into_owned()),
+            legacy_exists: resolution.map(|resolution| resolution.legacy_exists),
+            migration_pending: resolution.is_some_and(|resolution| resolution.migration_pending),
             configuration: LedgerReport::new(ROLE, SchemaLedger::Configuration)?,
             legacy: LedgerReport::new(DatabaseRole::Repository, SchemaLedger::Repository)?,
             classification: "unreadable",
@@ -320,8 +329,11 @@ fn target_unchanged(
 }
 
 pub(super) async fn execute(output: &OutputConfig) -> CliResult<()> {
-    let path = ConfigScope::Global.get_config_path();
-    let mut report = Report::new(path.as_deref())?;
+    let resolution = crate::internal::config::global_config_resolution();
+    let path = resolution
+        .as_ref()
+        .map(|resolution| resolution.path.clone());
+    let mut report = Report::new(resolution.as_ref())?;
     if let Some(path) = path {
         // SQLite errors may contain untrusted schema text. Report a controlled
         // diagnostic instead of forwarding engine messages or config values.
@@ -330,12 +342,21 @@ pub(super) async fn execute(output: &OutputConfig) -> CliResult<()> {
             report.hints = vec![UNREADABLE_HINT];
         }
     }
+    if report.migration_pending && !report.hints.contains(&LEGACY_MIGRATION_HINT) {
+        report.hints.push(LEGACY_MIGRATION_HINT);
+    }
     if output.is_json() {
         emit_json_data("config", &report, output)?;
     } else if !output.quiet {
         println!("Global configuration schema doctor");
         println!("  scope: {} ({})", report.scope, report.role);
         println!("  path_source: {}", report.path_source);
+        println!("  migration_pending: {}", report.migration_pending);
+        println!(
+            "  legacy: {:?} (exists: {:?})",
+            report.legacy_path.as_deref().unwrap_or("unavailable"),
+            report.legacy_exists
+        );
         println!(
             "  exists: {:?}, size_bytes: {:?}",
             report.exists, report.size_bytes
@@ -428,7 +449,7 @@ mod tests {
         let wal = regular_file_stamp(&sidecar(&canonical, "-wal")).unwrap();
         fs::write(&path, b"changed database").unwrap();
         assert!(!target_unchanged(&path, &canonical, &before, &wal));
-        let mut report = Report::new(Some(&path)).unwrap();
+        let mut report = Report::new(None).unwrap();
         report.producer_disposition = "known_repository_receipt_unattested";
         report.legacy.verified_name = Some("operation_v2_branch_convergence");
         report.issue = Some(IssueReport {

@@ -704,8 +704,17 @@ fn config_doctor_uses_global_role() {
         .unwrap();
     assert!(default.status.success());
     let default: serde_json::Value = serde_json::from_slice(&default.stdout).unwrap();
-    assert_eq!(default["data"]["path_source"], "home");
+    // ADR-GCX-01: with `LIBRA_CONFIG_GLOBAL_DB` unset and only the legacy
+    // `home/.libra/config.db` present (created by the env-overridden runs
+    // above), the legacy file stays active until the migration release.
+    assert_eq!(default["data"]["path_source"], "legacy");
+    assert_eq!(default["data"]["legacy_exists"], true);
+    assert_eq!(default["data"]["migration_pending"], true);
     assert_eq!(default["data"]["configured_path"], data["configured_path"]);
+    assert_eq!(
+        default["data"]["legacy_path"],
+        serde_json::json!(fixture.home.join(".libra/config.db").to_str().unwrap())
+    );
 
     let cli = include_str!("../../src/cli.rs")
         .split_whitespace()

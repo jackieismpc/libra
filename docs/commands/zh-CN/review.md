@@ -6,7 +6,6 @@
 
 ```bash
 libra review --agent <slug>... [--since <rev>] [--checkpoint <id>] [--json]
-libra review --fix [--json]
 libra review list [--json] [--limit <n>] [--cursor <token>]
 libra review show <run_id> [--json]
 libra review cancel <run_id>
@@ -74,43 +73,6 @@ reviewer findings 是**不可信自由文本**。`libra review show` 在渲染
 `schema_version`、`items`、`next_cursor`（不透明 token——原样回传）和
 `has_more`。
 
-### `--fix`
-
-`libra review --fix` 要求同一 worktree 中已有活跃且获授权的
-`libra code --control write` 会话。它复用该会话仅 loopback、token 鉴权的
-controller 路径，把一条固定且可信的请求交给既有的串行 AgentRuntime；它不会创建
-第二个 mutation queue。提交前，Code 会话必须处于 `idle`，且没有 pending interaction
-或 plan-execution repair state；否则 bridge 不提交新请求，直接返回 `LBR-AGENT-040`。
-应先在原 Code 会话中处理遗留 interaction；若 repair 投影仍存在，则启动新的获授权
-Code 会话后再重试。请求活跃期间，前台命令持有既有的 automation-controller
-lease，只把用户明确输入的终端选项或表单答案转交给 runtime。reviewer findings、
-transcript、环境变量和其它外部 seed 都不会进入该请求。
-
-`--fix` 与 `--agent`、`--since`、`--checkpoint` 冲突：这些选项只用于选择
-只读 review run 的 reviewer 或输入，受控执行不会静默忽略它们。
-
-活跃 Code runtime 始终是唯一写入者。它会向用户询问正常的 intent/plan 选择、
-用户输入表单、network 选择、工具 approval、sandbox approval 与 ACL 检查；CLI 不会
-自动批准其中任何一步。四类受控结局都明确可见：
-
-在 intent review 选择 `modify` 或 `cancel`，或在 plan review 后选择 `modify`、
-`back`、`cancel`，会立即把控制权交还给活跃 Code 会话，并以 `LBR-AGENT-040`
-结束当前前台 bridge；后续修改应在该 Code 会话中继续。
-
-- 工具 approval 被拒绝时，在报告 patch 之前返回 `LBR-AGENT-039`；
-- sandbox approval 被拒绝时，同样在报告 patch 之前返回该稳定错误码；
-- 工具失败时，以 `execution: "repair_required"` 返回 runtime 既有的确定性
-  repair state，绝不会静默报告 patch 成功；`patch_applied` 会如实说明失败前
-  runtime 是否已经投影出部分 patch；
-- 只有既有 runtime 通过全部适用 gate 并投影出新的 patchset 后，才报告
-  `execution: "patch_applied"` 与 `patch_applied: true`。
-
-没有获授权会话时，命令以 `LBR-AGENT-010` fail-closed；终端交互响应非法、受控执行
-未完整结束，或在后续 gate 被拒绝前已观察到 patch 时，以 `LBR-AGENT-040` 停止且不
-声称 clean success，重试前必须检查 Code 会话与 worktree。untrusted seed 会在发现
-control endpoint 之前以 `LBR-AGENT-011` 拒绝。当前 `review --fix` CLI 没有接收 seed
-的参数，因此该错误码暂不是可触达的 CLI 结局。
-
 ## Examples
 
 ```bash
@@ -128,11 +90,6 @@ libra review --agent codex --checkpoint <checkpoint_id>
 
 # 结构化 run 结果（terminal state、逐 reviewer 结果）
 libra review --agent codex --json
-
-# 通过已运行的 Code 会话准备并执行 review-fix。
-# 终端会要求确认每个适用的 plan、approval、sandbox 与 ACL 选择。
-libra code --control write
-libra review --fix
 
 # 列出 run，再取下一页
 libra review list
@@ -161,13 +118,9 @@ libra review clean --all
 ## 退出状态
 
 - `0` —— run 落在 `success`、`partial`、`timeout` 或 `cancelled`（terminal
-  state 会在输出中报告）；子命令执行成功；或 `--fix` 报告观察到的 patch
-  （`patch_applied: true`）或明确的 runtime repair state
-  （`execution: "repair_required"`）。
+  state 会在输出中报告）；子命令执行成功。
 - 非零 —— 用法错误、run 落在 `error` terminal state、未知 run id、
-  未知或不可物化的 `--checkpoint`（在创建任何 run 之前拒绝）、没有获授权活跃
-  Code 会话的 `--fix`（`LBR-AGENT-010`）、被拒绝的 runtime approval 或 sandbox
-  gate（`LBR-AGENT-039`）、未完成的受控执行（`LBR-AGENT-040`），或 run 队列已满
+  未知或不可物化的 `--checkpoint`（在创建任何 run 之前拒绝），或 run 队列已满
   （`LBR-AGENT-014`）。
 
 ## 另请参阅

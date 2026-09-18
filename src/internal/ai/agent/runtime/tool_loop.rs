@@ -2871,21 +2871,20 @@ mod tests {
             .load_context_replay()
             .unwrap();
         assert_eq!(replay.frames.len(), 2);
-        assert_eq!(
-            replay.frames[0].prompt_id.as_deref(),
-            Some("turn-42/model-turn-1")
-        );
-        assert_eq!(
-            replay.frames[1].prompt_id.as_deref(),
-            Some("turn-42/model-turn-2")
-        );
-        assert!(replay.frames[0].segments.iter().any(|segment| {
+        let frames: Vec<ContextFrameEvent> = replay
+            .frames
+            .iter()
+            .map(|value| serde_json::from_value(value.clone()).expect("context frame payload"))
+            .collect();
+        assert_eq!(frames[0].prompt_id.as_deref(), Some("turn-42/model-turn-1"));
+        assert_eq!(frames[1].prompt_id.as_deref(), Some("turn-42/model-turn-2"));
+        assert!(frames[0].segments.iter().any(|segment| {
             segment.id == "preamble"
                 && segment.segment == ContextSegmentKind::SystemRules
                 && segment.non_compressible
         }));
 
-        let tool_segment = replay.frames[1]
+        let tool_segment = frames[1]
             .segments
             .iter()
             .find(|segment| segment.segment == ContextSegmentKind::ToolResults)
@@ -2901,8 +2900,10 @@ mod tests {
             })
         );
         assert_eq!(replay.compactions.len(), 1);
+        let compaction: CompactionEvent =
+            serde_json::from_value(replay.compactions[0].clone()).expect("compaction payload");
         assert!(
-            replay.compactions[0]
+            compaction
                 .protected_segment_ids
                 .iter()
                 .any(|id| id == "preamble")

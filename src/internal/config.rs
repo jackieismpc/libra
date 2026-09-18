@@ -1251,18 +1251,177 @@ pub async fn locate_env_for_target(
         .map(|value| (value, EnvHitLayer::GlobalVault)))
 }
 
-/// Resolve the global config database path.
+/// Where the active global configuration database came from.
 ///
-/// Boundary conditions:
-/// - `LIBRA_CONFIG_GLOBAL_DB` env var wins (used by integration tests to
-///   sandbox a global config without touching `$HOME`).
-/// - Falls back to `~/.libra/config.db`. Returns `None` if no home directory
-///   can be discovered (rare, but possible inside containers).
-pub(crate) fn global_config_path() -> Option<std::path::PathBuf> {
-    if let Some(p) = std::env::var_os("LIBRA_CONFIG_GLOBAL_DB") {
-        return Some(std::path::PathBuf::from(p));
+/// The string forms are part of the `libra config path --json` and
+/// `libra config doctor --global-schema` contracts (ADR-GCX-06); do not rename
+/// an existing value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlobalConfigPathSource {
+    /// `LIBRA_CONFIG_GLOBAL_DB` was set (tests/sandboxes; never migrated).
+    EnvOverride,
+    /// An absolute `XDG_CONFIG_HOME` was used.
+    XdgConfigHome,
+    /// `<home>/.config/libra` was used.
+    HomeConfig,
+    /// The legacy `<home>/.libra/config.db` is still active (migration pending).
+    LegacyHome,
+}
+
+impl GlobalConfigPathSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EnvOverride => "LIBRA_CONFIG_GLOBAL_DB",
+            Self::XdgConfigHome => "xdg",
+            Self::HomeConfig => "home",
+            Self::LegacyHome => "legacy",
+        }
     }
+}
+
+/// Fully resolved global configuration state.
+///
+/// `path` is the active database; `new_path` is where the XDG-based layout
+/// expects it. When `migration_pending` is true the active path is the legacy
+/// `~/.libra/config.db` and a future release migrates it automatically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalConfigResolution {
+    pub path: std::path::PathBuf,
+    pub source: GlobalConfigPathSource,
+    pub new_path: Option<std::path::PathBuf>,
+    pub new_exists: bool,
+    pub legacy_path: Option<std::path::PathBuf>,
+    pub legacy_exists: bool,
+    pub migration_pending: bool,
+}
+
+/// The platform-consistent global configuration directory (`<config>/libra`).
+///
+/// Rule (ADR-GCX-01): an absolute `XDG_CONFIG_HOME` wins; otherwise
+/// `<home>/.config/libra` on every platform (Linux, macOS and Windows alike).
+/// A relative `XDG_CONFIG_HOME` is ignored per the XDG basedir spec.
+fn global_config_dir_with_source() -> Option<(std::path::PathBuf, GlobalConfigPathSource)> {
+    config_dir_from(
+        dirs::home_dir(),
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+    )
+}
+
+/// Pure form of [`global_config_dir_with_source`] so the no-home branch is
+/// unit-testable without depending on the process passwd database.
+fn config_dir_from(
+    home: Option<std::path::PathBuf>,
+    xdg_config_home: Option<&std::ffi::OsStr>,
+) -> Option<(std::path::PathBuf, GlobalConfigPathSource)> {
+    if let Some(raw) = xdg_config_home {
+        let path = std::path::PathBuf::from(raw);
+        if path.is_absolute() && !path.as_os_str().is_empty() {
+            return Some((path.join("libra"), GlobalConfigPathSource::XdgConfigHome));
+        }
+        tracing::debug!(
+            value = %path.display(),
+            "ignoring relative XDG_CONFIG_HOME for the global config directory"
+        );
+    }
+    home.map(|home| {
+        (
+            home.join(".config").join("libra"),
+            GlobalConfigPathSource::HomeConfig,
+        )
+    })
+}
+
+/// The XDG-based global configuration directory, independent of legacy state.
+pub fn global_config_dir() -> Option<std::path::PathBuf> {
+    global_config_dir_with_source().map(|(dir, _)| dir)
+}
+
+/// The legacy per-home database (`<home>/.libra/config.db`).
+pub fn legacy_global_config_path() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|home| home.join(".libra").join("config.db"))
+}
+
+/// Resolve the global config database plus its provenance.
+///
+/// Boundary conditions (ADR-GCX-01):
+/// - A non-empty `LIBRA_CONFIG_GLOBAL_DB` wins verbatim and disables any legacy
+///   fallback (integration tests / sandboxes rely on this).
+/// - Otherwise the XDG-based path is active when it exists, or when no legacy
+///   database exists yet.
+/// - A new-layout path that is missing while `<home>/.libra/config.db` exists
+///   falls back to the legacy file (read and write stay on one file) and flags
+///   `migration_pending`.
+/// - Returns `None` when no config directory can be discovered.
+pub fn global_config_resolution() -> Option<GlobalConfigResolution> {
+    let legacy_path = legacy_global_config_path();
+    let legacy_exists = legacy_path.as_deref().is_some_and(std::path::Path::exists);
+
+    if let Some(raw) = std::env::var_os("LIBRA_CONFIG_GLOBAL_DB")
+        && !raw.is_empty()
+    {
+        let path = std::path::PathBuf::from(raw);
+        let new_path = global_config_dir().map(|dir| dir.join("config.db"));
+        let new_exists = new_path.as_deref().is_some_and(std::path::Path::exists);
+        return Some(GlobalConfigResolution {
+            path,
+            source: GlobalConfigPathSource::EnvOverride,
+            new_path,
+            new_exists,
+            legacy_path,
+            legacy_exists,
+            migration_pending: false,
+        });
+    }
+
+    let (dir, dir_source) = global_config_dir_with_source()?;
+    let new_path = dir.join("config.db");
+    let new_exists = new_path.exists();
+
+    if !new_exists && legacy_exists {
+        let path = legacy_path.clone()?;
+        return Some(GlobalConfigResolution {
+            path,
+            source: GlobalConfigPathSource::LegacyHome,
+            new_path: Some(new_path),
+            new_exists,
+            legacy_path,
+            legacy_exists,
+            migration_pending: true,
+        });
+    }
+
+    Some(GlobalConfigResolution {
+        path: new_path.clone(),
+        source: dir_source,
+        new_path: Some(new_path),
+        new_exists,
+        legacy_path,
+        legacy_exists,
+        migration_pending: false,
+    })
+}
+
+/// One-line actionable notice for the legacy global config layout, or `None`
+/// when the active layout is already the XDG one.
+pub fn legacy_global_config_notice(resolution: &GlobalConfigResolution) -> Option<String> {
+    if !resolution.migration_pending {
+        return None;
+    }
+    let legacy = resolution.path.display();
+    let new = resolution
+        .new_path
+        .as_deref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<config dir>/libra/config.db".to_string());
+    Some(format!(
+        "global configuration is still at '{legacy}'; a future release will migrate it to \
+         '{new}' automatically (keep the legacy file for downgrade safety)"
+    ))
+}
+
+/// Resolve the active global config database path (see [`global_config_resolution`]).
+pub(crate) fn global_config_path() -> Option<std::path::PathBuf> {
+    global_config_resolution().map(|resolution| resolution.path)
 }
 
 fn system_config_path() -> Option<std::path::PathBuf> {
@@ -3608,5 +3767,135 @@ mod tests {
             downgraded,
             "the read must not have applied pending migrations"
         );
+    }
+
+    // ── ADR-GCX-01: global config path resolution ──
+
+    #[test]
+    fn config_dir_from_ignores_relative_xdg_and_missing_home() {
+        use std::{ffi::OsStr, path::PathBuf};
+
+        assert_eq!(config_dir_from(None, None), None);
+        assert_eq!(
+            config_dir_from(None, Some(OsStr::new("/xdg"))),
+            Some((
+                PathBuf::from("/xdg/libra"),
+                GlobalConfigPathSource::XdgConfigHome,
+            ))
+        );
+        assert_eq!(
+            config_dir_from(Some(PathBuf::from("/home/u")), Some(OsStr::new("relative"))),
+            Some((
+                PathBuf::from("/home/u/.config/libra"),
+                GlobalConfigPathSource::HomeConfig,
+            ))
+        );
+        assert_eq!(
+            config_dir_from(Some(PathBuf::from("/home/u")), Some(OsStr::new(""))),
+            Some((
+                PathBuf::from("/home/u/.config/libra"),
+                GlobalConfigPathSource::HomeConfig,
+            ))
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(env)]
+    fn global_config_resolution_prefers_legacy_then_new_then_xdg_then_env() {
+        use crate::utils::test::ScopedEnvVar;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("xdg");
+        std::fs::create_dir_all(&home).expect("home dir");
+        std::fs::create_dir_all(xdg.join("libra")).expect("xdg dir");
+
+        let _env = ScopedEnvVar::unset("LIBRA_CONFIG_GLOBAL_DB");
+        let _home = ScopedEnvVar::set("HOME", &home);
+        let _profile = ScopedEnvVar::set("USERPROFILE", &home);
+        let _xdg_unset = ScopedEnvVar::unset("XDG_CONFIG_HOME");
+
+        // Fresh home: the XDG-style default under <home>/.config/libra.
+        let fresh = global_config_resolution().expect("fresh resolution");
+        assert_eq!(
+            fresh.path,
+            home.join(".config").join("libra").join("config.db")
+        );
+        assert_eq!(fresh.source, GlobalConfigPathSource::HomeConfig);
+        assert!(!fresh.migration_pending);
+        assert!(!fresh.new_exists);
+
+        // Legacy-only: the legacy file stays active and migration is pending.
+        std::fs::create_dir_all(home.join(".libra")).expect("legacy dir");
+        let legacy = home.join(".libra").join("config.db");
+        std::fs::write(&legacy, b"legacy").expect("legacy db");
+        let pending = global_config_resolution().expect("pending resolution");
+        assert_eq!(pending.path, legacy);
+        assert_eq!(pending.source, GlobalConfigPathSource::LegacyHome);
+        assert!(pending.migration_pending);
+        assert!(pending.legacy_exists);
+
+        // Once the new-layout file exists it wins and migration is not pending.
+        let new_config_dir = home.join(".config").join("libra");
+        std::fs::create_dir_all(&new_config_dir).expect("new config dir");
+        std::fs::write(new_config_dir.join("config.db"), b"new").expect("new db");
+        let migrated = global_config_resolution().expect("migrated resolution");
+        assert_eq!(migrated.path, new_config_dir.join("config.db"));
+        assert_eq!(migrated.source, GlobalConfigPathSource::HomeConfig);
+        assert!(!migrated.migration_pending);
+
+        // XDG set, but its database missing while legacy exists: the legacy
+        // file stays active (one file, no split state) until migration.
+        let _xdg = ScopedEnvVar::set("XDG_CONFIG_HOME", &xdg);
+        let xdg_pending = global_config_resolution().expect("xdg pending resolution");
+        assert_eq!(xdg_pending.path, legacy);
+        assert_eq!(xdg_pending.source, GlobalConfigPathSource::LegacyHome);
+        assert!(xdg_pending.migration_pending);
+
+        // Once the XDG database exists it wins over both legacy and home.
+        std::fs::write(xdg.join("libra").join("config.db"), b"xdg").expect("xdg db");
+        let xdg_resolution = global_config_resolution().expect("xdg resolution");
+        assert_eq!(xdg_resolution.path, xdg.join("libra").join("config.db"));
+        assert_eq!(xdg_resolution.source, GlobalConfigPathSource::XdgConfigHome);
+        assert!(!xdg_resolution.migration_pending);
+
+        // A relative XDG_CONFIG_HOME is ignored per the XDG basedir spec.
+        let _xdg_relative = ScopedEnvVar::set("XDG_CONFIG_HOME", "relative-config");
+        let relative = global_config_resolution().expect("relative xdg resolution");
+        assert_eq!(relative.source, GlobalConfigPathSource::HomeConfig);
+        assert_eq!(relative.path, new_config_dir.join("config.db"));
+
+        // LIBRA_CONFIG_GLOBAL_DB wins verbatim and never migrates.
+        let override_path = tmp.path().join("custom").join("config.db");
+        let _override = ScopedEnvVar::set("LIBRA_CONFIG_GLOBAL_DB", &override_path);
+        let overridden = global_config_resolution().expect("env resolution");
+        assert_eq!(overridden.path, override_path);
+        assert_eq!(overridden.source, GlobalConfigPathSource::EnvOverride);
+        assert!(!overridden.migration_pending);
+    }
+
+    #[test]
+    fn legacy_global_config_notice_mentions_both_paths_and_only_fires_when_pending() {
+        let resolution = GlobalConfigResolution {
+            path: std::path::PathBuf::from("/home/u/.libra/config.db"),
+            source: GlobalConfigPathSource::LegacyHome,
+            new_path: Some(std::path::PathBuf::from("/home/u/.config/libra/config.db")),
+            new_exists: false,
+            legacy_path: Some(std::path::PathBuf::from("/home/u/.libra/config.db")),
+            legacy_exists: true,
+            migration_pending: true,
+        };
+        let notice = legacy_global_config_notice(&resolution).expect("pending notice");
+        assert!(
+            notice.contains("/home/u/.libra/config.db")
+                && notice.contains("/home/u/.config/libra/config.db"),
+            "notice must name both paths: {notice}"
+        );
+
+        let migrated = GlobalConfigResolution {
+            migration_pending: false,
+            ..resolution
+        };
+        assert!(legacy_global_config_notice(&migrated).is_none());
     }
 }

@@ -6,7 +6,6 @@ Run read-only code reviews with external agent CLIs (AG-22).
 
 ```bash
 libra review --agent <slug>... [--since <rev>] [--checkpoint <id>] [--json]
-libra review --fix [--json]
 libra review list [--json] [--limit <n>] [--cursor <token>]
 libra review show <run_id> [--json]
 libra review cancel <run_id>
@@ -86,55 +85,6 @@ default `--limit 50`, capped at 500, ordered `created_at DESC, run_id
 DESC`. The JSON envelope carries `schema_version`, `items`,
 `next_cursor` (opaque — round-trip it verbatim), and `has_more`.
 
-### `--fix`
-
-`libra review --fix` requires an active, authorized `libra code --control
-write` session for the same worktree. It reuses that session's loopback-only,
-token-authenticated controller path to submit one fixed trusted request to the
-existing serialized AgentRuntime; it does not create another mutation queue.
-Before submission, the Code session must be idle, with no pending interaction
-or plan-execution repair state. Otherwise the bridge returns `LBR-AGENT-040`
-without submitting a new request. Resolve any old interaction in its Code
-session; if a repair projection remains, start a fresh authorized Code session
-before retrying.
-While the request is active, the foreground command holds the existing
-automation-controller lease and relays only the user's explicit terminal
-choices or form answers back to that runtime. Reviewer findings, transcripts,
-environment values, and other external seeds are never included in the request.
-
-`--fix` conflicts with `--agent`, `--since`, and `--checkpoint`: those options
-select a reviewer or input for a read-only review run and are never silently
-ignored by controlled execution.
-
-The active Code runtime remains the only writer. It asks the user for the normal
-intent/plan choices, user-input forms, network choices, tool approvals, sandbox
-approval, and ACL checks; the CLI never auto-approves one. The four controlled
-outcomes are explicit:
-
-Choosing `modify` or `cancel` at intent review, or `modify`, `back`, or `cancel`
-after plan review, hands control back to the active Code session immediately and
-ends this foreground bridge with `LBR-AGENT-040`; continue the requested revision
-in that session.
-
-- a denied tool approval returns `LBR-AGENT-039` before a patch is reported;
-- a denied sandbox approval returns the same stable code before a patch is
-  reported;
-- a tool failure returns the runtime's existing deterministic repair state as
-  `execution: "repair_required"`, never a silent patch success;
-  `patch_applied` truthfully reports whether the runtime projected a partial
-  patch before the failure;
-- success is reported as `execution: "patch_applied"` and
-  `patch_applied: true` only after the existing runtime completed all applicable
-  gates and projected a new patchset.
-
-If no authorized session is available, the command fails closed with
-`LBR-AGENT-010`. Malformed interaction responses, incomplete execution, or a
-patch observed before a later denial return `LBR-AGENT-040` without claiming a
-clean success; inspect both the active Code session and worktree before retrying.
-An untrusted seed is rejected before the control endpoint is discovered with
-`LBR-AGENT-011` by the shared helper. The current `review --fix` CLI has no seed
-parameter, so that error is not a reachable CLI outcome yet.
-
 ## Examples
 
 ```bash
@@ -152,11 +102,6 @@ libra review --agent codex --checkpoint <checkpoint_id>
 
 # Structured run result (terminal state, per-reviewer outcomes)
 libra review --agent codex --json
-
-# Prepare and execute a review-fix through an already running Code session.
-# The terminal asks for every applicable plan, approval, sandbox, and ACL choice.
-libra code --control write
-libra review --fix
 
 # List runs, then fetch the next page
 libra review list
@@ -188,15 +133,11 @@ overrunning the budget. Raise the limit with
 ## Exit Status
 
 - `0` — the run reached `success`, `partial`, `timeout`, or `cancelled`
-  (the terminal state is reported in the output); subcommands succeeded; or
-  `--fix` reports either an observed patch (`patch_applied: true`) or the
-  explicit runtime repair state (`execution: "repair_required"`).
+  (the terminal state is reported in the output); subcommands succeeded.
 - non-zero — usage errors, a run that ended in the `error` terminal
   state, unknown run ids, an unknown or non-materializable
-  `--checkpoint` (refused before any run is created), `--fix` without an
-  authorized active Code session (`LBR-AGENT-010`), denied runtime approval or
-  sandbox gates (`LBR-AGENT-039`), an incomplete controlled execution
-  (`LBR-AGENT-040`), or a full run queue (`LBR-AGENT-014`).
+  `--checkpoint` (refused before any run is created), or a full run queue
+  (`LBR-AGENT-014`).
 
 ## See Also
 

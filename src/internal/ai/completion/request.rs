@@ -8,7 +8,7 @@ use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::message::{AssistantContent, Message};
-use crate::internal::ai::tools::ToolDefinition;
+use crate::internal::ai::tool_definition::ToolDefinition;
 
 /// Incremental output from a provider while a completion request is still in flight.
 #[derive(Debug, Clone)]

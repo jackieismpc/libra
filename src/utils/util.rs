@@ -158,20 +158,37 @@ pub fn cur_dir() -> PathBuf {
 }
 
 /// Whether `path` is reserved for per-user state rather than repository storage.
-/// The upgrade home and global config directory can differ when overridden;
+/// The upgrade home and global config directories can differ when overridden;
 /// neither may be adopted because of a stray `libra.db`. Resolve existing
 /// ancestors too, so a not-yet-created home behind a symlink is still reserved.
+///
+/// The reserved set covers the Libra home, the XDG-based global config
+/// directory and the legacy `<home>/.libra` config directory (ADR-GCX-01).
+/// Two strengths apply:
+/// - the **config directories** are reserved recursively, so `libra init`
+///   refuses a storage root inside the user's configuration directory;
+/// - the **Libra home** (`LIBRA_HOME`, or the parent of an explicit
+///   `LIBRA_CONFIG_GLOBAL_DB` override) is reserved only as itself, because
+///   isolated test/sandbox setups legitimately keep repositories beneath that
+///   directory (the override is an isolation hook, not a storage policy).
 pub fn is_global_libra_home(path: &Path) -> bool {
-    let config_dir = crate::internal::config::global_config_path()
-        .and_then(|db| db.parent().map(Path::to_path_buf));
     let path = canonicalize_deepest_existing(path).unwrap_or_else(|_| path.to_path_buf());
+    let canonical = |home: PathBuf| canonicalize_deepest_existing(&home).unwrap_or(home);
+    let home = crate::internal::upgrade::home::resolve_libra_home()
+        .ok()
+        .map(canonical);
+    if home.as_deref() == Some(path.as_path()) {
+        return true;
+    }
     [
-        crate::internal::upgrade::home::resolve_libra_home().ok(),
-        config_dir,
+        crate::internal::config::global_config_dir(),
+        crate::internal::config::legacy_global_config_path()
+            .and_then(|db| db.parent().map(Path::to_path_buf)),
     ]
     .into_iter()
     .flatten()
-    .any(|home| canonicalize_deepest_existing(&home).unwrap_or(home) == path)
+    .map(canonical)
+    .any(|config_dir| path == config_dir || path.starts_with(&config_dir))
 }
 
 fn is_valid_storage_dir(path: &Path) -> bool {

@@ -71,4 +71,4 @@ pub use store::{
     is_valid_run_id, sanitize_reviewer_name,
 };
 
-pub use crate::internal::ai::agent::runtime::sub_agent_dispatcher::materialize_isolated_workspace;
+pub use crate::internal::ai::workspace_isolation::materialize_isolated_workspace;

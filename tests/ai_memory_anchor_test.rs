@@ -21,7 +21,7 @@ fn memory_anchor_events_roundtrip_and_replay_lifecycle() {
         .append(&SessionEvent::memory_anchor(draft.clone()))
         .unwrap();
 
-    let replay = jsonl.load_memory_anchors().unwrap();
+    let replay = replay_memory_anchors(&jsonl);
     let anchor = replay
         .find_unique_by_prefix(&draft.anchor_id.to_string()[..8])
         .unwrap();
@@ -30,7 +30,7 @@ fn memory_anchor_events_roundtrip_and_replay_lifecycle() {
 
     let confirm = MemoryAnchorEvent::confirm(&anchor, Some("user confirmed".to_string()));
     jsonl.append(&SessionEvent::memory_anchor(confirm)).unwrap();
-    let replay = jsonl.load_memory_anchors().unwrap();
+    let replay = replay_memory_anchors(&jsonl);
     let active = replay.active_anchors_at(Utc::now());
     assert_eq!(active.len(), 1);
     assert_eq!(
@@ -40,12 +40,22 @@ fn memory_anchor_events_roundtrip_and_replay_lifecycle() {
 
     let revoke = MemoryAnchorEvent::revoke(&active[0], Some("no longer true".to_string()));
     jsonl.append(&SessionEvent::memory_anchor(revoke)).unwrap();
-    let replay = jsonl.load_memory_anchors().unwrap();
+    let replay = replay_memory_anchors(&jsonl);
     assert!(replay.active_anchors_at(Utc::now()).is_empty());
     let revoked = replay
         .find_unique_by_prefix(&draft.anchor_id.to_string()[..8])
         .unwrap();
     assert_eq!(revoked.review_state, MemoryAnchorReviewState::Revoked);
+}
+
+fn replay_memory_anchors(jsonl: &SessionJsonlStore) -> MemoryAnchorReplay {
+    let mut replay = MemoryAnchorReplay::default();
+    for value in jsonl.load_memory_anchors().unwrap() {
+        let event: MemoryAnchorEvent =
+            serde_json::from_value(value).expect("memory anchor payload");
+        replay.apply_event(event);
+    }
+    replay
 }
 
 #[test]

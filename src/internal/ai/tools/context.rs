@@ -22,24 +22,7 @@ pub enum ToolKind {
     Custom,
 }
 
-/// Redacted causal identifiers attached to a tool invocation.
-///
-/// These values are runtime-owned identifiers, not model-provided payload. They
-/// are carried to mutating handlers so the handler can persist an auditable link
-/// to the current stable change projection.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AiOperationContext {
-    pub operation_id: String,
-    pub session_id: Option<String>,
-    pub run_id: Option<String>,
-    pub tool_invocation_id: String,
-    pub intent_id: Option<String>,
-    pub repo_id: Option<String>,
-    /// Earlier successful mutating operations in this tool-loop mutation batch.
-    /// A later commit/rewrite may consume this explicit set, never a repo-wide
-    /// or run-wide scan.
-    pub pending_operation_ids: Vec<String>,
-}
+pub use crate::internal::ai::operation_context::AiOperationContext;
 
 /// A tool invocation containing all context needed for execution.
 #[derive(Clone)]

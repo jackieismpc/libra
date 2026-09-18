@@ -18,7 +18,7 @@ libra init [OPTIONS] [DIRECTORY]
 
 在已初始化的仓库中再次运行 `libra init` 是安全的：与 `git init` 一致，它会就地重新初始化，打印 `Reinitialized existing Libra repository in <path>`，补齐缺失的标准布局（模板、目录）并重新应用 `--shared`，同时保留现有仓库数据——配置、`HEAD`、refs、对象、vault 与仓库 id 均不受影响。打开数据库仍可能应用 schema 迁移；保留数据不等于保留旧数据库结构。当 `--initial-branch`/`--object-format` 与现有仓库不一致时会被忽略（并给出警告）；`--from-git-repository` 在已初始化的仓库上会被拒绝。
 
-不能把用户级 Libra home（`LIBRA_HOME`，默认 `~/.libra`）作为仓库存储根。该目录保存用户状态；全局配置保存在 `~/.libra/config.db`（或 `LIBRA_CONFIG_GLOBAL_DB` 指定的位置）。当这两个目录不同时，两者都受保护。检查同样适用于尚不存在的目录、路径别名和 linked worktree 的 `commondir` 目标。
+不能把用户级 Libra home（`LIBRA_HOME`，默认 `~/.libra`）或全局配置目录（`<XDG_CONFIG_HOME 或 ~/.config>/libra`）内的路径作为仓库存储根。该目录保存用户状态；全局配置保存在 `<XDG_CONFIG_HOME 或 ~/.config>/libra/config.db`（legacy `~/.libra/config.db` 在自动迁移前仍是回退，或 `LIBRA_CONFIG_GLOBAL_DB` 指定的位置）。检查同样适用于尚不存在的目录、路径别名和 linked worktree 的 `commondir` 目标。
 
 仓库发现会忽略 home 中遗留的 `libra.db`，因此从用户主目录初始化项目时会读取真正的全局配置。打开旧仓库或全局配置数据库时，迁移会自动补建缺失的旧版 `config` 表，保留已有配置；被忽略的 home `libra.db` 文件保持原样。
 

@@ -124,26 +124,6 @@ pub(crate) fn command_development_unpublished_docs() -> BTreeSet<String> {
     command_links_in_readme_section("## 未公开或未纳入用户承诺的命令资料", "## 汇总文档")
 }
 
-pub(crate) fn code_router_routes(web_mod: &str) -> BTreeSet<String> {
-    let router_region = web_mod
-        .split("fn code_router()")
-        .nth(1)
-        .expect("code_router function exists")
-        .split("async fn static_handler")
-        .next()
-        .expect("static_handler follows code routers");
-
-    router_region
-        .lines()
-        .filter_map(|line| {
-            let start = line.find(".route(\"")? + ".route(\"".len();
-            let rest = &line[start..];
-            let end = rest.find('"')?;
-            Some(format!("/api/code{}", &rest[..end]))
-        })
-        .collect()
-}
-
 pub(crate) fn assert_contains(body: &str, needle: &str, context: &str) {
     assert!(
         body.contains(needle),

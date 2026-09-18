@@ -134,3 +134,25 @@ fn test_agent_checkpoint_rewind_help_mentions_supported_transcript_truncation() 
         "rewind help must not claim transcripts are never rewritten, stdout: {stdout}"
     );
 }
+
+/// RC-11: `agent session promote` is gone. Clap must reject it as an
+/// unknown subcommand; it must not write `refs/libra/intent`.
+#[test]
+fn test_agent_session_promote_is_unknown() {
+    let repo = tempdir().expect("tempdir for agent session promote");
+    let output = run_libra_command(
+        &["agent", "session", "promote", "some-session", "--as-intent"],
+        repo.path(),
+    );
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "agent session promote must not succeed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("refs/libra/intent"),
+        "deleted promote must not mention refs/libra/intent: {stderr}"
+    );
+}

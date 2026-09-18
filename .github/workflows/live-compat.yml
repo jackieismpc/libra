@@ -126,11 +126,8 @@ jobs:
           LIBRA_STORAGE_BUCKET: ${{ secrets.LIBRA_STORAGE_BUCKET }}
           LIBRA_STORAGE_ACCESS_KEY: ${{ secrets.LIBRA_STORAGE_ACCESS_KEY }}
           LIBRA_STORAGE_SECRET_KEY: ${{ secrets.LIBRA_STORAGE_SECRET_KEY }}
-          LIBRA_PUBLISH_LIVE_WORKER_ORIGIN: ${{ secrets.LIBRA_PUBLISH_LIVE_WORKER_ORIGIN }}
-          LIBRA_PUBLISH_LIVE_CLONE_DOMAIN: ${{ secrets.LIBRA_PUBLISH_LIVE_CLONE_DOMAIN }}
         run: |
           cargo test --features test-live-cloud \
             --test cloud_storage_backup_test \
-            --test publish_live_test \
             --test storage_r2_test \
             -- --test-threads=1 --nocapture

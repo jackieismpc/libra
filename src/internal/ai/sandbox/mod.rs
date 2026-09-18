@@ -28,7 +28,7 @@ use uuid::Uuid;
 
 use self::evidence::SandboxEvidenceSink;
 use super::{
-    runtime::hardening::{SafetyDecision, SafetyDisposition},
+    hardening::{SafetyDecision, SafetyDisposition},
     sources::security::{request_scope_for_workdir, resolve_security_file},
 };
 
@@ -856,7 +856,7 @@ pub struct ShellCommandRequest {
     pub safety_decision: Option<SafetyDecision>,
     /// Runtime-owned AI identifiers propagated to a nested Libra command so
     /// its revision builder can attach the pending link to the new Change.
-    pub ai_operation: Option<crate::internal::ai::tools::AiOperationContext>,
+    pub ai_operation: Option<crate::internal::ai::operation_context::AiOperationContext>,
 }
 
 #[derive(Default, Clone)]
@@ -4275,7 +4275,7 @@ mod tests {
             safety_decision: Some(SafetyDecision::deny(
                 "test.deny",
                 "policy denial remains authoritative",
-                super::super::runtime::hardening::BlastRadius::Workspace,
+                super::super::hardening::BlastRadius::Workspace,
             )),
             ai_operation: None,
         })
@@ -4550,7 +4550,7 @@ mod tests {
             safety_decision: Some(SafetyDecision::deny(
                 "test.deny",
                 "policy denial remains authoritative",
-                super::super::runtime::hardening::BlastRadius::Workspace,
+                super::super::hardening::BlastRadius::Workspace,
             )),
             ai_operation: None,
         })

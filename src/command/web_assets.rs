@@ -1,11 +1,21 @@
-//! Embedded web UI assets produced by the Next.js static export (`web/out/`).
+//! Stub for the retired Next.js embed.
 //!
-//! `rust-embed` embeds these files into the binary (using an `include_bytes!`-like
-//! mechanism) so the web UI is available at runtime without accessing the
-//! filesystem. See the `rust-embed` crate documentation for configuration options.
+//! RC-20 stopped `build.rs` from exporting `web/out/` and rust-embed no
+//! longer ships those bytes. Callers in `internal/ai/web` still compile
+//! against `WebAssets::get` until RC-23 deletes that SCC. Every lookup
+//! returns `None`.
 
-use rust_embed::Embed;
+use std::borrow::Cow;
 
-#[derive(Embed)]
-#[folder = "web/out/"]
+/// Former rust-embed payload. Kept so existing `content.data` reads compile.
+pub struct EmbeddedFile {
+    pub data: Cow<'static, [u8]>,
+}
+
 pub struct WebAssets;
+
+impl WebAssets {
+    pub fn get(_path: &str) -> Option<EmbeddedFile> {
+        None
+    }
+}

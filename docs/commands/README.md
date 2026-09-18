@@ -133,19 +133,19 @@ Every Libra command accepts the following global flags:
 |---------|-------|-------------|-----|
 | `libra cloud` | | Cloud backup and restore operations via Cloudflare D1/R2 | [cloud.md](cloud.md) |
 | `libra cache` | | Inspect the tiered-storage / LRU cache configuration (type, threshold, budget) | [cache.md](cache.md) |
-| `libra publish` | | Manage read-only Cloudflare Worker publishing | [publish.md](publish.md) |
+| `libra publish` | | Removed. Use `libra cloud` for repository backup | [publish.md](publish.md) |
 | `libra worktree` | `wt` | Manage multiple working trees attached to the repository | [worktree.md](worktree.md) |
 
 ### AI & Development
 
 | Command | Alias | Description | Doc |
 |---------|-------|-------------|-----|
-| `libra code` | | Interactive Web Code UI with AI agent, web server, and MCP integration | [code.md](code.md) |
-| `libra code-control` | | **Removed in the W5 breaking release** — use `libra code --control stdio` (breaking-change migration note) | [code-control.md](code-control.md) |
+| `libra code` | | Removed. Capture external agents with `libra agent` | [code.md](code.md) |
+| `libra code-control` | | Removed with `libra code`. Use `libra agent` | [code-control.md](code-control.md) |
 | Codex data storage | | Link `libra code --provider codex` to Codex app-server and persist Codex session data | [codex-data-storage.md](codex-data-storage.md) |
 | `libra automation` | | List, run, and inspect AI automation rules | [automation.md](automation.md) |
-| `libra usage` | | Report and prune AI provider/model usage aggregates | [usage.md](usage.md) |
-| `libra graph` | | Inspect a Libra Code thread version graph (`--json`/`--machine`; interactive TUI entry removed in the W5 breaking release, use Web Code UI) | [graph.md](graph.md) |
+| `libra usage` | | Removed. Usage stats only served the deleted developer agent | [usage.md](usage.md) |
+| `libra graph` | | Removed. Use `libra --json agent graph <session>` for the capture graph | [graph.md](graph.md) |
 | `libra sandbox` | | Inspect AI sandbox diagnostics, including OS backend availability and downgrade warnings | [sandbox.md](sandbox.md) |
 | `libra agent` | | Manage external-agent capture, checkpoints, hooks, and RPC adapters | [agent.md](agent.md) |
 

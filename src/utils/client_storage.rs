@@ -581,6 +581,7 @@ impl Drop for TaskGuard {
     }
 }
 
+#[allow(dead_code)] // paired with spawn_background_index_work; leftover after RC-23
 fn register_pending_index_work(scope: &IndexWorkScope) -> TaskGuard {
     PENDING_TASKS.fetch_add(1, Ordering::Relaxed);
     scope.pending.fetch_add(1, Ordering::Relaxed);
@@ -1459,6 +1460,7 @@ impl ClientStorage {
     /// the producer before spawning prevents the foreground drain from seeing
     /// a transient zero, and re-entering the captured scope keeps both pending
     /// work and terminal failures attributed to the command that created it.
+    #[allow(dead_code)] // leftover after RC-23 deleted Code-era index producers
     pub(crate) fn spawn_background_index_work<F>(future: F) -> tokio::task::JoinHandle<F::Output>
     where
         F: std::future::Future + Send + 'static,
@@ -2553,14 +2555,12 @@ async fn read_config_env_value(
 /// Locate the global config database.
 ///
 /// Boundary conditions:
-/// - Honours `LIBRA_CONFIG_GLOBAL_DB` first so tests can redirect to a temp path.
-/// - Returns `None` when no home directory is discoverable; on those platforms global
-///   config is unavailable.
+/// - Delegates to the single resolver in [`crate::internal::config`] so storage
+///   and the config command cannot drift (ADR-GCX-01 / GC-GCX-01).
+/// - Returns `None` when no config directory is discoverable; on those platforms
+///   global config is unavailable.
 fn storage_global_config_path() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("LIBRA_CONFIG_GLOBAL_DB") {
-        return Some(PathBuf::from(path));
-    }
-    dirs::home_dir().map(|home| home.join(".libra").join("config.db"))
+    crate::internal::config::global_config_path()
 }
 
 /// Resolve (and lazily create) the per-repo `libra.repoid` used as a key prefix in

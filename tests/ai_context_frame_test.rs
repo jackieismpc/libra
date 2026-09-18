@@ -105,7 +105,9 @@ fn context_frame_events_roundtrip_through_session_jsonl() {
     let replay = jsonl.load_context_replay().unwrap();
     assert_eq!(replay.frames.len(), 1);
     assert_eq!(replay.compactions.len(), 1);
-    assert_eq!(replay.frames[0].segments[0].id, "rules");
+    let loaded: libra::internal::ai::context_budget::ContextFrameEvent =
+        serde_json::from_value(replay.frames[0].clone()).expect("context frame payload");
+    assert_eq!(loaded.segments[0].id, "rules");
 
     let line = fs::read_to_string(jsonl.events_path()).unwrap();
     assert!(line.contains("\"kind\":\"context_frame\""));

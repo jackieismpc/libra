@@ -36,9 +36,8 @@
 //! text; plan.md:998). It — and every prior investigator stance injected
 //! as context — is redacted and wrapped in explicit spotlighting
 //! delimiters before it reaches any turn prompt, and rendered through the
-//! ANSI-stripping sanitizer before display. A mutating `investigate fix`
-//! is refused fail-closed at the CLI (`LBR-AGENT-010` /
-//! `LBR-AGENT-011`) — the engine here is strictly read-only.
+//! ANSI-stripping sanitizer before display. There is no mutating
+//! `investigate fix` surface — the engine here is strictly read-only.
 
 pub mod runner;
 pub mod store;

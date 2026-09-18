@@ -555,9 +555,10 @@ async fn run_init_internal(
     if is_global_libra_home(&root_dir) {
         return Err(invalid_argument(
             format!(
-                "refusing to initialize a Libra repository at '{}': this is the Libra home \
-                 directory, which stores global configuration and per-user state; repository \
-                 data must live in a dedicated project directory's '.libra/'",
+                "refusing to initialize a Libra repository at '{}': this is a per-user Libra \
+                 state directory (the Libra home or the global configuration directory), which \
+                 stores global configuration and per-user state; repository data must live in a \
+                 dedicated project directory's '.libra/'",
                 root_dir.display()
             ),
             Some("choose a project subdirectory, e.g. 'libra init <project>'".to_string()),

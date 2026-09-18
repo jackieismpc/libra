@@ -34,7 +34,10 @@ not make a configuration store future; its supported values remain readable.
 The configuration-owned legacy-reader barrier is recognized by this build;
 see [configuration compatibility](config.md#configuration-schema-compatibility).
 
-Global configuration uses `LIBRA_CONFIG_GLOBAL_DB` or `~/.libra/config.db`;
+Global configuration uses `LIBRA_CONFIG_GLOBAL_DB` or the XDG configuration
+directory (`$XDG_CONFIG_HOME/libra/config.db`, defaulting to
+`<home>/.config/libra/config.db`), falling back to the legacy
+`<home>/.libra/config.db` until it is migrated;
 system configuration uses `LIBRA_CONFIG_SYSTEM_DB` or `/etc/libra/config.db`.
 Complete process/repo-local storage settings can make GlobalConfig unnecessary
 (`cloud` must also satisfy its D1 settings). They do not prove that SystemConfig
@@ -54,46 +57,16 @@ these modes warn and are not authorization for remote synchronization.
 
 The remote repository URL to clone from. Supports SSH (`git@host:user/repo.git`) and
 HTTPS (`https://host/user/repo.git`) protocols, as well as local filesystem paths.
-`libra+cloud://` publish sources are recognized and strictly validated. The clone
-domain must be configured locally before restore starts; otherwise Libra returns
-`LBR-AUTH-001` and does not create the destination directory. Configured cloud
-sources resolve the D1 site, repository row, published refs, selected/default
-revision, object index, and R2 object availability before creating the target
-directory. Restore then initializes a local Libra repo, downloads indexed Git
-objects from R2, restores refs metadata, writes origin cloud config, and checks
-out the selected/default revision. Cloud sources never fall through to generic
-Git discovery.
+The former Cloudflare publish restore source was removed with the Publish product;
+cloning that source is a usage error (exit 129) and points at a git remote or
+`libra cloud` for repository backup. The matching clone-domain config keys are
+frozen and are no longer read.
 
 ```bash
 libra clone git@github.com:user/repo.git
 libra clone https://github.com/user/repo.git
 libra clone /path/to/local/repo
-libra clone libra+cloud://code.example.com/kepler-ledger
-libra clone libra+cloud://code.example.com/repo/rp_8f4c1b
-libra clone "libra+cloud://code.example.com/kepler-ledger?ref=refs/tags/v1.0.0"
-libra clone "libra+cloud://code.example.com/kepler-ledger?revision=latest"
 ```
-
-For `libra+cloud://`, the authority is the configured clone domain. The path must be
-either `/<slug>` or `/repo/<repo_id>`. Only one selector is allowed: `?ref=<branch|tag|full-ref>`
-or `?revision=<oid|latest>`.
-The first Cloudflare restore surface does not accept Git transport shaping flags:
-`--branch`, `--depth`, `--single-branch`, `--bare`, `--mirror`, `--filter`,
-`--shallow-since`, and `--shallow-exclude` return `LBR-CLI-002`
-before clone-domain config lookup and before creating the destination directory.
-Use `?ref=<branch|tag|full-ref>` on the source URL to select a checkout target.
-
-Required clone-domain config keys:
-
-```text
-cloud.clone_domains.<domain>.account_id
-cloud.clone_domains.<domain>.d1_database_id
-cloud.clone_domains.<domain>.r2_bucket
-```
-
-Cloud site resolution also requires `LIBRA_D1_API_TOKEN`; Libra reads
-`vault.env.LIBRA_D1_API_TOKEN` first, then the exported environment variable, so
-the CLI can query the configured D1 database before starting restore.
 
 ### `[LOCAL_PATH]`
 
@@ -109,8 +82,6 @@ libra clone git@github.com:user/repo.git my-dir
 
 Check out `<NAME>` instead of the remote's HEAD. The branch must exist on the remote;
 otherwise a "remote branch not found" error is raised.
-For `libra+cloud://` sources, use `?ref=<branch|tag|full-ref>` in the URL instead;
-`--branch` is rejected before restore starts.
 
 ```bash
 libra clone -b develop git@github.com:user/repo.git
@@ -120,8 +91,7 @@ libra clone -b develop git@github.com:user/repo.git
 
 Fetch only the history leading to the tip of a single branch (HEAD, or the branch given
 by `-b`). Reduces transfer size for large repositories when only one branch is needed.
-Only Git remotes support this transport optimization; `libra+cloud://` restore rejects it
-because the restored local repository must preserve all published refs.
+Only Git remotes support this transport optimization.
 
 ```bash
 libra clone --single-branch -b main git@github.com:user/repo.git
@@ -141,8 +111,6 @@ libra clone --single-branch --no-single-branch git@github.com:user/repo.git
 
 Create a bare repository without a working tree. The destination directory becomes the
 object store directly. Useful for central/server-side repositories.
-Bare Cloudflare restores are not part of the first restore surface; `libra+cloud://`
-currently rejects `--bare` explicitly.
 
 ```bash
 libra clone --bare git@github.com:user/repo.git
@@ -154,8 +122,7 @@ Set up a mirror of the source repository (like `git clone --mirror`). Implies
 `--bare`, and maps the fetched branches verbatim into `refs/heads/*` and keeps
 tags in `refs/tags/*` — without any `refs/remotes/*` tracking refs — then records
 the `remote.<name>.mirror=true` marker. Useful for serving or backing up a
-repository. Not supported for `libra+cloud://` sources (rejected with
-`LBR-CLI-002`).
+repository.
 
 Narrowings vs Git: (1) Git mirrors `refs/*:refs/*` verbatim; Libra mirrors only
 what its fetch transfers — every fetched branch is promoted to `refs/heads/*` and
@@ -182,8 +149,7 @@ subject only to `--depth` if also given). Without `--depth` that means a complet
 clone — a correct superset of a filtered or date-bounded clone, so the result is
 always usable; this mirrors Git itself, which warns and falls back to a full clone
 when a server cannot honor `--filter`. `--shallow-exclude` may be given
-multiple times. Not supported for `libra+cloud://` sources (rejected with
-`LBR-CLI-002`, like `--depth`).
+multiple times.
 
 ```bash
 libra clone --filter blob:none git@github.com:user/repo.git
@@ -210,9 +176,8 @@ libra clone -l /path/to/source /path/to/dest
 
 Create a shallow clone with history truncated to the specified number of commits.
 `N` must be a positive integer.
-Only Git remotes support shallow transfer. Cloudflare restore rejects `--depth`
-because it must download the complete published object set. A local Libra source
-also rejects `--depth` with `LBR-REPO-002`: that transport cannot advertise
+Only Git remotes support shallow transfer. A local Libra source
+rejects `--depth` with `LBR-REPO-002`: that transport cannot advertise
 shallow boundaries, so accepting the option would leave a clone with missing
 parents. This fail-closed behavior is the accepted end state (decision D20 in
 the development compatibility register), not a pending gap.
@@ -302,7 +267,7 @@ libra clone --no-checkout git@github.com:user/repo.git
 Use `<NAME>` for the remote (and its `refs/remotes/<NAME>/*` tracking refs)
 instead of the default `origin`, matching `git clone -o`. The branch tracking
 config (`branch.<branch>.remote`) and `remote.<NAME>.url` use the chosen name.
-This applies to standard clones; `libra+cloud` clones always use `origin`.
+This applies to standard clones.
 
 ```bash
 libra clone -o upstream git@github.com:user/repo.git
@@ -326,8 +291,7 @@ scope to the closure); reducing on-disk footprint is deferred (D18, needs the
 D10 skip-worktree machinery). Only a **local Libra source** can travel the
 dependency graph in v1 (D17); a network or plain-Git source performs a full
 clone without scoping and warns. Conflicts with `--no-checkout`/`--bare`/
-`--mirror` (they skip the checkout that keeps the repository commit-safe) and is
-rejected for `libra+cloud://` sources.
+`--mirror` (they skip the checkout that keeps the repository commit-safe).
 
 ```bash
 libra clone --deps-of scene.usd /path/to/local-libra-repo my-scene
@@ -458,9 +422,9 @@ Empty remote returns `"branch": null` and a warning:
 - `branch` is the actual checked-out branch; `null` when the remote has no refs
 - `shallow` is `true` when `--depth` was used
 - `gitignore_converted` lists the worktree-relative `.libraignore` files written from converted `.gitignore` files; always present (empty for bare clones or when the source has no `.gitignore`)
-- `source_kind` and `cloud_site` are omitted for ordinary Git/local clones; `libra+cloud://` clones add them with clone domain, site id, slug, repo id, selected ref, and restored revision
+- `source_kind` and `cloud_site` are omitted for ordinary Git/local clones
 - `ref_format` and `converted_from` from init are intentionally excluded
-- `objects_fetched` / `bytes_received` report the fetch pack's object count and byte size for Git sources; they are omitted for `libra+cloud://` restores (which download indexed objects from R2 rather than a pack stream)
+- `objects_fetched` / `bytes_received` report the fetch pack's object count and byte size for Git sources
 
 ## Design Rationale
 

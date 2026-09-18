@@ -19,18 +19,16 @@
 //! - investigators run in an isolated workspace, never the repo worktree;
 //! - the topic is an untrusted seed — redacted + spotlit before any prompt
 //!   injection, ANSI-stripped before display;
-//! - `investigate fix` submits only a fixed trusted request through the same
-//!   controlled AgentRuntime helper as `review --fix`; the run's untrusted
-//!   topic, findings, stances, attachments, and id never enter that request.
+//! - investigation topic, findings, stances, attachments, and id never
+//!   enter a mutating workflow; the command family stays read-only.
 
 use std::time::Duration;
 
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
-use super::{
-    checkpoint::{PAGE_SCHEMA_VERSION, decode_page_cursor, encode_page_cursor, resolve_page_limit},
-    review::{ControlledFixCommand, drive_controlled_fix},
+use super::checkpoint::{
+    PAGE_SCHEMA_VERSION, decode_page_cursor, encode_page_cursor, resolve_page_limit,
 };
 use crate::{
     internal::{
@@ -43,7 +41,6 @@ use crate::{
                 is_launchable_investigator, render_untrusted_findings, run_investigate,
             },
             run_admission::{self, RejectedAdmission},
-            runtime::{ReviewFixExecutionOutcome, ReviewFixInput},
         },
         head::Head,
     },
@@ -73,12 +70,7 @@ EXAMPLES:
     libra investigate cancel <run_id>                         Cancel a run (same cleanup path as Ctrl-C)
     libra investigate clean --run <run_id>                    Remove one finished run directory
     libra investigate clean --all                             Remove every finished run directory
-    libra investigate attach <run_id> <file>                  Attach an external file to a run (provenance=manual)
-
-    libra investigate fix <run_id>                         Prepare a controlled fix through an active Code runtime
-
-    `libra investigate fix` never injects the investigation topic or findings;
-    without an active authorized Code runtime it fails with LBR-AGENT-010.";
+    libra investigate attach <run_id> <file>                  Attach an external file to a run (provenance=manual)";
 
 // ---------------------------------------------------------------------------
 // Clap surface (agent.md §5 exact)
@@ -111,9 +103,6 @@ pub enum InvestigateSubcommand {
     /// Remove investigate run directories.
     #[command(about = "Remove finished investigate run directories")]
     Clean(InvestigateCleanArgs),
-    /// Prepare a controlled fix through the active internal Code runtime.
-    #[command(about = "Prepare a controlled fix through the active Code runtime")]
-    Fix(InvestigateFixArgs),
     /// Attach an external file to a run's audit chain (provenance=manual).
     #[command(
         about = "Attach an external transcript/findings/context file to a run (provenance=manual)"
@@ -201,13 +190,6 @@ pub struct InvestigateCleanArgs {
     pub all: bool,
 }
 
-#[derive(Args, Debug)]
-pub struct InvestigateFixArgs {
-    /// Run identifier from `libra investigate list`.
-    #[arg(value_name = "RUN_ID")]
-    pub run_id: String,
-}
-
 pub async fn execute_safe(args: InvestigateArgs, output: &OutputConfig) -> CliResult<()> {
     match args.command {
         InvestigateSubcommand::Start(a) => start(a, output).await,
@@ -216,7 +198,6 @@ pub async fn execute_safe(args: InvestigateArgs, output: &OutputConfig) -> CliRe
         InvestigateSubcommand::Continue(a) => resume(a, output).await,
         InvestigateSubcommand::Cancel(a) => cancel(a, output).await,
         InvestigateSubcommand::Clean(a) => clean(a, output).await,
-        InvestigateSubcommand::Fix(a) => fix(a, output).await,
         InvestigateSubcommand::Attach(a) => attach(a, output).await,
     }
 }
@@ -1053,59 +1034,6 @@ async fn clean(args: InvestigateCleanArgs, output: &OutputConfig) -> CliResult<(
     }
 }
 
-// ---------------------------------------------------------------------------
-// fix (shared controlled AgentRuntime helper)
-// ---------------------------------------------------------------------------
-
-async fn fix(args: InvestigateFixArgs, output: &OutputConfig) -> CliResult<()> {
-    let store = open_store()?;
-    store
-        .load_state(&args.run_id)
-        .map_err(|error| map_store_error("failed to read investigate run state", error))?
-        .ok_or_else(|| run_not_found(&args.run_id))?;
-
-    let working_dir = std::env::current_dir().map_err(|error| {
-        CliError::fatal(format!(
-            "cannot resolve the working directory for controlled investigate fix execution: {error}"
-        ))
-    })?;
-    let outcome = drive_controlled_fix(
-        ControlledFixCommand::Investigate,
-        &working_dir,
-        ReviewFixInput::TrustedInvestigateAdmission,
-    )
-    .await?;
-    let (execution, patch_applied) = match outcome {
-        ReviewFixExecutionOutcome::PatchApplied => ("patch_applied", true),
-        ReviewFixExecutionOutcome::RepairRequired { patch_applied } => {
-            ("repair_required", patch_applied)
-        }
-    };
-    if output.is_json() {
-        let payload = serde_json::json!({
-            "schema_version": PAGE_SCHEMA_VERSION,
-            "run_id": args.run_id,
-            "admitted": true,
-            "execution": execution,
-            "patch_applied": patch_applied,
-        });
-        return emit_json_data("investigate_fix_execution", &payload, output);
-    }
-    if !output.quiet {
-        match outcome {
-            ReviewFixExecutionOutcome::PatchApplied => println!(
-                "investigate fix applied a patch through the active AgentRuntime for run {}",
-                args.run_id
-            ),
-            ReviewFixExecutionOutcome::RepairRequired { patch_applied } => println!(
-                "investigate fix reached the AgentRuntime repair state for run {}; patch applied before failure: {patch_applied}",
-                args.run_id
-            ),
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1126,64 +1054,12 @@ mod tests {
             "investigate cancel",
             "investigate clean --run",
             "investigate clean --all",
-            "LBR-AGENT-010",
         ] {
             assert!(
                 INVESTIGATE_EXAMPLES.contains(needle),
                 "INVESTIGATE_EXAMPLES must mention '{needle}'"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn fix_maps_to_lbr_agent_010_with_readonly_and_precondition_message() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let error = drive_controlled_fix(
-            ControlledFixCommand::Investigate,
-            temp.path(),
-            ReviewFixInput::TrustedInvestigateAdmission,
-        )
-        .await
-        .expect_err("a missing runtime must fail closed");
-        assert_eq!(
-            error.stable_code(),
-            StableErrorCode::AgentFixBridgeUnavailable
-        );
-        assert_eq!(error.stable_code().as_str(), "LBR-AGENT-010");
-        let text = error.to_string();
-        assert!(
-            text.contains("active authorized internal AgentRuntime"),
-            "{text}"
-        );
-        assert!(text.contains("read-only"), "{text}");
-        assert!(
-            text.contains("investigate show"),
-            "must point at the read-only alternative: {text}"
-        );
-    }
-
-    #[tokio::test]
-    async fn untrusted_seed_mutation_maps_to_lbr_agent_011() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let error = drive_controlled_fix(
-            ControlledFixCommand::Investigate,
-            temp.path(),
-            ReviewFixInput::UntrustedSeed,
-        )
-        .await
-        .expect_err("untrusted content must fail before runtime discovery");
-        assert_eq!(
-            error.stable_code(),
-            StableErrorCode::AgentUntrustedSeedForMutation
-        );
-        assert_eq!(error.stable_code().as_str(), "LBR-AGENT-011");
-        let text = error.to_string();
-        assert!(text.contains("untrusted"), "{text}");
-        assert!(text.contains("approval"), "{text}");
-        assert!(
-            text.contains("investigate show"),
-            "must point at the read-only alternative: {text}"
-        );
     }
 
     #[test]

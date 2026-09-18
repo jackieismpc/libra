@@ -100,10 +100,28 @@ pub(crate) mod generated_artifacts;
 // Per-turn coverage claim gate for external-agent checkpoint writers
 // (plan-20260713 DR-05c-0).
 pub mod coverage_gate;
+// Append-only event trait (plan-20260920 RC-01). `runtime::event` re-exports
+// this module until the executor SCC is deleted.
+pub mod event;
 // OpenCode export-bridge job coordination (plan-20260713 DR-04b, ADR-DR-11).
 pub mod export_job;
 // Conversation history datastructures (compaction, persistence, replay).
 pub mod history;
+// `refs/libra/traces` persistence API (plan-20260920 RC-02).
+pub mod traces;
+// Isolated workspace helper (plan-20260920 RC-03).
+pub mod workspace_isolation;
+// Capture-side tool-call projection (plan-20260920 RC-04).
+pub mod tool_call_record;
+// Runtime-owned AI causality identifiers (plan-20260920 RC-06).
+pub mod operation_context;
+// Authorization / tool-boundary / audit contracts (plan-20260920 RC-09).
+pub mod hardening;
+// Shell command safety classification (plan-20260920 RC-09).
+pub mod command_safety;
+// KEEP permission / tool schema (plan-20260920 RC-19).
+pub mod permission_spec;
+pub mod tool_definition;
 // Git hooks integration that lets the agent observe commit events.
 pub mod hooks;
 // IntentSpec primitive types (Phase 0 / "what does the user want?").

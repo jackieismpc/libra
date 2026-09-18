@@ -196,13 +196,20 @@ fn unresolved_plan_execution_repair_markers<'a>(
                 turn_id,
                 predecessor_interaction_id,
                 supersedes_predecessor,
-                repair: repair @ PlanExecutionRepairState::AwaitingUser { .. },
+                repair,
             } => {
+                let Ok(repair) = serde_json::from_value::<PlanExecutionRepairState>(repair.clone())
+                else {
+                    continue;
+                };
+                if !matches!(repair, PlanExecutionRepairState::AwaitingUser { .. }) {
+                    continue;
+                }
                 if open
                     .insert(
                         interaction_id.clone(),
                         (
-                            repair.clone(),
+                            repair,
                             turn_id.clone(),
                             predecessor_interaction_id.clone(),
                             *supersedes_predecessor,
@@ -316,7 +323,12 @@ fn persist_plan_execution_repair_gate_with_lineage(
             turn_id: gate_turn_id.to_string(),
             predecessor_interaction_id: predecessor_interaction_id.unwrap_or_default().to_string(),
             supersedes_predecessor,
-            repair: repair.clone(),
+            repair: serde_json::to_value(repair).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("failed to encode plan execution repair state: {error}"),
+                )
+            })?,
         })
         .map(|_| ())
 }

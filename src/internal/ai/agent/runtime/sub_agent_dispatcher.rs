@@ -757,36 +757,7 @@ impl SubAgentDispatcher for DefaultSubAgentDispatcher {
 ///
 /// [`SubAgentWorkspace`]: crate::internal::ai::orchestrator::workspace::SubAgentWorkspace
 /// [`SubAgentWorkspace::cleanup`]: crate::internal::ai::orchestrator::workspace::SubAgentWorkspace::cleanup
-pub fn materialize_isolated_workspace(
-    main_working_dir: &std::path::Path,
-    thread_id: uuid::Uuid,
-    agent_run_id: AgentRunId,
-    isolation: &super::sub_agent::WorkspaceIsolationConfig,
-) -> Result<
-    crate::internal::ai::orchestrator::workspace::SubAgentWorkspace,
-    crate::internal::ai::orchestrator::workspace::SubAgentWorkspaceError,
-> {
-    use crate::internal::ai::{
-        agent_run::{event_store::AgentRunEventStore, workspace_sizing::measure_workspace_sizing},
-        orchestrator::workspace::materialize_sub_agent_workspace,
-    };
-
-    let sizing = measure_workspace_sizing(
-        &main_working_dir.join(crate::utils::util::ROOT_DIR),
-        main_working_dir,
-    );
-    let store = AgentRunEventStore::new(isolation.sessions_root.clone());
-
-    materialize_sub_agent_workspace(
-        main_working_dir,
-        sizing,
-        thread_id,
-        agent_run_id,
-        isolation.allow_full_copy,
-        &isolation.fuse_state,
-        &store,
-    )
-}
+pub use crate::internal::ai::workspace_isolation::materialize_isolated_workspace;
 
 /// Materialize an isolated workspace for a sub-agent run and return the
 /// re-rooted child tool registry + the inherited runtime context with

@@ -9,8 +9,8 @@ use crate::internal::ai::{
         config::{AutomationAction, AutomationRule, AutomationTrigger},
         events::{AutomationRunResult, AutomationRunStatus},
     },
-    runtime::hardening::{CommandSafetySurface, SafetyDisposition},
-    tools::utils::classify_ai_command_safety,
+    command_safety::classify_shell_command_safety,
+    hardening::SafetyDisposition,
 };
 
 const DEFAULT_SHELL_TIMEOUT_MS: u64 = 30_000;
@@ -91,7 +91,7 @@ impl AutomationExecutor {
         timeout_ms: Option<u64>,
         started_at: chrono::DateTime<Utc>,
     ) -> AutomationRunResult {
-        let decision = classify_ai_command_safety(CommandSafetySurface::Shell, command, &[]);
+        let decision = classify_shell_command_safety(command);
         let safety = serde_json::to_value(&decision).unwrap_or_else(|error| {
             json!({
                 "serialization_error": error.to_string(),

@@ -127,15 +127,6 @@ pnpm --dir web build
 pnpm --dir web test
 ```
 
-Worker checks:
-
-```bash
-pnpm --dir worker lint
-pnpm --dir worker test
-pnpm --dir worker test:miniflare
-pnpm --dir worker build
-```
-
 ## Tests and docs synchronization
 
 - Pair new or changed command behavior with focused tests in `tests/command/` and,

@@ -77,7 +77,8 @@ const EXAMPLES: &str = r#"EXAMPLES:
 pub enum ConfigScope {
     /// Repository-specific (`.libra/libra.db`). Default for writes.
     Local,
-    /// User-level (`~/.libra/config.db`).
+    /// User-level (`<config dir>/libra/config.db`, falling back to the legacy
+    /// `~/.libra/config.db` until the migration lands).
     Global,
     /// System-wide (`/etc/libra/config.db`, overridable via
     /// `LIBRA_CONFIG_SYSTEM_DB`). Lowest precedence; writing it usually needs
@@ -103,12 +104,7 @@ impl ConfigScope {
     pub fn get_config_path(&self) -> Option<PathBuf> {
         match self {
             ConfigScope::Local => None,
-            ConfigScope::Global => {
-                if let Some(p) = std::env::var_os("LIBRA_CONFIG_GLOBAL_DB") {
-                    return Some(PathBuf::from(p));
-                }
-                dirs::home_dir().map(|home| home.join(".libra").join("config.db"))
-            }
+            ConfigScope::Global => crate::internal::config::global_config_path(),
             ConfigScope::System => {
                 if let Some(p) = std::env::var_os("LIBRA_CONFIG_SYSTEM_DB") {
                     return Some(PathBuf::from(p));
@@ -2888,20 +2884,36 @@ async fn handle_path(scope: ConfigScope, output: &OutputConfig) -> CliResult<()>
     };
 
     let exists = path.exists();
+    let resolution = if scope == ConfigScope::Global {
+        crate::internal::config::global_config_resolution()
+    } else {
+        None
+    };
 
     if output.is_json() {
-        emit_json_data(
-            "config",
-            &serde_json::json!({
-                "action": "path",
-                "scope": scope_name(scope),
-                "path": path.to_string_lossy(),
-                "exists": exists,
-            }),
-            output,
-        )?;
+        let mut data = serde_json::json!({
+            "action": "path",
+            "scope": scope_name(scope),
+            "path": path.to_string_lossy(),
+            "exists": exists,
+        });
+        if let Some(resolution) = resolution.as_ref() {
+            data["source"] = serde_json::json!(resolution.source.as_str());
+            data["legacy_path"] = match resolution.legacy_path.as_ref() {
+                Some(legacy) => serde_json::json!(legacy.to_string_lossy()),
+                None => serde_json::Value::Null,
+            };
+            data["legacy_exists"] = serde_json::json!(resolution.legacy_exists);
+            data["migration_pending"] = serde_json::json!(resolution.migration_pending);
+        }
+        emit_json_data("config", &data, output)?;
     } else if !output.quiet {
         println!("{}", path.display());
+        if let Some(resolution) = resolution.as_ref()
+            && let Some(notice) = crate::internal::config::legacy_global_config_notice(resolution)
+        {
+            eprintln!("warning: {notice}");
+        }
     }
     Ok(())
 }

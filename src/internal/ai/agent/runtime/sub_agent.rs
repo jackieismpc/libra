@@ -67,29 +67,7 @@ pub type MessageId = String;
 /// sandbox `writable_roots` to it before running the child — so a
 /// sub-agent's writes land in the workspace, not the main worktree.
 /// `None` (every existing test and any flag-off path) means no
-/// isolation: behaviour is byte-for-byte identical to before this slice.
-#[derive(Clone)]
-pub struct WorkspaceIsolationConfig {
-    /// Per-session FUSE-provisioning state (degrades to copy backend
-    /// when FUSE is unavailable). `Arc`-backed, cheap to clone.
-    pub fuse_state: crate::internal::ai::orchestrator::workspace::FuseProvisionState,
-    /// `.libra/sessions` root the per-run `AgentRunEventStore` writes the
-    /// `WorkspaceMaterialized` event under.
-    pub sessions_root: std::path::PathBuf,
-    /// Whether an expensive full-copy fallback is permitted when the
-    /// preferred (size-selected) strategy cannot be materialized
-    /// (`code.multi_agent.allow_full_copy`).
-    pub allow_full_copy: bool,
-}
-
-impl std::fmt::Debug for WorkspaceIsolationConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WorkspaceIsolationConfig")
-            .field("sessions_root", &self.sessions_root)
-            .field("allow_full_copy", &self.allow_full_copy)
-            .finish_non_exhaustive()
-    }
-}
+pub use crate::internal::ai::workspace_isolation::WorkspaceIsolationConfig;
 
 // ─── Cancellation primitive ─────────────────────────────────────────────
 
@@ -462,8 +440,13 @@ impl ContextFrameLoader {
         let events = store.load_events()?;
         let mut latest = None;
         for event in events {
-            if let SessionEvent::ContextFrame(frame) = event {
-                latest = Some(frame);
+            if let SessionEvent::ContextFrame(payload) = event {
+                latest = Some(serde_json::from_value(payload).map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("failed to decode context frame from session log: {error}"),
+                    )
+                })?);
             }
         }
         Ok(latest)
@@ -1983,10 +1966,10 @@ mod tests {
             budget_exceeded_by: 0,
         };
         store
-            .append(&SessionEvent::ContextFrame(older.clone()))
+            .append(&SessionEvent::context_frame(older.clone()))
             .unwrap();
         store
-            .append(&SessionEvent::ContextFrame(newer.clone()))
+            .append(&SessionEvent::context_frame(newer.clone()))
             .unwrap();
 
         let loader = ContextFrameLoader::new();

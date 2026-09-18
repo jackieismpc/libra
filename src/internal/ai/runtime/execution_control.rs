@@ -262,10 +262,14 @@ impl ExecutionControlService {
             .context("failed to load Goal events for Code session resume")?
             .into_iter()
             .filter_map(|event| match event {
-                SessionEvent::Goal(envelope) => Some(envelope),
+                SessionEvent::Goal(payload) => Some(payload),
                 _ => None,
             })
-            .collect::<Vec<_>>();
+            .map(|payload| {
+                serde_json::from_value::<crate::internal::ai::goal::GoalEventEnvelope>(payload)
+                    .context("failed to decode Goal envelope from session log")
+            })
+            .collect::<Result<Vec<_>>>()?;
         if envelopes.is_empty() {
             return Ok(None);
         }

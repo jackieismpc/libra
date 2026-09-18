@@ -416,11 +416,15 @@ fn session_event_goal_variant_round_trips_through_serde() {
     let spec = fixture_spec();
     let goal_id = spec.goal_id;
     let envelope = envelope(goal_id, GoalEvent::Created(spec));
-    let session = SessionEvent::Goal(envelope.clone());
+    let session = SessionEvent::goal(envelope.clone());
     let json = serde_json::to_string(&session).expect("serialize SessionEvent::Goal");
     let back: SessionEvent = serde_json::from_str(&json).expect("deserialize SessionEvent::Goal");
     match back {
-        SessionEvent::Goal(envelope_back) => assert_eq!(envelope_back, envelope),
+        SessionEvent::Goal(payload) => {
+            let envelope_back: GoalEventEnvelope =
+                serde_json::from_value(payload).expect("decode Goal envelope");
+            assert_eq!(envelope_back, envelope);
+        }
         other => panic!("expected SessionEvent::Goal, got {other:?}"),
     }
 }
@@ -436,7 +440,7 @@ fn session_event_goal_apply_to_legacy_state_is_no_op() {
 
     let spec = fixture_spec();
     let goal_id = spec.goal_id;
-    let session = SessionEvent::Goal(envelope(goal_id, GoalEvent::Created(spec)));
+    let session = SessionEvent::goal(envelope(goal_id, GoalEvent::Created(spec)));
     let mut current: Option<SessionState> = None;
     session.apply_to(&mut current);
     assert!(
@@ -969,7 +973,10 @@ fn session_event_goal_with_unknown_nested_variant_deserialises() {
     let session: SessionEvent = serde_json::from_value(payload)
         .expect("SessionEvent::Goal with unknown nested variant must deserialise");
     match session {
-        SessionEvent::Goal(envelope) => match envelope.event {
+        SessionEvent::Goal(payload) => match serde_json::from_value::<GoalEventEnvelope>(payload)
+            .expect("decode Goal envelope")
+            .event
+        {
             GoalEvent::Blocked { reason, .. } => {
                 assert!(
                     matches!(reason, GoalBlockReason::Future),
