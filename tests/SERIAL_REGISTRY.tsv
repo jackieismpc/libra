@@ -252,8 +252,6 @@ test_blame_regex_line_range	lane:cwd+env+hash_kind	fail-closed body (TA-01 globa
 test_branch	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_branch_all_shows_unborn_head_even_with_remote_refs	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_branch_contains_commit_filter	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_branch_create_mints_missing_repo_id_before_operation_log	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_branch_create_records_operation_log	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_branch_create_track_modes_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_branch_create_without_base_surfaces_corrupt_head_storage	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_branch_delete_safe	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
