@@ -7,7 +7,7 @@
 //! rows in a write-locked transaction.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fmt,
     str::FromStr,
 };
@@ -846,6 +846,107 @@ impl OperationStoreV2 {
             .collect())
     }
 
+    /// Return the published operation heads across every worktree scope.
+    ///
+    /// The Web read model is repository-wide, so it must not silently pick a
+    /// single request scope and hide concurrent heads from the caller.
+    pub async fn read_all_heads(&self, repo_id: &str) -> Result<Vec<String>, StoreError> {
+        let rows = self
+            .db
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT DISTINCT op_id FROM operation_head WHERE repo_id = ? ORDER BY op_id LIMIT 200",
+                [repo_id.to_string().into()],
+            ))
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                row.try_get::<String>("", "op_id")
+                    .map_err(StoreError::Database)
+            })
+            .collect()
+    }
+
+    /// Return a bounded breadth-first page of operation ids reachable from the
+    /// repository's published heads. Each database read is bounded, and the
+    /// traversal stops once the requested page plus one continuation row has
+    /// been collected; it never materialises the full operation DAG.
+    pub async fn graph_operation_ids(
+        &self,
+        repo_id: &str,
+        depth: usize,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<String>, bool), StoreError> {
+        let limit = limit.clamp(1, 200);
+        let depth = depth.min(32);
+        let requested = limit.saturating_add(1).min(201);
+        let target = offset.saturating_add(requested);
+        let head_rows = self
+            .db
+            .query_all_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT DISTINCT op_id FROM operation_head WHERE repo_id = ? ORDER BY op_id LIMIT 200",
+                [repo_id.to_string().into()],
+            ))
+            .await?;
+        let mut frontier = head_rows
+            .into_iter()
+            .map(|row| {
+                row.try_get::<String>("", "op_id")
+                    .map_err(StoreError::Database)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        frontier.sort();
+        let mut seen = HashSet::new();
+        let mut ids = Vec::new();
+        let mut current_depth = 0usize;
+        while !frontier.is_empty() && current_depth <= depth && ids.len() < target {
+            frontier.sort();
+            let current = frontier
+                .into_iter()
+                .filter(|operation_id| seen.insert(operation_id.clone()))
+                .take(target.saturating_sub(ids.len()))
+                .collect::<Vec<_>>();
+            ids.extend(current.iter().cloned());
+            if current_depth == depth || ids.len() >= target {
+                break;
+            }
+
+            let placeholders = vec!["?"; current.len()].join(", ");
+            let sql = format!(
+                "SELECT p.parent_op_id FROM operation_parent p \
+                 JOIN operation o ON o.op_id = p.parent_op_id \
+                 WHERE o.repo_id = ? AND p.op_id IN ({placeholders}) \
+                 ORDER BY p.parent_op_id LIMIT 200"
+            );
+            let mut values = Vec::with_capacity(current.len() + 1);
+            values.push(repo_id.to_string().into());
+            values.extend(current.into_iter().map(Into::into));
+            let parent_rows = self
+                .db
+                .query_all_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    sql,
+                    values,
+                ))
+                .await?;
+            frontier = parent_rows
+                .into_iter()
+                .map(|row| {
+                    row.try_get::<String>("", "parent_op_id")
+                        .map_err(StoreError::Database)
+                })
+                .collect::<Result<BTreeSet<_>, _>>()?
+                .into_iter()
+                .collect();
+            current_depth = current_depth.saturating_add(1);
+        }
+        let has_more = ids.len() > offset.saturating_add(limit);
+        let page = ids.into_iter().skip(offset).take(limit).collect();
+        Ok((page, has_more))
+    }
+
     /// Whether `op_id` is referenced as a current operation head in any scope
     /// of this repository. Used by recovery to distinguish a globally orphaned
     /// running operation (safe to fail closed) from one another worktree still
@@ -1025,6 +1126,63 @@ impl OperationStoreV2 {
         txn.commit().await?;
         Ok(())
     }
+}
+
+/// Return the most recent successful repository operation with the same
+/// command and argument digest inside the short duplicate-operation window.
+///
+/// This is deliberately a v2-table query.  Callers use it for idempotency
+/// checks before applying a mutation; the operation row created by the v2
+/// boundary is updated with the digest immediately afterwards.
+pub(crate) async fn find_recent_success_by_args_digest(
+    db: &DatabaseConnection,
+    repo_id: &str,
+    command_name: &str,
+    args_digest: &str,
+) -> Result<Option<String>, StoreError> {
+    let cutoff = Utc::now().timestamp_millis() - 5_000;
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT op_id FROM operation \
+             WHERE repo_id = ? AND scope_kind = 'repository' \
+               AND command_name = ? AND args_digest = ? \
+               AND status = 'success' AND end_ts >= ? \
+             ORDER BY end_ts DESC, op_id DESC LIMIT 1",
+            [
+                repo_id.to_string().into(),
+                command_name.to_string().into(),
+                args_digest.to_string().into(),
+                cutoff.into(),
+            ],
+        ))
+        .await?;
+    row.map(|row| row.try_get("", "op_id").map_err(StoreError::Database))
+        .transpose()
+}
+
+/// Persist an idempotency digest on an already-created v2 operation row.
+pub(crate) async fn update_operation_args_digest(
+    db: &DatabaseConnection,
+    repo_id: &str,
+    op_id: &str,
+    args_digest: &str,
+) -> Result<(), StoreError> {
+    let updated = db
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE operation SET args_digest = ? WHERE repo_id = ? AND op_id = ?",
+            [
+                args_digest.to_string().into(),
+                repo_id.to_string().into(),
+                op_id.to_string().into(),
+            ],
+        ))
+        .await?;
+    if updated.rows_affected() == 0 {
+        return Err(StoreError::NotFound(op_id.to_string()));
+    }
+    Ok(())
 }
 
 async fn query_head_rows<C: ConnectionTrait>(

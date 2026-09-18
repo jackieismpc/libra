@@ -228,16 +228,17 @@ impl ReconcileEngine {
         }
         let mut merged_references: Vec<serde_json::Value> = Vec::new();
         for key in targets.keys() {
-            let (head, entry) = facets
-                .iter()
-                .find_map(|(head, references)| {
-                    references
-                        .iter()
-                        .find(|entry| reference_key(entry).is_ok_and(|parsed| parsed == *key))
-                        .map(|entry| (head.clone(), entry.clone()))
-                })
-                .expect("a reference row recorded in targets must exist in a facet");
-            let _ = head;
+            let Some(entry) = facets.iter().find_map(|(_, references)| {
+                references
+                    .iter()
+                    .find(|entry| reference_key(entry).is_ok_and(|parsed| parsed == *key))
+                    .cloned()
+            }) else {
+                return Err(ReconcileError::View(
+                    "reconcile".to_string(),
+                    format!("reference identity {key:?} disappeared during merge"),
+                ));
+            };
             merged_references.push(entry);
         }
 

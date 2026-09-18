@@ -24,7 +24,7 @@ use git_internal::{
         types::ObjectType,
     },
 };
-use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -37,6 +37,7 @@ use super::{
 };
 use crate::{
     internal::{
+        branch::is_locked_branch,
         config::ConfigKv,
         head::Head,
         operation::{PointerError, facets::registry_for_scope},
@@ -431,7 +432,11 @@ impl RestoreEngine {
         let current = self.capture_current_state(generation).await?;
         receipt.changed_paths =
             count_changed_paths(&self.store, &self.store, &current.snapshot, &snapshot, what)?;
-        let restore_refs = confirm_repo_wide && what == RestoreWhat::All;
+        // A single-worktree view is safe to restore without the explicit
+        // repository-wide acknowledgement. Multi-worktree views have already
+        // been rejected above unless the caller supplied that acknowledgement.
+        let restore_refs =
+            what == RestoreWhat::All && (confirm_repo_wide || view.workspaces.len() == 1);
         let op_id = Uuid::now_v7().to_string();
         let owner = format!("pid-{}", std::process::id());
         let command_name = match kind {
@@ -566,7 +571,7 @@ impl RestoreEngine {
         published_view
             .workspaces
             .insert(workspace_id.clone(), post.snapshot_oid);
-        if !(confirm_repo_wide && what == RestoreWhat::All) {
+        if !restore_refs {
             published_view.refs_facet_oid = post_manifest.refs_facet_oid;
         }
         let post_view_oid = match self.store.write_view_manifest(&published_view) {
@@ -991,10 +996,7 @@ impl RestoreEngine {
             });
         }
 
-        let txn = self
-            .store
-            .db()
-            .begin()
+        let txn = crate::internal::db::begin_write_transaction(self.store.db())
             .await
             .map_err(|error| RestoreError::Storage(error.to_string()))?;
         if let Some(other_worktree) =
@@ -1055,7 +1057,7 @@ impl RestoreEngine {
         if value
             .get("schema_version")
             .and_then(serde_json::Value::as_u64)
-            != Some(1)
+            .is_some_and(|version| version != 1)
         {
             return Err(RestoreError::Storage(
                 "refs facet has unsupported schema_version".to_string(),
@@ -1129,9 +1131,17 @@ impl RestoreEngine {
                     ));
                 }
                 "Tag" => {}
-                "Branch" if commit.is_none() || worktree_id.is_some() => {
+                "Branch" if worktree_id.is_some() => {
                     return Err(RestoreError::Storage(
-                        "Branch ref has invalid commit or worktree scope".to_string(),
+                        "Branch ref has invalid worktree scope".to_string(),
+                    ));
+                }
+                // The protected Libra-owned branches are created as empty
+                // placeholders during init. They are real branch rows, but
+                // intentionally have no commit until their first capture.
+                "Branch" if commit.is_none() && !name.is_some_and(is_locked_branch) => {
+                    return Err(RestoreError::Storage(
+                        "Branch ref has no commit and is not a locked placeholder".to_string(),
                     ));
                 }
                 "Branch" => {}
@@ -1159,12 +1169,10 @@ impl RestoreEngine {
             }
         }
         self.protect_linked_worktree_heads(references).await?;
-        let txn = self
-            .store
-            .db()
-            .begin()
+        let txn = crate::internal::db::begin_write_transaction(self.store.db())
             .await
             .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        self.protect_changed_branch_refs(&txn, references).await?;
         txn.execute_raw(Statement::from_string(
             DbBackend::Sqlite,
             "DELETE FROM reference",
@@ -1215,6 +1223,70 @@ impl RestoreEngine {
         txn.commit()
             .await
             .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        Ok(())
+    }
+
+    /// A repository-wide restore rewrites the shared branch table. Refuse to
+    /// move or delete a branch that another linked worktree currently has
+    /// checked out; otherwise that worktree would retain a HEAD pointing at a
+    /// branch whose tip or row no longer matches its working tree.
+    async fn protect_changed_branch_refs<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        target_references: &[serde_json::Value],
+    ) -> Result<(), RestoreError> {
+        let target_branches = target_references
+            .iter()
+            .filter(|reference| {
+                reference.get("kind").and_then(serde_json::Value::as_str) == Some("Branch")
+                    && reference
+                        .get("remote")
+                        .is_none_or(serde_json::Value::is_null)
+            })
+            .filter_map(|reference| {
+                let name = reference.get("name").and_then(serde_json::Value::as_str)?;
+                let commit = reference
+                    .get("commit")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                Some((name.to_string(), commit))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let current_rows = db
+            .query_all_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT name, `commit` FROM reference \
+                 WHERE kind = 'Branch' AND remote IS NULL",
+            ))
+            .await
+            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        for row in current_rows {
+            let Some(name) = row
+                .try_get_by_index::<Option<String>>(0)
+                .map_err(|error| RestoreError::Storage(error.to_string()))?
+            else {
+                continue;
+            };
+            let current_commit = row
+                .try_get_by_index::<Option<String>>(1)
+                .map_err(|error| RestoreError::Storage(error.to_string()))?;
+            let changed = match target_branches.get(&name) {
+                Some(target_commit) => target_commit != &current_commit,
+                None => true,
+            };
+            if !changed {
+                continue;
+            }
+            if let Some(other_worktree) =
+                Head::branch_checked_out_elsewhere_result_with_conn(db, &name)
+                    .await
+                    .map_err(|error| RestoreError::Storage(error.to_string()))?
+            {
+                return Err(RestoreError::Storage(format!(
+                    "cannot restore branch '{name}': it is checked out in worktree '{other_worktree}'"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -1271,7 +1343,7 @@ impl RestoreEngine {
                 .collect::<Vec<_>>();
             listed.sort();
             return Err(RestoreError::Storage(format!(
-                "repository-wide restore would delete the HEAD of worktree(s) {} that are absent from the target snapshot; check them out of the target refs or recreate them after the restore",
+                "repository-wide restore would delete the HEAD of worktree(s) {} that are checked out elsewhere and absent from the target snapshot; check them out of the target refs or recreate them after the restore",
                 listed.join(", ")
             )));
         }

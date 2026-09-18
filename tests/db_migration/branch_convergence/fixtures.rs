@@ -105,20 +105,6 @@ pub(super) async fn rows(conn: &DatabaseConnection, table: &str) -> Vec<String> 
     .collect()
 }
 
-pub(super) async fn operation_rows(conn: &DatabaseConnection, prefix: &str) -> Vec<Vec<String>> {
-    let mut captured = Vec::new();
-    for table in [
-        "operation",
-        "operation_parent",
-        "operation_view",
-        "operation_view_ref",
-        "operation_view_workspace",
-    ] {
-        captured.push(rows(conn, &format!("{prefix}{table}")).await);
-    }
-    captured
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct DatabaseSnapshot {
     schema: Vec<String>,
