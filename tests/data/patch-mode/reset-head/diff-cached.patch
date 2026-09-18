@@ -1,0 +1,20 @@
+diff --git a/bar b/bar
+index 9c2a709..996cea5 100644
+--- a/bar
++++ b/bar
+@@ -1,4 +1,4 @@
+-line 1
++line 1 x
+ line 2
+ line 3
+ line 4
+diff --git a/foo b/foo
+index 9c2a709..996cea5 100644
+--- a/foo
++++ b/foo
+@@ -1,4 +1,4 @@
+-line 1
++line 1 x
+ line 2
+ line 3
+ line 4

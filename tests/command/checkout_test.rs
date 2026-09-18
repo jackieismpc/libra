@@ -223,6 +223,9 @@ async fn checkout_restore_rejects_sha1_hash_in_sha256_repo() {
             renormalize: false,
             ignore_missing: false,
             resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         },
         &OutputConfig::default(),
     )
@@ -322,6 +325,9 @@ async fn test_checkout_new_branch_with_dirty_worktree_returns_error() {
             renormalize: false,
             ignore_missing: false,
             resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         },
         &OutputConfig::default(),
     )
@@ -365,6 +371,9 @@ async fn test_checkout_new_branch_with_dirty_worktree_returns_error() {
             renormalize: false,
             ignore_missing: false,
             resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         },
         &OutputConfig::default(),
     )
@@ -432,6 +441,9 @@ async fn test_checkout_current_branch_with_dirty_worktree_succeeds() {
             renormalize: false,
             ignore_missing: false,
             resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         },
         &OutputConfig::default(),
     )
@@ -522,6 +534,9 @@ async fn test_checkout_existing_branch_with_unstaged_dirty_worktree_returns_erro
             renormalize: false,
             ignore_missing: false,
             resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         },
         &OutputConfig::default(),
     )
@@ -1200,4 +1215,54 @@ fn test_checkout_literal_pathspecs_global() {
     );
     assert_eq!(std::fs::read_to_string(p.join("*.txt")).unwrap(), "star\n");
     assert_eq!(std::fs::read_to_string(p.join("x.txt")).unwrap(), "x2\n");
+}
+
+/// M-DETACH D1, D4 (checkout), D5, D6, D7: bare `checkout --detach` is not a
+/// current-branch no-op; dirty files are kept; unborn HEAD is refused.
+#[test]
+fn test_checkout_bare_detach_is_not_a_noop() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("tracked.txt"), "dirty\n").expect("dirty");
+
+    let d1 = run_libra_command(&["checkout", "--detach"], p);
+    assert_cli_success(&d1, "D1 checkout --detach");
+    let symbolic = run_libra_command(&["symbolic-ref", "HEAD"], p);
+    assert!(!symbolic.status.success(), "D1 symbolic-ref HEAD must fail");
+    assert_eq!(
+        std::fs::read_to_string(p.join("tracked.txt")).expect("read dirty"),
+        "dirty\n",
+        "D5 keeps uncommitted edits"
+    );
+    let d1_json = run_libra_command(&["--json", "checkout", "--detach"], p);
+    assert_cli_success(&d1_json, "D6 checkout --json --detach");
+    let parsed = parse_json_stdout(&d1_json);
+    assert_eq!(parsed["data"]["detached"], true);
+    let status = run_libra_command(&["status"], p);
+    assert_cli_success(&status, "D7 status after D1");
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("HEAD detached at"),
+        "D7: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+
+    let unborn = tempdir().expect("unborn");
+    init_repo_via_cli(unborn.path());
+    let before = run_libra_command(&["symbolic-ref", "HEAD"], unborn.path());
+    assert_cli_success(&before, "unborn symbolic-ref");
+    let before_out = String::from_utf8_lossy(&before.stdout).into_owned();
+    let d4 = run_libra_command(&["checkout", "--detach"], unborn.path());
+    let (stderr, report) = parse_cli_error_stderr(&d4.stderr);
+    assert_eq!(d4.status.code(), Some(128), "D4: {stderr}");
+    assert_eq!(report.error_code, "LBR-REPO-003");
+    assert!(
+        stderr.contains("You are on a branch yet to be born"),
+        "D4 wording: {stderr}"
+    );
+    let after = run_libra_command(&["symbolic-ref", "HEAD"], unborn.path());
+    assert_eq!(
+        String::from_utf8_lossy(&after.stdout).trim(),
+        before_out.trim(),
+        "D4 zero-write"
+    );
 }

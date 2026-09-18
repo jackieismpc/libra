@@ -18,7 +18,7 @@ INSTALL_DIR="${LIBRA_INSTALL_DIR:-$LIBRA_HOME/bin}"
 # user opts in with LIBRA_ALLOW_FALLBACK=1. Default behaviour is fail-fast so
 # offline installs cannot silently regress to a stale version. Bump this on
 # every release so the opt-in fallback remains useful.
-DEFAULT_VERSION="v0.22.47"
+DEFAULT_VERSION="v0.22.49"
 # Public-only trust anchor for stable-manifest verification. It deliberately
 # has no environment override: the install-smoke harness rewrites these
 # clearly-marked constants in a temporary COPY of this script, never through
@@ -917,11 +917,11 @@ verify_stable_manifest() {
             "refusing to install"
     fi
     # Digest must be exactly 64 lowercase hex; size mirrors the native
-    # (0, 128 MiB] bound — a signed zero-byte or oversized row is refused.
+    # (0, 256 MiB] bound — a signed zero-byte or oversized row is refused.
     printf '%s' "$STABLE_SHA256" | grep -qE '^[0-9a-f]{64}$' \
         || error_exit "signed manifest artifact sha256 is not 64 lowercase hex" "verify" "refusing to install"
-    if [ -z "$STABLE_SIZE" ] || [ "$STABLE_SIZE" -le 0 ] || [ "$STABLE_SIZE" -gt 134217728 ]; then
-        error_exit "signed manifest artifact size ${STABLE_SIZE:-?} is outside (0, 128 MiB]" "verify" "refusing to install"
+    if [ -z "$STABLE_SIZE" ] || [ "$STABLE_SIZE" -le 0 ] || [ "$STABLE_SIZE" -gt 268435456 ]; then
+        error_exit "signed manifest artifact size ${STABLE_SIZE:-?} is outside (0, 256 MiB]" "verify" "refusing to install"
     fi
 }
 

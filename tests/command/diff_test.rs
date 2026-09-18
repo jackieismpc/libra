@@ -527,6 +527,9 @@ async fn test_diff_after_init() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     let staged_file = output_dir.path().join("diff_staged_output.txt");
@@ -571,6 +574,9 @@ async fn test_basic_diff() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -642,6 +648,9 @@ async fn test_diff_staged() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -680,6 +689,9 @@ async fn test_diff_staged() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -744,6 +756,9 @@ async fn test_diff_between_commits() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -784,6 +799,9 @@ async fn test_diff_between_commits() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -865,6 +883,9 @@ async fn test_diff_with_pathspec() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -944,6 +965,9 @@ async fn test_diff_output_to_file() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1018,6 +1042,9 @@ async fn test_diff_algorithms() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 

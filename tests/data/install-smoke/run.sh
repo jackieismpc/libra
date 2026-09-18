@@ -224,8 +224,8 @@ run_scenario stale-replay manifest-stale-replay.json fail no "older than this in
 run_scenario tampered-payload manifest-tampered-payload.json fail no "SIGNATURE VERIFICATION FAILED"
 
 # 10. Signed artifact row with size 0 → refused at parse time (before any
-#     download; the native contract bounds size to (0, 128 MiB]).
-run_scenario zero-size manifest-zero-size.json fail no "outside (0, 128 MiB]"
+#     download; the native contract bounds size to (0, 256 MiB]).
+run_scenario zero-size manifest-zero-size.json fail no "outside (0, 256 MiB]"
 
 # 11. min_key_generation above the installer's pinned key generation.
 run_scenario future-min-key manifest-future-min-key.json fail no "min_key_generation"

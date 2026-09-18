@@ -129,7 +129,7 @@ async fn test_branch_all_shows_unborn_head_even_with_remote_refs() {
 
 /// Scenario: when `branch -d` targets a misspelled branch, the structured
 /// error must include a "did you mean" suggestion based on existing branch
-/// names. Pins the typo-suggestion contract (`LBR-CLI-003`, exit 129).
+/// names. Pins the typo-suggestion contract (`LBR-CLI-003`, exit 1).
 #[test]
 fn test_branch_not_found_suggests_similar_name() {
     let repo = create_committed_repo_via_cli();
@@ -140,8 +140,9 @@ fn test_branch_not_found_suggests_similar_name() {
     let output = run_libra_command(&["branch", "-d", "feature"], repo.path());
     let (stderr, report) = parse_cli_error_stderr(&output.stderr);
 
-    assert_eq!(output.status.code(), Some(129));
+    assert_eq!(output.status.code(), Some(1));
     assert_eq!(report.error_code, "LBR-CLI-003");
+    assert_eq!(report.exit_code, 1);
     assert!(
         stderr.contains("did you mean 'featur'?"),
         "expected suggestion in stderr, got: {stderr}"
@@ -187,12 +188,8 @@ fn test_branch_set_upstream_rejects_unknown_remote() {
     assert_eq!(output.status.code(), Some(129));
     assert_eq!(report.error_code, "LBR-CLI-003");
     assert!(
-        stderr.contains("remote 'origin' not found"),
+        stderr.contains("the requested upstream branch 'origin/main' does not exist"),
         "unexpected stderr: {stderr}"
-    );
-    assert!(
-        stderr.contains("libra remote -v"),
-        "missing remediation hint in stderr: {stderr}"
     );
 }
 
@@ -457,6 +454,8 @@ async fn test_branch() {
             delete: None,
             delete_safe: None,
             set_upstream_to: None,
+            track: None,
+            no_track: false,
             unset_upstream: None,
             edit_description: None,
             show_current: false,
@@ -506,6 +505,8 @@ async fn test_branch() {
             delete: None,
             delete_safe: None,
             set_upstream_to: None,
+            track: None,
+            no_track: false,
             unset_upstream: None,
             edit_description: None,
             show_current: false,
@@ -545,6 +546,8 @@ async fn test_branch() {
         delete: None,
         delete_safe: None,
         set_upstream_to: None,
+        track: None,
+        no_track: false,
         unset_upstream: None,
         edit_description: None,
         show_current: true,
@@ -612,6 +615,8 @@ async fn test_create_branch_from_remote() {
         delete: None,
         delete_safe: None,
         set_upstream_to: None,
+        track: None,
+        no_track: false,
         unset_upstream: None,
         edit_description: None,
         show_current: false,
@@ -680,6 +685,8 @@ async fn test_create_branch_from_remote_tracking_ref() {
         delete: None,
         delete_safe: None,
         set_upstream_to: None,
+        track: None,
+        no_track: false,
         unset_upstream: None,
         edit_description: None,
         show_current: false,
@@ -904,6 +911,8 @@ async fn test_branch_rename() {
         delete: None,
         delete_safe: None,
         set_upstream_to: None,
+        track: None,
+        no_track: false,
         unset_upstream: None,
         edit_description: None,
         show_current: false,
@@ -942,6 +951,8 @@ async fn test_branch_rename() {
         delete: None,
         delete_safe: None,
         set_upstream_to: None,
+        track: None,
+        no_track: false,
         unset_upstream: None,
         edit_description: None,
         show_current: false,
@@ -1050,6 +1061,8 @@ async fn test_rename_current_branch() {
         delete: None,
         delete_safe: None,
         set_upstream_to: None,
+        track: None,
+        no_track: false,
         unset_upstream: None,
         edit_description: None,
         show_current: false,
@@ -1132,6 +1145,8 @@ async fn test_rename_to_existing_branch() {
         delete: None,
         delete_safe: None,
         set_upstream_to: None,
+        track: None,
+        no_track: false,
         unset_upstream: None,
         edit_description: None,
         show_current: false,
@@ -1162,6 +1177,8 @@ async fn test_rename_to_existing_branch() {
         delete: None,
         delete_safe: None,
         set_upstream_to: None,
+        track: None,
+        no_track: false,
         unset_upstream: None,
         edit_description: None,
         show_current: false,
@@ -1193,6 +1210,8 @@ async fn test_rename_to_existing_branch() {
         delete: None,
         delete_safe: None,
         set_upstream_to: None,
+        track: None,
+        no_track: false,
         unset_upstream: None,
         edit_description: None,
         show_current: false,
@@ -1268,6 +1287,8 @@ async fn test_list_all_branches() {
         delete: None,
         delete_safe: None,
         set_upstream_to: None,
+        track: None,
+        no_track: false,
         unset_upstream: None,
         edit_description: None,
         show_current: false,
@@ -1309,6 +1330,8 @@ async fn test_list_all_branches() {
         delete: None,
         delete_safe: None,
         set_upstream_to: None,
+        track: None,
+        no_track: false,
         unset_upstream: None,
         edit_description: None,
         show_current: false,
@@ -1389,6 +1412,8 @@ async fn test_branch_delete_safe() {
         delete: None,
         delete_safe: None,
         set_upstream_to: None,
+        track: None,
+        no_track: false,
         unset_upstream: None,
         edit_description: None,
         show_current: false,
@@ -1468,6 +1493,8 @@ async fn test_branch_delete_safe() {
         delete: None,
         delete_safe: Some("feature".to_string()),
         set_upstream_to: None,
+        track: None,
+        no_track: false,
         unset_upstream: None,
         edit_description: None,
         show_current: false,
@@ -1548,6 +1575,8 @@ async fn test_branch_delete_safe() {
         delete: None,
         delete_safe: Some("feature".to_string()),
         set_upstream_to: None,
+        track: None,
+        no_track: false,
         unset_upstream: None,
         edit_description: None,
         show_current: false,
@@ -1647,6 +1676,8 @@ async fn test_branch_contains_commit_filter() {
         delete: None,
         delete_safe: None,
         set_upstream_to: None,
+        track: None,
+        no_track: false,
         unset_upstream: None,
         edit_description: None,
         show_current: false,
@@ -2663,4 +2694,630 @@ async fn branch_vv_counts_upstream_shapes() {
     commit_named_file(p, "l1");
     let line = main_line(p);
     assert!(line.contains("[origin/main: ahead 1, behind 2]"), "{line}");
+}
+
+fn config_get(repo: &std::path::Path, key: &str) -> Option<String> {
+    let output = run_libra_command(&["config", "--get", key], repo);
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+fn branch_config_snapshot(repo: &std::path::Path) -> String {
+    let output = run_libra_command(&["config", "--get-regexp", r"^branch\."], repo);
+    let mut lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    lines.sort();
+    lines.join("\n")
+}
+
+fn refs_snapshot(repo: &std::path::Path) -> String {
+    let output = run_libra_command(&["show-ref"], repo);
+    let mut lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(ToString::to_string)
+        .collect();
+    lines.sort();
+    lines.join("\n")
+}
+
+/// M-UPSTREAM P1–P7 (#477 HF-07).
+#[tokio::test]
+#[serial(cwd)]
+async fn test_branch_set_upstream_to_with_branch_arg_and_local_upstream_matrix() {
+    use super::status_test::{rev_parse, write_upstream_ref};
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let _cwd = ChangeDirGuard::new(p);
+
+    assert_cli_success(&run_libra_command(&["branch", "alpha"], p), "create alpha");
+    assert_cli_success(&run_libra_command(&["branch", "zeta"], p), "create zeta");
+    assert_cli_success(&run_libra_command(&["branch", "feat"], p), "create feat");
+
+    let e1 = run_libra_command(&["branch", "-u", "main", "alpha"], p);
+    assert_cli_success(&e1, "P1 -u main alpha");
+    assert!(
+        String::from_utf8_lossy(&e1.stdout).contains("branch 'alpha' set up to track 'main'."),
+        "P1 stdout: {}",
+        String::from_utf8_lossy(&e1.stdout)
+    );
+    assert_eq!(config_get(p, "branch.alpha.remote").as_deref(), Some("."));
+    assert_eq!(
+        config_get(p, "branch.alpha.merge").as_deref(),
+        Some("refs/heads/main")
+    );
+
+    let e2 = run_libra_command(&["branch", "--set-upstream-to", "main", "zeta"], p);
+    assert_cli_success(&e2, "P2 --set-upstream-to main zeta");
+    assert_eq!(config_get(p, "branch.zeta.remote").as_deref(), Some("."));
+    assert_eq!(
+        config_get(p, "branch.zeta.merge").as_deref(),
+        Some("refs/heads/main")
+    );
+
+    assert_cli_success(&run_libra_command(&["switch", "alpha"], p), "switch alpha");
+    let e3 = run_libra_command(&["branch", "--set-upstream-to=main"], p);
+    assert_cli_success(&e3, "P3 --set-upstream-to=main on alpha");
+    assert_eq!(config_get(p, "branch.alpha.remote").as_deref(), Some("."));
+
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+            p,
+        ),
+        "remote add origin",
+    );
+    write_upstream_ref(&rev_parse(p, "HEAD")).await;
+    let e4 = run_libra_command(&["branch", "-u", "origin/main", "feat"], p);
+    assert_cli_success(&e4, "P4 -u origin/main feat");
+    assert_eq!(
+        config_get(p, "branch.feat.remote").as_deref(),
+        Some("origin")
+    );
+    assert_eq!(
+        config_get(p, "branch.feat.merge").as_deref(),
+        Some("refs/heads/main")
+    );
+
+    let before_p5 = branch_config_snapshot(p);
+    let refs_p5 = refs_snapshot(p);
+    let e5 = run_libra_command(&["branch", "-u", "main", "main"], p);
+    assert_eq!(e5.status.code(), Some(0), "P5 is a warning, not a failure");
+    assert!(
+        String::from_utf8_lossy(&e5.stderr)
+            .contains("not setting branch 'main' as its own upstream"),
+        "P5: {}",
+        String::from_utf8_lossy(&e5.stderr)
+    );
+    assert_eq!(
+        branch_config_snapshot(p),
+        before_p5,
+        "P5 must not write branch.*"
+    );
+    assert_eq!(refs_snapshot(p), refs_p5, "P5 must not move refs");
+
+    let before_p6 = branch_config_snapshot(p);
+    let refs_p6 = refs_snapshot(p);
+
+    let missing_up = run_libra_command(&["branch", "-u", "nosuch", "feat"], p);
+    let (stderr, report) = parse_cli_error_stderr(&missing_up.stderr);
+    assert_eq!(missing_up.status.code(), Some(129), "P6 nosuch");
+    assert_eq!(report.error_code, "LBR-CLI-003");
+    assert!(
+        stderr.contains("the requested upstream branch 'nosuch' does not exist"),
+        "P6 nosuch: {stderr}"
+    );
+
+    let missing_br = run_libra_command(&["branch", "-u", "main", "nosuchbranch"], p);
+    let (stderr, report) = parse_cli_error_stderr(&missing_br.stderr);
+    assert_eq!(missing_br.status.code(), Some(129), "P6 missing branch");
+    assert_eq!(report.error_code, "LBR-CLI-003");
+    assert!(
+        stderr.contains("branch 'nosuchbranch' does not exist"),
+        "P6 missing branch: {stderr}"
+    );
+
+    let too_many = run_libra_command(&["branch", "-u", "main", "a", "b"], p);
+    let (stderr, report) = parse_cli_error_stderr(&too_many.stderr);
+    assert_eq!(too_many.status.code(), Some(129), "P6 too many");
+    assert_eq!(report.error_code, "LBR-CLI-002");
+    assert!(
+        stderr.contains("too many arguments to set new upstream"),
+        "P6 too many: {stderr}"
+    );
+
+    assert_eq!(
+        branch_config_snapshot(p),
+        before_p6,
+        "P6 must not write branch.*"
+    );
+    assert_eq!(refs_snapshot(p), refs_p6, "P6 must not move refs");
+
+    let vv = run_libra_command(&["branch", "-vv"], p);
+    assert_cli_success(&vv, "P7 branch -vv");
+    let alpha_line = String::from_utf8_lossy(&vv.stdout)
+        .lines()
+        .find(|line| line.contains("alpha"))
+        .expect("alpha line")
+        .to_string();
+    assert!(
+        alpha_line.contains("[main]") && !alpha_line.contains("[./main]"),
+        "P7 -vv local upstream: {alpha_line}"
+    );
+}
+
+/// M-TRACK T1–T6b (#477 HF-08).
+#[tokio::test]
+#[serial(cwd)]
+async fn test_branch_create_track_modes_matrix() {
+    use super::status_test::{rev_parse, write_upstream_ref};
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let _cwd = ChangeDirGuard::new(p);
+
+    let current = run_libra_command(&["branch", "--show-current"], p);
+    assert_cli_success(&current, "show current");
+    let base = String::from_utf8_lossy(&current.stdout).trim().to_string();
+
+    let t1 = run_libra_command(&["branch", "--track", "t1", &base], p);
+    assert_cli_success(&t1, "T1 --track");
+    let t1_out = String::from_utf8_lossy(&t1.stdout);
+    assert!(
+        t1_out.contains("branch 't1' set up to track") && t1_out.contains(&format!("'{base}'")),
+        "T1 confirmation: {t1_out}"
+    );
+    assert_eq!(config_get(p, "branch.t1.remote").as_deref(), Some("."));
+    assert_eq!(
+        config_get(p, "branch.t1.merge").as_deref(),
+        Some(format!("refs/heads/{base}").as_str())
+    );
+
+    let t2 = run_libra_command(&["branch", "-t", "t2", &base], p);
+    assert_cli_success(&t2, "T2 -t");
+    assert_eq!(config_get(p, "branch.t2.remote").as_deref(), Some("."));
+    assert_eq!(
+        config_get(p, "branch.t2.merge").as_deref(),
+        Some(format!("refs/heads/{base}").as_str())
+    );
+
+    let t3 = run_libra_command(&["branch", "--track=inherit", "t3", "t1"], p);
+    assert_cli_success(&t3, "T3 inherit");
+    assert_eq!(config_get(p, "branch.t3.remote").as_deref(), Some("."));
+    assert_eq!(
+        config_get(p, "branch.t3.merge").as_deref(),
+        Some(format!("refs/heads/{base}").as_str())
+    );
+
+    let before_t4 = branch_config_snapshot(p);
+    let t4 = run_libra_command(&["branch", "--no-track", "t4", &base], p);
+    assert_cli_success(&t4, "T4 --no-track");
+    assert_eq!(config_get(p, "branch.t4.remote"), None);
+    assert_eq!(config_get(p, "branch.t4.merge"), None);
+    let after_t4 = branch_config_snapshot(p);
+    assert!(
+        after_t4 == before_t4 || !after_t4.contains("branch.t4."),
+        "T4 must not write tracking for t4:\n{after_t4}"
+    );
+
+    assert_cli_success(
+        &run_libra_command(
+            &["remote", "add", "origin", "https://example.com/repo.git"],
+            p,
+        ),
+        "remote add origin",
+    );
+    write_upstream_ref(&rev_parse(p, "HEAD")).await;
+    let t5 = run_libra_command(&["branch", "--track", "t5", "origin/main"], p);
+    assert_cli_success(&t5, "T5 remote start");
+    assert_eq!(config_get(p, "branch.t5.remote").as_deref(), Some("origin"));
+    assert_eq!(
+        config_get(p, "branch.t5.merge").as_deref(),
+        Some("refs/heads/main")
+    );
+
+    let hash = rev_parse(p, "HEAD");
+    let refs_t6 = refs_snapshot(p);
+    let cfg_t6 = branch_config_snapshot(p);
+    let t6 = run_libra_command(&["branch", "--track", "t6", &hash], p);
+    let (stderr, report) = parse_cli_error_stderr(&t6.stderr);
+    assert_eq!(t6.status.code(), Some(129), "T6a: {stderr}");
+    assert_eq!(report.error_code, "LBR-CLI-003");
+    assert!(
+        stderr.contains("cannot set up tracking information") && stderr.contains("is not a branch"),
+        "T6a wording: {stderr}"
+    );
+    assert_eq!(config_get(p, "branch.t6.remote"), None);
+    assert_eq!(refs_snapshot(p), refs_t6, "T6a must not create t6");
+    assert_eq!(
+        branch_config_snapshot(p),
+        cfg_t6,
+        "T6a must not write config"
+    );
+
+    let list_only = run_libra_command(&["branch", "--track"], p);
+    assert_cli_success(&list_only, "T6b --track alone lists");
+    assert!(
+        config_get(p, "branch.track.remote").is_none(),
+        "T6b alone must not create a branch named track"
+    );
+
+    let listed = run_libra_command(&["branch", "--track", "--list"], p);
+    assert_cli_success(&listed, "T6b --track --list");
+
+    assert_cli_success(
+        &run_libra_command(&["branch", "doomed"], p),
+        "create doomed for T6b -d",
+    );
+    let deleted = run_libra_command(&["branch", "--track", "-d", "doomed"], p);
+    assert_cli_success(&deleted, "T6b --track -d");
+    assert_eq!(config_get(p, "branch.doomed.remote"), None);
+
+    assert_cli_success(
+        &run_libra_command(&["branch", "ren-src"], p),
+        "create ren-src",
+    );
+    let renamed = run_libra_command(&["branch", "--track", "-m", "ren-src", "ren-dst"], p);
+    assert_cli_success(&renamed, "T6b --track -m");
+    assert_eq!(config_get(p, "branch.ren-dst.remote"), None);
+}
+
+/// M-LIST V1–V9: default refname order, `-v` name padding, remotes prefix,
+/// detached first line, JSON order, and the existing-flag regression set.
+#[tokio::test]
+#[serial(cwd)]
+async fn test_branch_list_refname_order_and_verbose_alignment_matrix() {
+    use super::status_test::{rev_parse, write_upstream_ref};
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let _guard = ChangeDirGuard::new(p);
+
+    let current = {
+        let out = run_libra_command(&["branch", "--show-current"], p);
+        assert_cli_success(&out, "show-current");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    for name in ["a", "b-2", "longname-branch"] {
+        assert_cli_success(&run_libra_command(&["branch", name], p), name);
+    }
+    let expected = ["a", "b-2", "longname-branch", current.as_str()];
+
+    let list_plain_names = |stdout: &str| -> Vec<String> {
+        stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let rest = line
+                    .strip_prefix("* ")
+                    .or_else(|| line.strip_prefix("  "))
+                    .unwrap_or(line);
+                rest.trim().to_string()
+            })
+            .collect()
+    };
+    let starred = |stdout: &str| -> String {
+        stdout
+            .lines()
+            .find(|line| line.starts_with("* "))
+            .map(|line| {
+                line.trim_start_matches("* ")
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .unwrap_or_default()
+    };
+
+    let listed = run_libra_command(&["branch"], p);
+    assert_cli_success(&listed, "V1 branch");
+    let listed_out = String::from_utf8_lossy(&listed.stdout);
+    assert_eq!(
+        list_plain_names(&listed_out),
+        expected,
+        "V1 refname order: {listed_out}"
+    );
+    assert_eq!(starred(&listed_out), current, "V1 current stays put");
+
+    let head = rev_parse(p, "HEAD");
+    let short = &head[..7];
+    let verbose = run_libra_command(&["branch", "-v"], p);
+    assert_cli_success(&verbose, "V2 -v");
+    let v_out = String::from_utf8_lossy(&verbose.stdout);
+    let sha_cols: Vec<usize> = v_out
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            line.rfind(short)
+                .unwrap_or_else(|| panic!("V2 missing {short} in {line:?}"))
+        })
+        .collect();
+    assert!(
+        sha_cols.windows(2).all(|window| window[0] == window[1]),
+        "V2 name column alignment: {v_out}"
+    );
+    assert_eq!(starred(&v_out), current, "V2 star stays on {current}");
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "longname-branch"], p),
+        "V3 switch",
+    );
+    let after_switch = run_libra_command(&["branch", "-v"], p);
+    assert_cli_success(&after_switch, "V3 -v after switch");
+    let switched = String::from_utf8_lossy(&after_switch.stdout);
+    let switched_names: Vec<String> = switched
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let rest = line
+                .strip_prefix("* ")
+                .or_else(|| line.strip_prefix("  "))
+                .unwrap_or(line);
+            rest[..rest.find(short).expect(rest)].trim().to_string()
+        })
+        .collect();
+    assert_eq!(switched_names, expected, "V3 order unchanged: {switched}");
+    assert_eq!(starred(&switched), "longname-branch", "V3 star moves");
+
+    let formatted = run_libra_command(&["branch", "--format=%(refname:short)"], p);
+    assert_cli_success(&formatted, "V4 --format");
+    let format_names: Vec<String> = String::from_utf8_lossy(&formatted.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    assert_eq!(format_names, expected, "V4 format order");
+
+    let desc = run_libra_command(&["branch", "--sort=-refname"], p);
+    assert_cli_success(&desc, "V5 --sort=-refname");
+    let mut reversed = expected.to_vec();
+    reversed.reverse();
+    assert_eq!(
+        list_plain_names(&String::from_utf8_lossy(&desc.stdout)),
+        reversed
+    );
+    let ignore = run_libra_command(&["branch", "--ignore-case"], p);
+    assert_cli_success(&ignore, "V5 --ignore-case");
+    assert_eq!(
+        list_plain_names(&String::from_utf8_lossy(&ignore.stdout)),
+        expected
+    );
+
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+            p,
+        ),
+        "remote add",
+    );
+    write_upstream_ref(&head).await;
+
+    let all = run_libra_command(&["branch", "-a"], p);
+    assert_cli_success(&all, "V6 -a");
+    let all_out = String::from_utf8_lossy(&all.stdout);
+    let all_names = list_plain_names(&all_out);
+    assert_eq!(
+        &all_names[..expected.len()],
+        expected,
+        "V6 locals first: {all_out}"
+    );
+    assert!(
+        all_names.iter().any(|name| name == "remotes/origin/main"),
+        "V6 -a remotes/ prefix: {all_out}"
+    );
+    let remotes = run_libra_command(&["branch", "-r"], p);
+    assert_cli_success(&remotes, "V6 -r");
+    let remotes_out = String::from_utf8_lossy(&remotes.stdout);
+    assert!(
+        list_plain_names(&remotes_out).contains(&"origin/main".to_string()),
+        "V6 -r omits remotes/: {remotes_out}"
+    );
+    assert!(
+        !remotes_out.contains("remotes/origin/"),
+        "V6 -r has no remotes/ prefix: {remotes_out}"
+    );
+    let all_v = run_libra_command(&["branch", "-a", "-v"], p);
+    assert_cli_success(&all_v, "V6 -a -v");
+    let all_v_out = String::from_utf8_lossy(&all_v.stdout);
+    let all_v_cols: Vec<usize> = all_v_out
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            line.rfind(short)
+                .unwrap_or_else(|| panic!("V6 -a -v missing {short} in {line:?}"))
+        })
+        .collect();
+    assert!(
+        all_v_cols.windows(2).all(|window| window[0] == window[1]),
+        "V6 -a -v alignment: {all_v_out}"
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "--detach", "HEAD"], p),
+        "V7 detach",
+    );
+    let detached = run_libra_command(&["branch"], p);
+    assert_cli_success(&detached, "V7 list");
+    let detached_out = String::from_utf8_lossy(&detached.stdout);
+    let first = detached_out
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .expect("V7 first line");
+    assert_eq!(
+        first,
+        format!("* (HEAD detached at {short})"),
+        "V7 detached banner: {detached_out}"
+    );
+    let detached_v = run_libra_command(&["branch", "-v"], p);
+    assert_cli_success(&detached_v, "V7 -v");
+    let detached_v_out = String::from_utf8_lossy(&detached_v.stdout);
+    let detached_cols: Vec<usize> = detached_v_out
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            line.rfind(short)
+                .unwrap_or_else(|| panic!("V7 missing {short} in {line:?}"))
+        })
+        .collect();
+    assert!(
+        detached_cols
+            .windows(2)
+            .all(|window| window[0] == window[1]),
+        "V7 -v alignment: {detached_v_out}"
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "longname-branch"], p),
+        "reattach for JSON",
+    );
+    let json = run_libra_command(&["--json", "branch"], p);
+    assert_cli_success(&json, "V8 --json");
+    let parsed = parse_json_stdout(&json);
+    assert_eq!(parsed["data"]["action"], "list");
+    let json_names: Vec<String> = parsed["data"]["branches"]
+        .as_array()
+        .expect("branches")
+        .iter()
+        .map(|row| row["name"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(json_names, expected, "V8 JSON order");
+    assert!(
+        parsed["data"]["branches"][0].get("display_name").is_none(),
+        "V8 fields unchanged"
+    );
+
+    for (label, args) in [
+        (
+            "V9 --format",
+            ["branch", "--format=%(refname:short)"].as_slice(),
+        ),
+        ("V9 --sort", ["branch", "--sort=refname"].as_slice()),
+        (
+            "V9 --points-at",
+            ["branch", "--points-at", "HEAD"].as_slice(),
+        ),
+        ("V9 --no-merged", ["branch", "--no-merged"].as_slice()),
+        ("V9 --no-contains", ["branch", "--no-contains"].as_slice()),
+    ] {
+        assert_cli_success(&run_libra_command(args, p), label);
+    }
+    let quiet = run_libra_command(&["--quiet", "branch"], p);
+    assert_cli_success(&quiet, "V9 --quiet");
+    assert!(
+        String::from_utf8_lossy(&quiet.stdout).trim().is_empty(),
+        "V9 quiet listing is empty"
+    );
+    let help = run_libra_command(&["branch", "--help"], p);
+    assert_cli_success(&help, "V9 --help");
+    let help_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&help.stdout),
+        String::from_utf8_lossy(&help.stderr)
+    );
+    assert!(
+        help_out.contains("--edit-description"),
+        "V9 --edit-description remains on the surface"
+    );
+}
+
+/// M-BRDEL B1–B5: `branch -d` refusals exit 1 with Git wording; `-D` /
+/// merged `-d` stay successful; `LIBRA_FINE_EXIT_CODES=1` does not win.
+#[test]
+fn test_branch_delete_refusal_exit_codes_matrix() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let current = {
+        let out = run_libra_command(&["branch", "--show-current"], p);
+        assert_cli_success(&out, "show-current");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    assert_cli_success(&run_libra_command(&["branch", "feat"], p), "create feat");
+    assert_cli_success(&run_libra_command(&["switch", "feat"], p), "switch feat");
+    std::fs::write(p.join("feat.txt"), "unmerged\n").expect("feat.txt");
+    assert_cli_success(&run_libra_command(&["add", "feat.txt"], p), "add feat.txt");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "feat work", "--no-verify"], p),
+        "commit feat",
+    );
+    assert_cli_success(&run_libra_command(&["switch", &current], p), "switch back");
+
+    let b1 = run_libra_command(&["branch", "-d", "feat"], p);
+    let (stderr, report) = parse_cli_error_stderr(&b1.stderr);
+    assert_eq!(b1.status.code(), Some(1), "B1: {stderr}");
+    assert_eq!(report.error_code, "LBR-REPO-003");
+    assert_eq!(report.exit_code, 1);
+    assert!(
+        stderr.contains("the branch 'feat' is not fully merged"),
+        "B1 wording: {stderr}"
+    );
+    assert!(stderr.contains("libra branch -D feat"), "B1 hint: {stderr}");
+
+    let b1_json = run_libra_command(&["--json", "branch", "-d", "feat"], p);
+    let (_, json_report) = parse_cli_error_stderr(&b1_json.stderr);
+    assert_eq!(b1_json.status.code(), Some(1));
+    assert_eq!(json_report.error_code, "LBR-REPO-003");
+    assert_eq!(json_report.exit_code, 1);
+
+    let b2 = run_libra_command(&["branch", "-d", "nonexistent"], p);
+    let (stderr, report) = parse_cli_error_stderr(&b2.stderr);
+    assert_eq!(b2.status.code(), Some(1), "B2: {stderr}");
+    assert_eq!(report.error_code, "LBR-CLI-003");
+    assert_eq!(report.exit_code, 1);
+    assert!(
+        stderr.contains("branch 'nonexistent' not found"),
+        "B2 wording: {stderr}"
+    );
+
+    assert_cli_success(&run_libra_command(&["branch", "topic"], p), "create topic");
+    assert_cli_success(&run_libra_command(&["switch", "topic"], p), "switch topic");
+    let b3 = run_libra_command(&["branch", "-d", "topic"], p);
+    let (stderr, report) = parse_cli_error_stderr(&b3.stderr);
+    assert_eq!(b3.status.code(), Some(1), "B3: {stderr}");
+    assert_eq!(report.error_code, "LBR-REPO-003");
+    assert_eq!(report.exit_code, 1);
+    assert!(
+        stderr.contains("Cannot delete the branch") && stderr.contains("topic"),
+        "B3 wording: {stderr}"
+    );
+
+    for (label, args) in [
+        ("B5 not merged", ["branch", "-d", "feat"].as_slice()),
+        ("B5 missing", ["branch", "-d", "nonexistent"].as_slice()),
+        ("B5 current", ["branch", "-d", "topic"].as_slice()),
+    ] {
+        let out =
+            run_libra_command_with_stdin_and_env(args, p, "", &[("LIBRA_FINE_EXIT_CODES", "1")]);
+        assert_eq!(out.status.code(), Some(1), "{label}");
+    }
+
+    assert_cli_success(
+        &run_libra_command(&["branch", "merged"], p),
+        "create merged",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "-d", "merged"], p),
+        "B4 -d merged",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "-D", "feat"], p),
+        "B4 -D feat",
+    );
 }

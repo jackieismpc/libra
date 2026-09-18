@@ -229,6 +229,9 @@ async fn test_changes_to_be_staged() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -371,6 +374,9 @@ async fn test_status_porcelain() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -391,6 +397,9 @@ async fn test_status_porcelain() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     file2.write_all(b"modified content").unwrap();
@@ -535,6 +544,9 @@ async fn test_status_short_format() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -555,6 +567,9 @@ async fn test_status_short_format() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -656,6 +671,9 @@ async fn test_status_porcelain_v2_basic() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     file1.write_all(b" more").unwrap(); // unstaged modification
@@ -740,6 +758,9 @@ async fn test_status_porcelain_v2_branch_metadata_includes_upstream_counts() {
             renormalize: false,
             ignore_missing: false,
             resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         },
         &libra::utils::output::OutputConfig::default(),
     )
@@ -817,6 +838,9 @@ async fn test_status_porcelain_v2_untracked_files_no() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -881,6 +905,9 @@ async fn test_status_porcelain_v2_untracked_files_all() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -937,6 +964,9 @@ async fn test_status_untracked_files_no() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1168,6 +1198,9 @@ async fn test_status_untracked_files_all() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1258,6 +1291,9 @@ async fn test_status_mixed_changes() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1328,6 +1364,9 @@ async fn test_status_deleted_files() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1403,6 +1442,9 @@ async fn test_status_with_subdirectories() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1495,6 +1537,9 @@ async fn test_status_verbose_output() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1555,6 +1600,9 @@ async fn test_status_short_format_with_branch() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1625,6 +1673,9 @@ async fn test_status_porcelain_format_with_branch() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1695,6 +1746,9 @@ async fn test_status_show_stash_with_existing_stash() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1723,6 +1777,9 @@ async fn test_status_show_stash_with_existing_stash() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1849,6 +1906,9 @@ async fn test_status_show_stash_without_stash() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1910,6 +1970,9 @@ async fn test_status_branch_detached_head() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1938,6 +2001,9 @@ async fn test_status_branch_detached_head() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -2015,6 +2081,9 @@ async fn test_status_porcelain_v2_file_modes_and_hashes() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(create_commit_args("Initial commit")).await;
@@ -2037,6 +2106,9 @@ async fn test_status_porcelain_v2_file_modes_and_hashes() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -2058,6 +2130,9 @@ async fn test_status_porcelain_v2_file_modes_and_hashes() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -2187,6 +2262,9 @@ async fn test_status_porcelain_v2_executable_file() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -2257,6 +2335,9 @@ async fn test_status_porcelain_v2_deleted_file() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(create_commit_args("Initial commit")).await;
@@ -2350,6 +2431,9 @@ async fn test_status_after_add() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -2999,6 +3083,9 @@ async fn test_status_short_branch_reports_up_to_date_with_fully_qualified_tracki
             renormalize: false,
             ignore_missing: false,
             resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         },
         &libra::utils::output::OutputConfig::default(),
     )
@@ -3441,4 +3528,33 @@ async fn test_status_branch_counts_shallow_boundaries() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+/// M-UPSTREAM P7 (#477 HF-07): `status` shows a local upstream (`remote=.`).
+#[test]
+fn test_status_reports_local_upstream() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(&run_libra_command(&["branch", "alpha"], p), "create alpha");
+    assert_cli_success(
+        &run_libra_command(&["branch", "-u", "main", "alpha"], p),
+        "point alpha at main",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "alpha"], p), "switch alpha");
+
+    let long = run_libra_command(&["status"], p);
+    assert_cli_success(&long, "status long");
+    let long_out = String::from_utf8_lossy(&long.stdout);
+    assert!(
+        long_out.contains("Your branch is up to date with 'main'."),
+        "P7 long status: {long_out}"
+    );
+
+    let short = run_libra_command(&["status", "--short", "--branch"], p);
+    assert_cli_success(&short, "status short");
+    let short_out = String::from_utf8_lossy(&short.stdout);
+    assert!(
+        short_out.lines().next() == Some("## alpha...main"),
+        "P7 short status: {short_out}"
+    );
 }

@@ -1068,6 +1068,18 @@ fn format_fetch_porcelain(result: &FetchOutput) -> String {
     lines.join("\n")
 }
 
+fn local_upstream_network_error(branch: &str) -> CliError {
+    CliError::command_usage(format!(
+        "cannot fetch: branch '{branch}' tracks a local upstream; \
+         network commands do not operate on local upstreams (issues/480 HP-16)"
+    ))
+    .with_stable_code(StableErrorCode::CliInvalidTarget)
+    .with_detail("remote", ".")
+    .with_detail("upstream_kind", "local")
+    .with_hint("use 'libra branch --unset-upstream' to clear the local upstream")
+    .with_hint("local-upstream network operations are tracked as issues/480 HP-16")
+}
+
 /// Force progress reporting off when `--no-progress` is set (mirroring
 /// `git fetch --no-progress`), preserving every other output setting. Returns
 /// `Some(modified)` when something changed, or `None` when progress was already
@@ -1183,6 +1195,17 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
     let remote = match repository {
         Some(remote) => remote,
         None => match ConfigKv::get_current_remote().await {
+            Ok(Some(remote)) if remote == "." => {
+                let branch = match Head::current().await {
+                    Head::Branch(name) => name,
+                    Head::Detached(_) => {
+                        return Err(CliError::fatal("HEAD is detached")
+                            .with_stable_code(StableErrorCode::RepoStateInvalid)
+                            .with_hint("switch to a branch before fetching its upstream"));
+                    }
+                };
+                return Err(local_upstream_network_error(&branch));
+            }
             Ok(Some(remote)) => remote,
             Ok(None) => {
                 return Err(

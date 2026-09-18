@@ -223,6 +223,8 @@ Git 的 `restore` 默认为仅恢复工作树，并要求 `--staged` 才能以�
 
 注意：jj 的 `restore` 作用于修订，而不是暂存区，将一个修订的内容恢复到另一个修订中。它不区分已暂存和未暂存更改。
 
+其余仍不支持的交互选项以 `LBR-UNSUPPORTED-001` 拒绝（`-p`/`--patch`，D15）。请用 `libra restore <pathspec>` 或 `libra restore --staged <pathspec>`。
+
 ## 错误处理
 
 | 代码 | 条件 |
@@ -237,3 +239,7 @@ Git 的 `restore` 默认为仅恢复工作树，并要求 `--staged` 才能以�
 | `LBR-CONFLICT-002` | 恢复会替换非空的已 materialize gitlink 目录，或会删除/覆盖 `160000` submodule 路径上并非 Libra 写入的内容——该路径上的两个方向都拒绝，除非索引把它记为普通 tracked 内容（可恢复）（退出码 128） |
 
 > `--ours` 与 `--theirs` 彼此互斥，并与 `--source`、`--staged`、`--ignore-unmerged` 互斥；任一此类组合会以 `LBR-CLI-002`、退出码 129 被拒绝。（`--source`、`--staged`、`--ignore-unmerged` 之间可以组合——例如 `--ignore-unmerged --source HEAD`。）
+
+## Issue #477 notes
+
+仍不支持的交互入口返回 `LBR-UNSUPPORTED-001`

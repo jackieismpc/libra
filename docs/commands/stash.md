@@ -429,6 +429,8 @@ Libra preserves Git's `stash@{N}` reference syntax for familiarity. Users migrat
 
 Note: jj does not have a stash command. Its change-based model allows creating anonymous changes with `jj new` that serve a similar purpose to stashing.
 
+Remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001` (`stash -p` / `stash push -p` and `--[no-]auto-advance`, D15). Use `libra stash push -m <message>` or `libra stash push -- <pathspec>`. `stash show -p` remains the non-interactive unified-diff viewer.
+
 ## Error Handling
 
 | Code | Condition |
@@ -438,3 +440,7 @@ Note: jj does not have a stash command. Its change-based model allows creating a
 | `LBR-CLI-002` | Invalid stash reference syntax |
 | `LBR-CLI-003` | Stash does not exist |
 | `LBR-CONFLICT-001` | Merge conflict during stash apply |
+
+## Issue #477 notes
+
+remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001`

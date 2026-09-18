@@ -15,7 +15,7 @@ missing, downloads them as a pack file, indexes the pack, and updates the corres
 remote-tracking refs (e.g. `refs/remotes/origin/main`). It never modifies the working
 tree or the current branch -- use `libra pull` or `libra merge` for that.
 
-When invoked with no arguments, it fetches from the current branch's configured upstream.
+When invoked with no arguments, it fetches from the current branch's configured upstream. A configured local upstream (`branch.<name>.remote=.`) is refused before any network or `FETCH_HEAD` write (`LBR-CLI-003`, exit 129); Git 2.54 `fetch` can operate on a local upstream — that support is deferred to [issues/480 HP-16](https://github.com/libra-tools/libra/issues/480). An explicit repository argument `.` keeps the existing `remote '.' not found` path.
 When `--all` is given, every configured remote is fetched in sequence. When a specific
 `<repository>` is named, only that remote is contacted. An optional `<refspec>` selects
 one source ref and may map it to an exact local destination (`<src>:<dst>`). When no
@@ -390,6 +390,7 @@ by default for maximum script friendliness.
 |----------|-----------------|------|------|
 | No configured upstream / detached HEAD | `LBR-REPO-003` | 128 | "checkout a branch or specify a remote" |
 | Remote not found | `LBR-CLI-003` | 129 | "use 'libra remote -v' to see configured remotes" |
+| Configured local upstream (`branch.<name>.remote=.`) | `LBR-CLI-003` | 129 | "use 'libra branch --unset-upstream' to clear the local upstream"; network support is issues/480 HP-16 |
 | Remote branch not found | `LBR-CLI-003` | 129 | "verify the remote branch name and try again" |
 | Invalid/mismatched fetch refspec | `LBR-CLI-002` | 129 | Use a valid `<src>:<dst>` mapping with matching optional wildcards |
 | Configured refspec read failure | `LBR-IO-001` | 128 | Inspect `remote.<name>.fetch` configuration |
@@ -619,3 +620,7 @@ reason that does not echo the remote bytes. It is no longer reported as a
 successful empty response. Check the remote Git service or proxy response before
 retrying. Valid empty repositories, supported SHA-1/SHA-256 advertisements,
 existing command hints and structured error fields retain their behavior.
+
+## Issue #477 notes
+
+refuses a local upstream (`branch.<name>.remote=.`)

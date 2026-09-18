@@ -150,6 +150,24 @@ libra add --resolved
 libra add --resolved path/to/file
 ```
 
+### `-p, --patch`
+
+交互式逐个选择 hunk 暂存。每个 hunk 打印 unified diff，并提示
+`Stage this hunk [y,n,q,a,d,s,e,p,P,?]? `（字母随当前可执行命令收缩）。
+`s` 按上下文岛拆分；`e` 用 `$GIT_EDITOR` / `core.editor` 手工编辑。
+`--auto-advance`（默认）在 `y`/`n` 后前进；`--no-auto-advance` 停留并在多文件时提供 `>`/`<`。
+不能与 `--json`、`--machine`、`--dry-run`、`--resolved` 同用。
+
+```bash
+libra add -p
+libra add -p --no-auto-advance src/main.rs
+```
+
+### `--auto-advance` / `--no-auto-advance`
+
+后者覆盖前者。没有 `-p`/`--patch` 时 `--no-auto-advance` 为 128：
+`the option '--no-auto-advance' requires '--interactive/--patch'`。
+
 ## 常用命令
 
 ```bash
@@ -164,6 +182,7 @@ libra add ':(glob)src/*.rs' ':(exclude)src/generated.rs'
 libra add --chmod=+x scripts/build.sh
 libra add --renormalize
 libra add --resolved
+libra add -p
 ```
 
 未合并（冲突）路径也在同一候选集里：`add`、`add -A`、`add .`、`add -u` 会把工作树内容写入 stage 0，并在同一索引事务里删掉 stage 1–3。普通 `add` 不检查残留冲突标记（`--resolved` 会检查）。解决后的未合并路径记为 modified，而不是 new file。
@@ -282,9 +301,11 @@ Dry-run：
 
 Git 的 `--intent-to-add`（`-N`）会为未跟踪文件记录空 blob，使它们出现在 `git diff` 输出中，但不真正暂存其内容。这是为了在暂存前审查新文件的工作流便利。Libra 省略该标志，因为 `libra status` 已经清楚显示未跟踪文件，且 `libra diff` 设计为配合完整工作树状态工作。“intent 然后 stage”的两步工作流增加认知负担，却没有显著改善审查体验。想在提交前审查新文件的用户可以使用 `libra add --dry-run`，暂存后再使用 `libra diff --staged`。
 
-### 没有 `--patch` / `-p` 交互式暂存
+### `--patch` / `-p` 交互式暂存
 
-Git 的 `--patch` 模式在终端内提供逐 hunk 的交互式暂存接口。Libra 有意从 CLI `add` 命令中省略交互式暂存，因为 `libra code` Web Code UI 提供更丰富的可视暂存体验，支持完整文件和 hunk 选择。交互式终端提示也不兼容 AI 代理工作流（MCP/stdio 模式），这是 Libra 的主要设计目标。保持 `libra add` 非交互，确保它在人类、脚本和代理上下文中行为一致。
+`libra add -p` 是与 Git 兼容的 hunk 会话（`y/n/q/a/d/j/J/k/K/g///s/e/p/P/?`、
+`--[no-]auto-advance`）。`--json` / `--machine` / `--dry-run` 仍拒绝与 patch 会话组合，
+以便代理保持非交互路径。`add -i` 仍按 D15 延后。
 
 ### `--refresh` 作为显式标志
 
@@ -316,7 +337,7 @@ Git 或双布局树还包括 `.git/info/exclude`——和 `core.excludesFile`）
 | Verbose 输出 | `git add -v` | N/A | `libra add -v` |
 | 忽略错误 | `git add --ignore-errors` | N/A | `libra add --ignore-errors` |
 | Intent to add | `git add -N` / `--intent-to-add` | N/A | N/A（未实现） |
-| 交互式 patch | `git add -p` / `--patch` | N/A | N/A（使用 `libra code` Web Code UI） |
+| 交互式 patch | `git add -p` / `--patch` | N/A | `libra add -p` / `--patch` |
 | 交互式选择 | `git add -i` / `--interactive` | N/A | N/A（使用 `libra code` Web Code UI） |
 | 暂存前编辑 diff | `git add -e` / `--edit` | N/A | N/A |
 | 仅 chmod | `git add --chmod=+x` | N/A | N/A |
@@ -361,3 +382,8 @@ Git 或双布局树还包括 `.git/info/exclude`——和 `core.excludesFile`）
 - Libra 的 `add` 是 `commit` 前必需步骤，匹配 Git 的显式暂存模型
 - `.gitignore` 与 `.libraignore` 都使用 Git ignore 模式语法；同目录内 `.libraignore` 可显式覆盖 `.gitignore`，导入和非 bare clone 仍会复制 `.gitignore` 规则，而不是删除或重命名原文件
 - LFS 跟踪文件会在暂存期间自动转换为指针文件
+- 其余仍不支持的交互选项以 `LBR-UNSUPPORTED-001` 拒绝（`-i`/`--interactive`，D15 剩余入口）。请用 `libra add -p` 或 `libra add <pathspec>`。
+
+## Issue #477 notes
+
+仍不支持的交互入口返回 `LBR-UNSUPPORTED-001`

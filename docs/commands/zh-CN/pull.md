@@ -22,7 +22,7 @@ libra pull [--ff-only] [--ff] [--no-ff] [--squash] [--no-commit] [--commit] [--a
 
 未传命令行集成标志时，Libra 会按本地、全局、系统配置的顺序读取 Git 风格的 pull 默认值（变量名不区分大小写）：`branch.<name>.rebase` 覆盖 `pull.rebase`，`pull.ff` 接受 `true`、`false` 或 `only`。本地和全局的加密值会先解密再校验。Git 的 `pull.rebase=merges`/`interactive`（以及 `m`/`i`）会被识别为不支持的模式，并以可操作的 `LBR-CLI-002` 诊断拒绝。命令行标志仍优先于配置。空值或其他无效的本地/全局配置会在 fetch 或集成前以 `LBR-CLI-002` 失败；本地/全局配置读取失败以 `LBR-IO-001` 失败。不可读或不支持的 system 配置 scope 会跳过，继续尝试低优先级默认值或内置 merge 行为。
 
-不带参数调用时，命令读取当前分支 tracking 配置（`branch.<name>.remote` 和 `branch.<name>.merge`）。只给出 `<repository>` 时，当前分支名会被用作远程分支。同时给出 `<repository>` 和 `<refspec>` 时，会获取并合并指定远程分支。
+不带参数调用时，命令读取当前分支 tracking 配置（`branch.<name>.remote` 和 `branch.<name>.merge`）。已配置的本地 upstream（`branch.<name>.remote=.`，由 `libra branch -u <本地分支>` 写入）会在任何网络或 `FETCH_HEAD` 写入前被拒绝（`LBR-CLI-003`，退出 129）；Git 2.54 的 `fetch`/`pull` 可以对本地 upstream 操作——该支持延后到 [issues/480 HP-16](https://github.com/libra-tools/libra/issues/480)。显式仓库参数 `.` 仍走现有的 `remote '.' not found`。只给出 `<repository>` 时，当前分支名会被用作远程分支。同时给出 `<repository>` 和 `<refspec>` 时，会获取并合并指定远程分支。
 
 pull 的 merge 阶段开始前继承 `libra merge` 的索引检查。没有 merge 状态但索引仍有未解决条目时（例如冲突 squash 后），即使获取到的目标已最新，也会以 `LBR-CONFLICT-002` 拒绝（退出 128，`phase: "merge"`）。该阶段保持 HEAD、索引和工作树原样，提示先解决冲突、用 `libra add` 暂存，再运行普通 `libra commit`。已有 merge 状态仍使用 `merge --continue` / `--abort` 提示。拒绝发生前 fetch 可能已经下载对象并更新远程跟踪引用，因此这不是整个 pull 的零写入保证。
 
@@ -254,6 +254,7 @@ Rebase 输出省略 `merge` 并包含 `rebase`：
 | HEAD detached | `LBR-REPO-003` | 128 | "checkout a branch before pulling" |
 | 分支没有 tracking 信息 | `LBR-REPO-003` | 128 | Git 风格 advisory block，包含 `libra pull <remote> <branch>` 和 `libra branch --set-upstream-to=...` |
 | 找不到远程 | `LBR-CLI-003` | 129 | "use 'libra remote -v' to see configured remotes" |
+| 已配置本地 upstream（`branch.<name>.remote=.`） | `LBR-CLI-003` | 129 | 用 `libra branch --unset-upstream` 清除；网络支持见 issues/480 HP-16 |
 | `pull.rebase`、`branch.<name>.rebase` 或 `pull.ff` 配置值无效 | `LBR-CLI-002` | 129 | "libra config <key> <value>" |
 | 不支持的 `pull.rebase=merges|interactive` 模式 | `LBR-CLI-002` | 129 | 使用布尔 rebase 或显式的受支持 pull 标志 |
 | `merge.renames` / `merge.renameLimit` / `merge.directoryRenames` / `merge.renormalize` 配置值无效（继承自 `libra merge`） | `LBR-REPO-003` | 128 | 把对应 merge 配置设为支持值或删除 |
@@ -419,3 +420,7 @@ HTTP(S) 广告声明仓库为空后，仍会校验剩余的全部 pkt-line 帧�
 原因固定且不回显远端字节，不再误报为空仓库成功。重试前请核对远端 Git 服务或代理
 响应。合法空仓库、支持的 SHA-1/SHA-256 广告、既有命令 hint 和结构化错误字段保持
 原有行为。
+
+## Issue #477 notes
+
+拒绝对本地 upstream（`remote=.`）执行

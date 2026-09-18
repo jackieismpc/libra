@@ -27,7 +27,7 @@ libra upgrade [--check | -y|--yes]
 4. If a newer version exists, shows both versions and the download size, and
    asks for confirmation (`[y/N]`, default **No**).
 5. On confirmation, downloads the artifact (sha256 and size enforced during
-   streaming, ≤ 128 MiB), stages it next to the installed binary, runs a
+   streaming, ≤ 256 MiB), stages it next to the installed binary, runs a
    pre-install self-check, and commits an atomic install transaction with a
    post-install probe — a failing probe rolls back to the previous binary
    automatically.

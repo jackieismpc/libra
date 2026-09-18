@@ -25,6 +25,8 @@ const ISSUE_URL: &str = "https://github.com/libra-tools/libra/issues";
 const TAG_EXAMPLES: &str = "\
 EXAMPLES:
     libra tag v1.0                        Create a lightweight tag at HEAD
+    libra tag -a -m \"Release v1.1\" v1.1 Create an annotated tag
+    libra tag -a v1.1                     Compose the annotated-tag message in an editor
     libra tag -m \"Release v1.1\" v1.1    Create an annotated tag
     libra tag -F notes.txt v1.1           Annotated tag with message from a file (- for stdin)
     libra tag -e v1.1                     Compose the annotated-tag message in an editor
@@ -60,11 +62,17 @@ pub struct TagArgs {
     #[clap(short = 'F', long = "file", conflicts_with = "message")]
     pub file: Option<String>,
 
+    /// Create an annotated tag. Combined with `-m`/`-F`/`-e` this creates an
+    /// annotated tag; used alone it opens an editor (empty cleaned message
+    /// aborts and writes no ref). Combined with list, delete, or verify it is
+    /// a usage error.
+    #[clap(short = 'a', long = "annotate")]
+    pub annotate: bool,
+
     /// Open an editor to compose or edit the annotated-tag message. With `-m`/
     /// `-F` the editor is pre-filled with that message for further editing;
-    /// without them it composes a new message. Because Libra has no separate
-    /// `-a`, `-e` is the editor-driven way to create an annotated tag — an empty
-    /// message after stripping comments aborts the tag.
+    /// without them it composes a new message. `-a` alone is the same editor
+    /// path. An empty message after stripping comments aborts the tag.
     #[clap(short = 'e', long = "edit")]
     pub edit: bool,
 
@@ -181,8 +189,8 @@ pub async fn execute_safe(args: TagArgs, output: &OutputConfig) -> CliResult<()>
 }
 
 pub(crate) fn validate_cli_args(args: &TagArgs) -> CliResult<()> {
-    validate_named_tag_action(args).map_err(CliError::from)?;
     validate_message_source_create_only(args).map_err(CliError::from)?;
+    validate_named_tag_action(args).map_err(CliError::from)?;
     // Validate the `--column` mode up front so an invalid mode is rejected for
     // every output mode (including `--json`/`--quiet`, which skip the human
     // column renderer). The boolean enable decision is recomputed at render.
@@ -197,9 +205,9 @@ pub(crate) fn validate_cli_args(args: &TagArgs) -> CliResult<()> {
 /// delete, verify, or any list filter so an invalid invocation is a usage
 /// error rather than silently ignoring the message (or performing a delete).
 fn validate_message_source_create_only(args: &TagArgs) -> Result<(), TagError> {
-    // `-e`/`--edit` is the editor-driven annotated-tag creation mode, so it is a
-    // create-only option just like `-m`/`-F`.
-    if args.message.is_none() && args.file.is_none() && !args.edit {
+    // `-e`/`--edit` and `-a`/`--annotate` are annotated-tag creation modes, so
+    // they are create-only options just like `-m`/`-F`.
+    if args.message.is_none() && args.file.is_none() && !args.edit && !args.annotate {
         return Ok(());
     }
     let non_create = args.list
@@ -215,7 +223,8 @@ fn validate_message_source_create_only(args: &TagArgs) -> Result<(), TagError> {
         || args.column.is_some();
     if non_create {
         return Err(TagError::MessageOptionRequiresCreate(
-            "-m/--message, -F/--file, and -e/--edit are only valid when creating a tag".to_string(),
+            "-m/--message, -F/--file, -e/--edit, and -a/--annotate are only valid when creating a tag"
+                .to_string(),
         ));
     }
     Ok(())
@@ -387,7 +396,7 @@ impl From<TagError> for CliError {
             }
             TagError::MessageOptionRequiresCreate(_) => CliError::command_usage(message)
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
-                .with_hint("-m/--message, -F/--file, and -e/--edit create a tag; drop the listing/delete/verify options."),
+                .with_hint("-m/--message, -F/--file, -e/--edit, and -a/--annotate create a tag; drop the listing/delete/verify options."),
             TagError::MessageFileRead { .. } => CliError::fatal(message)
                 .with_stable_code(StableErrorCode::IoReadFailed)
                 .with_hint("check that the message file path exists and is readable."),
@@ -553,6 +562,8 @@ fn validate_named_tag_action(args: &TagArgs) -> Result<(), TagError> {
         Some("tag name is required when using --message/--file")
     } else if args.edit {
         Some("tag name is required when using --edit")
+    } else if args.annotate {
+        Some("tag name is required when using --annotate")
     } else if args.force {
         Some("tag name is required for --force")
     } else {
@@ -604,11 +615,10 @@ fn map_create_tag_error(tag_name: &str, error: tag::CreateTagError) -> TagError 
 }
 
 async fn run_tag(args: &TagArgs) -> Result<TagOutput, TagError> {
-    validate_named_tag_action(args)?;
-    // Enforced here (not only in the cli.rs preflight) so every entry point —
-    // including direct/programmatic `execute_safe` callers — rejects misusing a
-    // message source with a non-create mode rather than silently deleting.
+    // Create-only checks first so `tag -a -l` / `tag -e -d` report the mode
+    // conflict (129) instead of a missing-name error.
     validate_message_source_create_only(args)?;
+    validate_named_tag_action(args)?;
     util::require_repo().map_err(|_| TagError::NotInRepo)?;
 
     if args.verify {
@@ -701,10 +711,13 @@ async fn run_tag(args: &TagArgs) -> Result<TagOutput, TagError> {
     }
 
     let base_message = resolve_tag_message(args)?;
-    // `-e`/`--edit` opens an editor on the (optional) base message; the edited,
-    // comment-stripped result becomes the annotated-tag message. Without `-e`
-    // the base message is used as-is (annotated iff `-m`/`-F` was given).
-    let message = if args.edit {
+    // `-e`/`--edit` opens an editor on the (optional) base message. `-a` alone
+    // is the same editor path (ADR-HF-11). Combined with `-m`/`-F` the base
+    // message is used as-is (annotated). Without `-a`/`-e`/`-m`/`-F` the tag
+    // is lightweight.
+    let wants_editor =
+        args.edit || (args.annotate && args.message.is_none() && args.file.is_none());
+    let message = if wants_editor {
         Some(compose_tag_message(name, base_message.as_deref()).await?)
     } else {
         base_message

@@ -972,6 +972,9 @@ async fn stage_targets(targets: &[String]) -> CliResult<()> {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     };
     run_add(&args).await.map(|_| ()).map_err(|error| {
         am_state_error(format!(
@@ -1270,6 +1273,9 @@ async fn reset_hard(target: &str, output: &OutputConfig) -> CliResult<()> {
             pathspec_from_file: None,
             pathspec_file_nul: false,
             no_refresh: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         },
         &child,
     )

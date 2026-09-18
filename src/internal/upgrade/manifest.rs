@@ -40,8 +40,8 @@ pub const ARTIFACT_HOST: &str = "download.libra.tools";
 /// Maximum accepted manifest size (§A.6 体积).
 pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 
-/// Maximum accepted artifact size (§A.6 体积: `0 < size <= 128MiB`).
-pub const MAX_ARTIFACT_BYTES: u64 = 128 * 1024 * 1024;
+/// Maximum accepted artifact size (§A.6 体积: `0 < size <= 256MiB`).
+pub const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// A strictly-parsed release version: `X.Y.Z`, no prerelease/build metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -743,5 +743,20 @@ mod tests {
             verify_envelope_bytes(&big, &test_trust(1)),
             Err(ManifestError::TooLarge)
         ));
+    }
+
+    #[test]
+    fn installers_pin_the_same_artifact_size_cap() {
+        let cap = MAX_ARTIFACT_BYTES.to_string();
+        let install_sh = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/install.sh"));
+        let install_ps1 = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/install.ps1"));
+        assert!(
+            install_sh.contains(&format!("-gt {cap}")),
+            "install.sh must refuse sizes above MAX_ARTIFACT_BYTES ({cap})"
+        );
+        assert!(
+            install_ps1.contains(&format!("-gt {cap}")),
+            "install.ps1 must refuse sizes above MAX_ARTIFACT_BYTES ({cap})"
+        );
     }
 }

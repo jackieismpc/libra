@@ -8,23 +8,24 @@
 
 ```
 libra branch [<new_branch>] [<commit_hash>]
+libra branch [-t | --track[=direct|inherit] | --no-track] <new_branch> [<start-point>]
 libra branch -l [-r | -a] [--contains <commit>] [--no-contains <commit>] [--points-at <object>] [--merged [<commit>]] [--no-merged [<commit>]] [--sort <key>] [--ignore-case] [--format <format>] [--column[=<mode>]] [-v | --verbose]
 libra branch -d <name>
 libra branch -D <name>
 libra branch -m [<old>] <new>
 libra branch (-c | -C) [<old>] <new>
-libra branch -u <upstream>
+libra branch -u <upstream> [<branch>]
 libra branch --edit-description [<branch>]
 libra branch --show-current
 ```
 
 ## 说明
 
-`libra branch` 管理存储在 SQLite 数据库中的本地和远程跟踪分支引用。不带参数时，它列出本地分支，并用星号高亮当前分支。给出位置参数 `<new_branch>` 时，它会创建一个指向 HEAD 的新分支；如果同时提供 `<commit_hash>`，则指向该提交。
+`libra branch` 管理存储在 SQLite 数据库中的本地和远程跟踪分支引用。不带参数时，它按 refname 列出本地分支，并用 `*` 标记当前分支（不再置顶）。`-v` / `-vv` 按本次最长显示名对齐名称列，分离 HEAD 时首行为 `* (HEAD detached at <abbrev7>)`。`-a` 将远程跟踪名显示为 `remotes/<remote>/<branch>`，`-r` 省略 `remotes/` 前缀。给出位置参数 `<new_branch>` 时，它会创建一个指向 HEAD 的新分支；如果同时提供 `<commit_hash>`，则指向该提交。
 
 删除有两种形式：`-d` 执行安全删除，移除前会检查该分支是否已完全合并到当前分支；`-D` 无论合并状态如何都会强制删除。两者都拒绝删除你当前所在的分支。
 
-`--contains` 和 `--no-contains` 过滤器（别名为 `--with` 和 `--without`）可将分支列表缩小到历史中包含或不包含某个提交的分支；省略提交参数时默认为 HEAD。`--points-at <object>` 只列出 tip 等于解析后提交的分支；附注标签名和完整 `refs/tags/...` 名会递归剥离到目标提交。`--merged [<commit>]` / `--no-merged [<commit>]` 列出已合并（或尚未合并）入某提交的分支——即 tip 是否可从该提交到达，缺省 HEAD，是 `--contains` 的反方向。`--sort <key>` 按 `refname`、`version:refname`（数值感知）、`committerdate`/`creatordate`/`authordate`（tip 提交的 committer 日期，`authordate` 为 author 日期）、`objectsize`（tip 对象字节大小）或 `objectname`（tip 提交的对象 id）排序，前导 `-` 反转。未传该标志时，Git 兼容的 `branch.sort` 配置默认生效（严格 local → global → system 级联；无效值在任何列表输出前以 `LBR-CLI-002` fail-closed，local/global 读取失败为 `LBR-IO-001`——例外：schema 比二进制新的全局配置库会在一次性警告后被跳过，见 `LBR-CONFIG-001`）。与标志不同，配置默认既不隐含 `--list` 也不抑制 unborn-HEAD 行，与 Git 一致。已记录收窄：Git 会把重复的 `branch.sort` 值叠成多键排序；Libra 只应用胜出 scope 的最后一个值。
+`--contains` 和 `--no-contains` 过滤器（别名为 `--with` 和 `--without`）可将分支列表缩小到历史中包含或不包含某个提交的分支；省略提交参数时默认为 HEAD。`--points-at <object>` 只列出 tip 等于解析后提交的分支；附注标签名和完整 `refs/tags/...` 名会递归剥离到目标提交。`--merged [<commit>]` / `--no-merged [<commit>]` 列出已合并（或尚未合并）入某提交的分支——即 tip 是否可从该提交到达，缺省 HEAD，是 `--contains` 的反方向。`--sort <key>` 按 `refname`、`version:refname`（数值感知）、`committerdate`/`creatordate`/`authordate`（tip 提交的 committer 日期，`authordate` 为 author 日期）、`objectsize`（tip 对象字节大小）或 `objectname`（tip 提交的对象 id）排序，前导 `-` 反转。未传该标志时，Git 兼容的 `branch.sort` 配置默认生效（严格 local → global → system 级联；无效值在任何列表输出前以 `LBR-CLI-002` fail-closed，local/global 读取失败为 `LBR-IO-001`——例外：schema 比二进制新的全局配置库会在一次性警告后被跳过，见 `LBR-CONFIG-001`）。与标志不同，配置默认既不隐含 `--list` 也不抑制 unborn-HEAD 行，与 Git 一致。已记录收窄：Git 会把重复的 `branch.sort` 值叠成多键排序；Libra 只应用胜出 scope 的最后一个值。`--ignore-case` 仍按折叠后的名称排序。
 
 ## 选项
 
@@ -35,7 +36,9 @@ libra branch --show-current
 | `-l` | `--list` | | 列出分支（未指定动作时默认） |
 | `-D` | `--delete-force` | `<name>` | 强制删除分支，即使未完全合并 |
 | `-d` | `--delete` | `<name>` | 安全删除分支（必须已完全合并） |
-| `-u` | `--set-upstream-to` | `<upstream>` | 为当前分支设置 upstream tracking |
+| `-u` | `--set-upstream-to` | `<upstream> [<branch>]` | 为当前分支（或给出的 `<branch>`）设置 upstream。本地分支名会写入 `branch.<name>.remote=.` 与 `branch.<name>.merge=refs/heads/<upstream>`。把分支设成自己的 upstream 只警告、不写配置。 |
+| `-t` | `--track[=direct\|inherit]` | | 创建分支时按起点配置 tracking（`direct` 为默认），或复制起点分支的 upstream（`inherit`）。起点是提交哈希时拒绝（`LBR-CLI-003`，退出 129；Git 为 128，属有意差异 ADR-HF-02）且不创建分支。与 `-d` / `-m` / `--list` 组合或单独使用时忽略 `--track`。 |
+| | `--no-track` | | 创建分支时不写 tracking 配置。 |
 | | `--edit-description` | `[branch]` | 在配置的编辑器中编辑分支描述（`branch.<name>.description`）；空/仅注释的缓冲会清除该描述。默认当前分支。 |
 | | `--show-current` | | 打印当前分支名或 detached HEAD 状态 |
 | `-m` | `--move` | `<old> <new>` 或 `<new>` | 重命名分支；一个参数时重命名当前分支 |
@@ -63,6 +66,11 @@ libra branch feature-x
 # 从另一个分支或提交创建分支
 libra branch feature-x main
 libra branch hotfix abc1234
+
+# 创建并跟踪起点（或复制该分支的 upstream）
+libra branch --track t1 main
+libra branch --track=inherit t3 t1
+libra branch --no-track t4 main
 
 # 列出本地分支
 libra branch -l
@@ -104,6 +112,7 @@ libra branch -c old-name new-name
 
 # 设置 upstream tracking
 libra branch -u origin/main
+libra branch -u main alpha              # 让 alpha 跟踪本地分支 main
 
 # 显示当前分支名
 libra branch --show-current
@@ -126,7 +135,7 @@ libra branch --json --show-current      # 面向代理的结构化 JSON 输出
 
 ## 人类可读输出
 
-- List：打印分支列表，用 `*` 标记当前分支
+- List：按 refname 打印分支列表，用 `*` 标记当前分支；`-v`/`-vv` 按最长名对齐名称列
 - 安全删除：`Deleted branch feature (was abc123...)`
 - 重命名：`Renamed branch 'old' to 'new'`
 - 复制：`Copied branch 'old' to 'new'`
@@ -190,10 +199,6 @@ Show-current 动作：
 
 ## 设计理由
 
-### 为什么没有 --track/--no-track？
-
-Git 的 `--track` 和 `--no-track` 标志控制新分支是否自动设置 upstream 关系。Libra 在 `branch` 中省略它们，因为 tracking 配置通过 `--set-upstream-to` 显式处理，或在 switch 时通过 `libra switch --track` 处理。这种分离让 `branch` 专注于 ref 创建，并避免 `git branch feature origin/feature` 静默配置 tracking 这种令人困惑的隐式行为。当代理创建分支时，它应当知道是否配置了 tracking；显式优于隐式。
-
 ### 为什么 `--contains`/`--no-contains` 有别名 --with/--without？
 
 `--contains` 和 `--no-contains` 标志镜像 Git 以保持兼容，但 Libra 增加了更短的 `--with` 和 `--without` 别名。它们在脚本中读起来更自然（`libra branch --with v2.0`）并减少输入。标志接受可选提交参数，默认为 HEAD，覆盖了“哪些分支包含我当前工作？”这个最常见场景。
@@ -220,7 +225,7 @@ Git 将分支引用存储为 `.git/refs/heads/` 下的单独文件。这在规�
 | 删除（强制） | `git branch -D <name>` | `libra branch -D <name>` | `jj branch delete <name>`（总是强制） |
 | 重命名 | `git branch -m <old> <new>` | `libra branch -m <old> <new>` | 不支持 |
 | 复制 | `git branch -c <old> <new>` | `libra branch -c <old> <new>`（`-C` 强制） | 不支持 |
-| 设置 upstream | `git branch -u <upstream>` | `libra branch -u <upstream>` | N/A（无 upstream 概念） |
+| 设置 upstream | `git branch -u <upstream> [<branch>]` | `libra branch -u <upstream> [<branch>]`（本地分支写入 `remote=.`） | N/A（无 upstream 概念） |
 | 显示当前 | `git branch --show-current` | `libra branch --show-current` | `jj log -r @` |
 | 远程分支 | `git branch -r` | `libra branch -r` | `jj branch list --all` |
 | 所有分支 | `git branch -a` | `libra branch -a` | `jj branch list --all` |
@@ -230,7 +235,7 @@ Git 将分支引用存储为 `.git/refs/heads/` 下的单独文件。这在规�
 | 自定义格式 | `git branch --format <format>` | `libra branch --format <format>`（for-each-ref atom；取代 `* name`/`-v`/`--column`） | N/A |
 | 列布局 | `git branch --column[=<mode>]` | `libra branch --column[=<mode>]`（`--no-column` 撤销） | N/A |
 | 详细列表 | `git branch -v` / `-vv` | `libra branch -v`（sha + subject）/ `-vv`（+ 上游 tracking） | N/A |
-| 自动 tracking | `git branch --track` | N/A（使用 `switch --track`） | N/A |
+| 自动 tracking | `git branch --track[=direct\|inherit]` / `--no-track` | `libra branch --track[=direct\|inherit]` / `--no-track`（哈希起点为 129 / `LBR-CLI-003`；Git 为 128） | N/A |
 | 结构化输出 | 无 | `--json` / `--machine` | `--template` |
 | 模糊建议 | 无 | 基于 Levenshtein 的 "did you mean" | 无 |
 
@@ -239,12 +244,24 @@ Git 将分支引用存储为 `.git/refs/heads/` 下的单独文件。这在规�
 | 场景 | 错误码 | 提示 |
 |----------|-----------|------|
 | 无效起点或缺少分支 | `LBR-CLI-003` | "use 'libra branch -l' to list branches" + 模糊建议 |
+| `-u` 的 upstream 或目标分支不存在 | `LBR-CLI-003` | 文案对齐 Git（`the requested upstream branch '…' does not exist` / `branch '…' does not exist`）；退出码 **129**（Git 为 128，有意差异，ADR-HF-02） |
+| `-u` 参数过多 | `LBR-CLI-002` | `too many arguments to set new upstream`（退出码 129；Git 为 128） |
+| `--track` 起点不是分支 | `LBR-CLI-003` | `cannot set up tracking information; starting point '…' is not a branch`（退出码 129；Git 为 128，有意差异 ADR-HF-02） |
 | 无效分支名 | `LBR-CLI-002` | "branch names cannot contain spaces, '..', '@{', or control characters." |
 | 分支已存在 | `LBR-CONFLICT-002` | "delete it first or choose a different name." |
-| 不能删除当前分支 | `LBR-REPO-003` | "switch to a different branch first." |
-| 分支未完全合并（安全删除） | `LBR-REPO-003` | "use '-D' to force-delete." |
+| 不能删除当前分支 | `LBR-REPO-003` | "switch to a different branch first." `-d` 三类拒绝（未完全合并、不存在、当前检出）退出码为 **1**；`LIBRA_FINE_EXIT_CODES=1` 不能覆盖。 |
+| 分支未完全合并（安全删除） | `LBR-REPO-003` | `the branch '…' is not fully merged` 与 `libra branch -D …`（退出码 **1**） |
 | 锁定/内部分支 | `LBR-CLI-003` | -- |
 | HEAD detached（rename/upstream） | `LBR-REPO-003` | -- |
 | 无法写入 refs | `LBR-IO-002` | -- |
 | 存储查询失败 | `LBR-IO-001` | -- |
 | 存储的引用损坏 | `LBR-REPO-002` | -- |
+
+## Issue #477 notes
+
+本地分支作为 upstream（`branch.<name>.remote=.`）
+无效的 `-u` 目标以 129 结束（Git 为 128）
+创建分支时按 `--track` / `--no-track` 写入跟踪配置
+`--track <提交>` 以 129 拒绝（Git 为 128）
+按 refname 排序，当前分支只标记不置顶
+`branch -d` 的三类拒绝以退出码 1 结束

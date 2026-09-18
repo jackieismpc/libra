@@ -6,6 +6,7 @@ Move `HEAD` and reset the index or working tree depending on the selected mode.
 
 ```
 libra reset [<target>] [--soft | --mixed | --hard | --merge | --keep]
+libra reset -p/--patch [<tree-ish>] [--] [<pathspec>...]
 libra reset <pathspec>...
 libra reset [<target>] [--] <pathspec>...
 libra reset [<target>] --pathspec-from-file=<file> [--pathspec-file-nul]
@@ -32,7 +33,9 @@ unsupported diagnostic.
 
 When pathspecs are provided, the command performs a targeted mixed reset: only the named files are reset in the index to match the target commit, without moving HEAD. This is the primary way to un-stage specific files. Like Git, a bare first positional that is a known path and not a revision is treated as a pathspec with target `HEAD`, so `libra reset src/lib.rs` is equivalent to `libra reset HEAD -- src/lib.rs`. If a token is both a revision and a filename, reset refuses it as ambiguous; use `libra reset <revision> -- <file>` for a target revision or `libra reset -- <file>` for a path. Pathspecs are incompatible with `--soft`, `--hard`, `--merge`, and `--keep`. When a pathspec reset restores a symlink from the target commit, the index entry keeps mode `120000` and the blob remains the link target bytes.
 
-A whole-tree reset (no pathspecs) ends a stopped sequence item only when its resulting index has no unresolved conflict stages: it clears a stopped single-commit cherry-pick or revert, so the next pick or revert starts cleanly. A multi-commit sequence keeps its remaining commits and records that the stopped commit was concluded here; finish it with `libra cherry-pick --skip` (or `--quit`) or `libra revert --skip` to apply remaining commits on the reset target. `libra revert --abort` instead restores the pre-revert HEAD/index/tracked files and discards later tracked changes. A reset with pathspecs changes no sequence state, and in-progress rebase and merge metadata are left alone. When a stopped pick or revert exists and `--soft` leaves conflict stages untouched or `--merge` carries them forward, reset warns and preserves the complete stopped state so the existing operation can still be continued or aborted. Libra retains its existing ability to perform a soft reset with an unmerged index; Git refuses that soft reset. If the post-reset index cannot be read, state is also preserved with a warning; the already-completed reset is not rolled back. If other bookkeeping fails, the reset still succeeds and the leftover state is named in a warning. In a repository with linked-worktree history (including removed worktrees), a common-storage revert sidecar without proven main-worktree ownership is left byte-for-byte unchanged. Reset still succeeds and warns to inspect it with `libra worktree doctor`; it neither deletes that evidence nor assigns it a new owner.
+A whole-tree reset (no pathspecs) ends a stopped sequence item only when its resulting index has no unresolved conflict stages: it clears a stopped single-commit cherry-pick or revert, so the next pick or revert starts cleanly. A multi-commit sequence keeps its remaining commits and records that the stopped commit was concluded here; finish it with `libra cherry-pick --skip` (or `--quit`) or `libra revert --skip` to apply remaining commits on the reset target. `libra revert --abort` instead restores the pre-revert HEAD/index/tracked files and discards later tracked changes. A reset with pathspecs changes no sequence state, and in-progress rebase metadata is left alone. A whole-tree reset also clears an in-progress merge (`merge-state.json`); if that merge held an autostash, the held commit is promoted into the stash list first. Promotion failure leaves both merge sidecars in place and still exits 0 with a warning naming `libra merge --abort`. When a stopped pick or revert exists and `--soft` leaves conflict stages untouched or `--merge` carries them forward, reset warns and preserves the complete stopped state so the existing operation can still be continued or aborted. Libra retains its existing ability to perform a soft reset with an unmerged index; Git refuses that soft reset. If the post-reset index cannot be read, state is also preserved with a warning; the already-completed reset is not rolled back. If other bookkeeping fails, the reset still succeeds and the leftover state is named in a warning. In a repository with linked-worktree history (including removed worktrees), a common-storage revert sidecar without proven main-worktree ownership is left byte-for-byte unchanged. Reset still succeeds and warns to inspect it with `libra worktree doctor`; it neither deletes that evidence nor assigns it a new owner.
+
+`libra reset -p` / `--patch` interactively selects hunks. Against `HEAD` (also `@` or a bare `-p`) the session asks `Unstage this hunk` and reverses the cached diff onto the index. Against any other commit or tree it asks `Apply this hunk to index` and shows a reverse header (`diff --git b/<path> a/<path>`). HEAD and the worktree are never written. A blob or unknown `reset -p` target exits 129 with `LBR-CLI-003` for a blob or unknown `reset -p` target (Git exits 128). `--[no-]auto-advance` is last-wins; `--no-auto-advance` without `-p` is refused. `-p` cannot be combined with `--soft`/`--mixed`/`--hard`/`--merge`/`--keep` or `--json`.
 
 The default target is `HEAD`, making `libra reset` (with no arguments) equivalent to un-staging everything.
 
@@ -52,6 +55,7 @@ Revert currently stores textual conflicts as stage-0 blobs. A whole-tree reset a
 | | `--pathspec-from-file` | `<file>` | Read pathspecs from a file (`-` for stdin) instead of the command line. Mutually exclusive with command-line pathspecs |
 | | `--pathspec-file-nul` | | Treat `--pathspec-from-file` input as NUL-separated rather than line-separated. No-op without `--pathspec-from-file` |
 | | `--no-refresh` | | Accepted for Git compatibility; a no-op in Libra (see below) |
+| `-p` | `--patch` | optional `[<tree-ish>]` | Interactively unstage or apply hunks to the index. `--[no-]auto-advance` last-wins |
 
 ### Reading pathspecs from a file
 
@@ -109,6 +113,9 @@ printf 'a.txt\0b.txt' | libra reset --pathspec-from-file=- --pathspec-file-nul
 
 # JSON output for agents
 libra reset --json --hard HEAD~1
+
+# Interactively unstage hunks (Unstage this hunk)
+libra reset -p
 ```
 
 ## Common Commands
@@ -123,6 +130,7 @@ libra reset src/lib.rs                 # Unstage a path back to HEAD
 libra reset HEAD -- src/lib.rs        # Unstage a path back to HEAD
 libra reset --pathspec-from-file=paths.txt   # Unstage paths read from a file ('-' for stdin)
 libra reset --json --hard HEAD~1      # Structured JSON output for agents
+libra reset -p                        # Interactively unstage hunks
 ```
 
 ## Human Output
@@ -227,12 +235,15 @@ Mixed mode is the safest general-purpose reset: it un-stages changes without dis
 | Pathspec from file + CLI pathspec | Rejected | Rejected (`LBR-CLI-002`) | N/A |
 | Rollback on failure | No | Classic modes attempt commit-tree rollback; `--merge`/`--keep` restore exact index/worktree snapshots | N/A (operation log undo) |
 
+`reset -p` / `--patch [<tree-ish>]` is supported. Other remaining interactive options fail with `LBR-UNSUPPORTED-001` (D15).
+
 ## Error Handling
 
 | Scenario | Error Code | Hint |
 |----------|-----------|------|
 | Not a libra repository | `LBR-REPO-001` | "run 'libra init' to create a repository in the current directory." |
 | Invalid revision | `LBR-CLI-003` | "check the revision name and try again." |
+| Blob or unknown `reset -p` target | `LBR-CLI-003` | exits 129 with `LBR-CLI-003` for a blob or unknown `reset -p` target (Git: 128) |
 | Ambiguous revision/path token | `LBR-CLI-002` | "use '--' to separate paths from revisions, like 'libra reset <revision> -- <file>' or 'libra reset -- <file>'." |
 | HEAD is unborn | `LBR-REPO-003` | "create a commit first before resetting HEAD." |
 | Failed to resolve HEAD | `LBR-IO-001` | "check whether the repository database is readable." |
@@ -257,3 +268,8 @@ Mixed mode is the safest general-purpose reset: it un-stages changes without dis
 Reset emits recovery and cleanup warnings to stderr after rendering its result, including with `--json` and `--machine`. The success JSON schema stays unchanged; `--exit-code-on-warning` returns 9 when such a warning occurs, even though the reset itself completed. An unmerged index without a stopped pick/revert does not produce a sequence-recovery warning.
 
 This warning delivery also applies to internal resets used by cherry-pick and am: existing filesystem-cleanup warnings are now visible on stderr in structured modes. Their sequence-state handling and warning-exit tracking stay unchanged.
+
+## Issue #477 notes
+
+clears an in-progress merge and moves its autostash into the stash list
+remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001`

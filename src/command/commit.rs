@@ -50,7 +50,7 @@ use crate::{
         atomic_stream::StreamingAtomicFile,
         atomic_write,
         client_storage::ClientStorage,
-        error::{CliError, CliResult, StableErrorCode},
+        error::{CliError, CliResult, StableErrorCode, emit_post_envelope_warning},
         lfs,
         output::{OutputConfig, emit_json_data},
         path, preview_object, preview_scratch, util,
@@ -87,6 +87,7 @@ EXAMPLES:
     libra commit -e -m 'Draft'                       Edit the message in $EDITOR before committing
     libra commit -v                                  Show the staged diff in the editor template
     libra commit --allow-empty -m 'Trigger CI'       Create an empty commit
+    libra commit --allow-empty-message -m ''         Allow an empty commit message
     libra commit --json -m 'Add feature'             Structured JSON output for agents";
 
 #[derive(Parser, Debug, Default)]
@@ -111,6 +112,10 @@ pub struct CommitArgs {
     /// allow commit with empty index
     #[arg(long)]
     pub allow_empty: bool,
+
+    /// Allow an empty commit message (does not imply `--allow-empty`).
+    #[arg(long)]
+    pub allow_empty_message: bool,
 
     /// check if the commit message follows conventional commits
     #[arg(long)]
@@ -262,6 +267,12 @@ pub enum CommitError {
     #[error("nothing to commit, working tree clean")]
     NothingToCommit,
 
+    #[error("nothing added to commit but untracked files present (use \"libra add\" to track)")]
+    NothingAddedUntracked,
+
+    #[error("no changes added to commit (use \"libra add\" and/or \"libra commit -a\")")]
+    NoChangesAdded,
+
     #[error("nothing to commit (create/copy files and use 'libra add' to track)")]
     NothingToCommitNoTracked,
 
@@ -273,6 +284,9 @@ pub enum CommitError {
 
     #[error("amend is not supported for merge commits with multiple parents")]
     AmendUnsupported,
+
+    #[error("You are in the middle of a merge -- cannot amend.")]
+    AmendDuringMerge,
 
     #[error("invalid author format: {0}")]
     InvalidAuthor(String),
@@ -384,6 +398,12 @@ impl From<CommitError> for CliError {
                 .with_stable_code(StableErrorCode::RepoStateInvalid)
                 .with_hint("use 'libra add' to stage changes")
                 .with_hint("use 'libra status' to see what changed"),
+            CommitError::NothingAddedUntracked => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("use 'libra add' to track files"),
+            CommitError::NoChangesAdded => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("use 'libra add' and/or 'libra commit -a'"),
             CommitError::NothingToCommitNoTracked => CliError::failure(error.to_string())
                 .with_stable_code(StableErrorCode::RepoStateInvalid)
                 .with_hint("create/copy files and use 'libra add' to track"),
@@ -397,6 +417,9 @@ impl From<CommitError> for CliError {
             CommitError::AmendUnsupported => CliError::failure(error.to_string())
                 .with_stable_code(StableErrorCode::RepoStateInvalid)
                 .with_hint("create a new commit instead of amending a merge commit"),
+            CommitError::AmendDuringMerge => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("finish the merge with a regular commit, then amend if needed"),
             CommitError::InvalidAuthor(..) => CliError::command_usage(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("expected format: 'Name <email>'"),
@@ -540,6 +563,14 @@ pub struct CommitOutput {
     /// JSON envelope.
     #[serde(skip)]
     pub porcelain: Option<String>,
+    /// Warnings from concluding a stopped cherry-pick/revert after HEAD moved
+    /// (ADR-HF-03 items 2 and 5, #477 HF-29). Not part of the JSON envelope.
+    #[serde(skip)]
+    pub warnings: Vec<String>,
+    /// `--dry-run` during an in-progress merge: preview only, do not print a
+    /// fake `[branch hash]` line (#477 HF-27 MC9).
+    #[serde(skip)]
+    pub dry_run_preview: bool,
 }
 
 /// Parse author string in format "Name <email>" and return (name, email)
@@ -1013,6 +1044,11 @@ async fn run_commit_with_index(
     message_settings: CommitMessageSettings,
 ) -> Result<CommitOutput, CommitError> {
     let is_amend = args.amend;
+    let merge_state =
+        crate::command::merge::MergeState::load_optional_sync().map_err(CommitError::IndexLoad)?;
+    if merge_state.is_some() && is_amend {
+        return Err(CommitError::AmendDuringMerge);
+    }
     let is_signoff = args.signoff;
     let is_conventional = args.conventional;
     let skip_pre_commit = args.disable_pre || args.no_verify;
@@ -1102,7 +1138,7 @@ async fn run_commit_with_index(
             .await
             .map_err(|e| CommitError::StagedChanges(e.to_string()))?;
         if staged_changes.is_empty() && !args.allow_empty && !is_amend {
-            return Err(CommitError::NothingToCommit);
+            return Err(classify_nothing_to_commit()?);
         }
 
         // Complete status collection before the pre-commit hook or commit/tree/ref
@@ -1172,9 +1208,17 @@ async fn run_commit_with_index(
 
     // Resolve parent commits (needed to seed the editor with the amend parent's
     // message).
-    let parents_commit_ids = get_parents_ids().await;
+    let parents_commit_ids = get_parents_ids(merge_state.as_ref()).await?;
 
     // Resolve the commit message (may open the editor for -e/-v or a bare commit).
+    let merge_message_seed = merge_state
+        .as_ref()
+        .map(crate::command::merge::merge_commit_message);
+    let squash_message_seed = if merge_message_seed.is_none() {
+        crate::command::merge::load_squash_message().map_err(CommitError::IndexLoad)?
+    } else {
+        None
+    };
     let message = resolve_final_message(
         &args,
         output,
@@ -1183,6 +1227,16 @@ async fn run_commit_with_index(
         status_section,
         dry_run,
         !skip_all_hooks,
+        merge_message_seed.as_deref(),
+        squash_message_seed.as_deref(),
+        args.no_edit
+            && merge_message_seed.is_some()
+            && args.message.is_none()
+            && args.file.is_none()
+            && args.fixup.is_none()
+            && args.squash.is_none()
+            && args.reuse_message.is_none()
+            && args.reedit_message.is_none(),
     )
     .await?;
 
@@ -1272,8 +1326,13 @@ async fn run_commit_with_index(
             None => final_message.clone(),
         };
         if !dry_run {
-            commit_message =
-                persist_and_run_commit_msg_hook(&commit_message, output, !skip_all_hooks).await?;
+            commit_message = persist_and_run_commit_msg_hook(
+                &commit_message,
+                output,
+                !skip_all_hooks,
+                args.allow_empty_message,
+            )
+            .await?;
         }
         let mut committer = committer;
         refresh_noop_amend_committer_timestamp(
@@ -1356,8 +1415,8 @@ async fn run_commit_with_index(
 
         // INVARIANT: persist the commit object before moving HEAD so a crash
         // after ref update never points the branch at a missing object.
-        save_commit_object(&storage, &commit)?;
-        update_head_and_reflog(&commit.id.to_string(), &commit_message).await?;
+        let sequence_warnings =
+            persist_commit_and_conclude_stopped(&storage, &commit, &commit_message, output).await?;
         // Record the change revision only after HEAD has advanced; a failed ref
         // update must not leave a projection for an unreachable commit (the
         // projection is a GC root and would anchor the object forever).
@@ -1384,17 +1443,20 @@ async fn run_commit_with_index(
         } else {
             None
         };
-        return Ok(build_commit_output(
-            &commit,
-            &commit_message,
-            &staged_changes,
-            is_amend,
-            is_signoff,
-            conventional_result,
-            gpg_sig.is_some(),
-            porcelain_text.take(),
-        )
-        .await);
+        return Ok(with_sequence_warnings(
+            build_commit_output(
+                &commit,
+                &commit_message,
+                &staged_changes,
+                is_amend,
+                is_signoff,
+                conventional_result,
+                gpg_sig.is_some(),
+                porcelain_text.take(),
+            )
+            .await,
+            sequence_warnings,
+        ));
     }
 
     // Normal (non-amend) path
@@ -1404,8 +1466,13 @@ async fn run_commit_with_index(
         None => message.clone(),
     };
     if !dry_run {
-        commit_message =
-            persist_and_run_commit_msg_hook(&commit_message, output, !skip_all_hooks).await?;
+        commit_message = persist_and_run_commit_msg_hook(
+            &commit_message,
+            output,
+            !skip_all_hooks,
+            args.allow_empty_message,
+        )
+        .await?;
     }
 
     // Conventional commit validation
@@ -1426,7 +1493,7 @@ async fn run_commit_with_index(
             parents_commit_ids,
             &format_commit_msg(&commit_message, None),
         );
-        return Ok(build_commit_output(
+        let mut preview = build_commit_output(
             &commit,
             &commit_message,
             &staged_changes,
@@ -1440,7 +1507,13 @@ async fn run_commit_with_index(
             false,
             porcelain_text.take(),
         )
-        .await);
+        .await;
+        if merge_state.is_some() {
+            preview.commit.clear();
+            preview.short_id.clear();
+            preview.dry_run_preview = true;
+        }
+        return Ok(preview);
     }
 
     let gpg_sig = match signing_policy {
@@ -1479,8 +1552,8 @@ async fn run_commit_with_index(
 
     // INVARIANT: persist the commit object before moving HEAD so a crash after
     // ref update never points the branch at a missing object.
-    save_commit_object(&storage, &commit)?;
-    update_head_and_reflog(&commit.id.to_string(), &commit_message).await?;
+    let sequence_warnings =
+        persist_commit_and_conclude_stopped(&storage, &commit, &commit_message, output).await?;
     // Record the change revision only after HEAD has advanced; a failed ref
     // update must not leave a projection for an unreachable commit (the
     // projection is a GC root and would anchor the object forever).
@@ -1496,17 +1569,20 @@ async fn run_commit_with_index(
     } else {
         None
     };
-    Ok(build_commit_output(
-        &commit,
-        &commit_message,
-        &staged_changes,
-        is_amend,
-        is_signoff,
-        conventional_result,
-        gpg_sig.is_some(),
-        porcelain_text.take(),
-    )
-    .await)
+    Ok(with_sequence_warnings(
+        build_commit_output(
+            &commit,
+            &commit_message,
+            &staged_changes,
+            is_amend,
+            is_signoff,
+            conventional_result,
+            gpg_sig.is_some(),
+            porcelain_text.take(),
+        )
+        .await,
+        sequence_warnings,
+    ))
 }
 
 fn refresh_noop_amend_committer_timestamp(
@@ -1546,6 +1622,7 @@ fn refresh_noop_amend_committer_timestamp(
 /// a TTY; the implicit `vi` fallback requires an interactive terminal). With
 /// `-v` the staged diff is appended to the template and stripped at the scissors
 /// marker so it never enters the message. An empty final message aborts.
+#[allow(clippy::too_many_arguments)]
 async fn resolve_final_message(
     args: &CommitArgs,
     output: &OutputConfig,
@@ -1554,13 +1631,19 @@ async fn resolve_final_message(
     status_section: Option<String>,
     dry_run: bool,
     run_prepare_hook: bool,
+    merge_message_seed: Option<&str>,
+    squash_message_seed: Option<&str>,
+    keep_merge_comments: bool,
 ) -> Result<String, CommitError> {
     let CommitMessageSettings {
         needs_editor,
-        mode,
+        mut mode,
         verbose,
         editor_cmd,
     } = settings;
+    if keep_merge_comments {
+        mode = CleanupMode::Verbatim;
+    }
     let base: Option<String> = if let Some(spec) = &args.fixup {
         Some(format!(
             "fixup! {}",
@@ -1583,7 +1666,9 @@ async fn resolve_final_message(
             }
         })?)
     } else {
-        None
+        merge_message_seed
+            .or(squash_message_seed)
+            .map(str::to_string)
     };
 
     // `-t`/`--template` (or the `commit.template` config) seeds the message only
@@ -1686,13 +1771,23 @@ async fn resolve_final_message(
         cleanup_commit_message(&prepared_buffer, effective_mode)
     };
 
+    // Empty first (including a comment-only `-t` template after cleanup), then
+    // the unedited-template abort, so K5/K6 stay distinct (ADR-HF-06).
+    // `--allow-empty-message` bypasses both checks (ADR-HF-07 / M-EMPTY).
+    if !dry_run && resolved.trim().is_empty() && !args.allow_empty_message {
+        return Err(CommitError::EmptyMessage);
+    }
+
     // When a template seeded the message and the editor was meant to open
     // (i.e. NOT `--no-edit`), Git aborts unless the user actually edited it:
     //   - editor ran but the result equals the cleaned template → unedited;
     //   - the editor was required but none was available → never edited.
     // `--no-edit` (needs_editor == false) bypasses this and uses the template
-    // directly.
-    if !dry_run && let Some(template) = &template_content {
+    // directly. `--allow-empty-message` also bypasses it (E7).
+    if !dry_run
+        && !args.allow_empty_message
+        && let Some(template) = &template_content
+    {
         let unedited = if editor_opened {
             resolved == cleanup_commit_message(template, mode)
         } else {
@@ -1701,10 +1796,6 @@ async fn resolve_final_message(
         if unedited {
             return Err(CommitError::TemplateUnedited);
         }
-    }
-
-    if !dry_run && resolved.trim().is_empty() {
-        return Err(CommitError::EmptyMessage);
     }
 
     if args.trailers.is_empty() {
@@ -2086,6 +2177,7 @@ async fn persist_and_run_commit_msg_hook(
     message: &str,
     output: &OutputConfig,
     run_hook: bool,
+    allow_empty_message: bool,
 ) -> Result<String, CommitError> {
     let message_path = commit_message_path()?;
     write_commit_message_file(&message_path, message)?;
@@ -2113,7 +2205,7 @@ async fn persist_and_run_commit_msg_hook(
     )
     .await?;
     let message = read_commit_message_file(&message_path)?;
-    if message.trim().is_empty() {
+    if message.trim().is_empty() && !allow_empty_message {
         return Err(CommitError::EmptyMessage);
     }
     Ok(message)
@@ -2225,7 +2317,104 @@ async fn build_commit_output(
         conventional,
         signed,
         porcelain,
+        warnings: Vec::new(),
+        dry_run_preview: false,
     }
+}
+
+fn with_sequence_warnings(mut output: CommitOutput, warnings: Vec<String>) -> CommitOutput {
+    output.warnings = warnings;
+    output
+}
+
+/// Snapshot of a stopped cherry-pick/revert taken before this commit writes
+/// HEAD, so a sequence started after the commit is never concluded by it
+/// (ADR-HF-03 items 2 and 5, #477 HF-29).
+struct StoppedSequences {
+    cherry_pick: Result<Option<crate::internal::sequencer::SequenceState>, String>,
+    revert: Result<Option<Vec<u8>>, String>,
+}
+
+async fn snapshot_stopped_sequences() -> StoppedSequences {
+    StoppedSequences {
+        cherry_pick: crate::command::cherry_pick::snapshot_stopped_cherry_pick().await,
+        revert: crate::command::revert::snapshot_stopped_revert(),
+    }
+}
+
+/// Persist the commit object, move HEAD, then conclude a stopped cherry-pick
+/// or revert. The snapshot is taken before those writes.
+async fn persist_commit_and_conclude_stopped(
+    storage: &ClientStorage,
+    commit: &Commit,
+    commit_message: &str,
+    output: &OutputConfig,
+) -> Result<Vec<String>, CommitError> {
+    let stopped = snapshot_stopped_sequences().await;
+    let stopped_merge = crate::command::merge::snapshot_stopped_merge();
+    save_commit_object(storage, commit)?;
+    update_head_and_reflog(&commit.id.to_string(), commit_message).await?;
+    let mut warnings = Vec::new();
+    match stopped_merge {
+        Ok(None) => {}
+        Ok(Some(snapshot)) => {
+            match crate::command::merge::conclude_merge_after_commit(snapshot, output).await {
+                Ok(notes) => warnings.extend(notes),
+                Err(error) => warnings.push(error),
+            }
+        }
+        Err(error) => warnings.push(format!(
+            "commit completed, but the in-progress merge state could not be read: {error}; \
+             finish or abort it with `libra merge --abort`"
+        )),
+    }
+    if let Err(error) = crate::command::merge::clear_squash_message() {
+        warnings.push(format!(
+            "commit completed, but SQUASH_MSG could not be removed: {error}"
+        ));
+    }
+    warnings.extend(conclude_stopped_sequences(stopped).await);
+    Ok(warnings)
+}
+
+/// Conclude a stopped cherry-pick/revert after HEAD has already moved.
+/// Failures become warnings and stop the remaining cleanup (ADR-HF-03 item 5).
+async fn conclude_stopped_sequences(stopped: StoppedSequences) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let cherry_pick = match stopped.cherry_pick {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            warnings.push(format!(
+                "commit completed, but the stopped cherry-pick state could not be read: {error}; finish it with 'libra cherry-pick --quit'"
+            ));
+            return warnings;
+        }
+    };
+    if let Some(snapshot) = cherry_pick
+        && let Err(error) =
+            crate::command::cherry_pick::conclude_stopped_cherry_pick(snapshot).await
+    {
+        warnings.push(format!(
+            "commit completed, but the stopped cherry-pick state could not be updated: {error}; finish it with 'libra cherry-pick --quit'"
+        ));
+        return warnings;
+    }
+    let revert_snapshot = match stopped.revert {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return warnings,
+        Err(error) => {
+            warnings.push(format!(
+                "commit completed, but the stopped revert state could not be read: {error}; inspect the leftover state with 'libra worktree doctor'; after confirming ownership and repairing the state, 'libra revert --abort' restores the pre-revert state and discards later tracked changes"
+            ));
+            return warnings;
+        }
+    };
+    if let Err(error) = crate::command::revert::conclude_stopped_revert(revert_snapshot).await {
+        warnings.push(format!(
+            "commit completed, but the stopped revert state could not be updated: {error}; inspect the leftover state with 'libra worktree doctor'; after confirming ownership and repairing the state, 'libra revert --abort' restores the pre-revert state and discards later tracked changes"
+        ));
+    }
+    warnings
 }
 
 /// Render commit output according to OutputConfig (human / JSON / machine).
@@ -2240,6 +2429,25 @@ fn render_commit_output(result: &CommitOutput, output: &OutputConfig) -> CliResu
 
     let stdout = std::io::stdout();
     let mut writer = stdout.lock();
+    if result.dry_run_preview {
+        writeln!(writer, "Would finish the in-progress merge.")
+            .map_err(|e| CliError::io(format!("failed to write commit preview: {e}")))?;
+        let file_count = result.files_changed.total;
+        if file_count > 0 {
+            let files_word = if file_count == 1 { "file" } else { "files" };
+            writeln!(
+                writer,
+                " {} {} changed (new: {}, modified: {}, deleted: {})",
+                file_count,
+                files_word,
+                result.files_changed.new,
+                result.files_changed.modified,
+                result.files_changed.deleted
+            )
+            .map_err(|e| CliError::io(format!("failed to write commit preview: {e}")))?;
+        }
+        return Ok(());
+    }
     if result.root_commit {
         writeln!(
             writer,
@@ -2289,6 +2497,23 @@ pub async fn execute(args: CommitArgs) {
 /// - Writes new objects, updates HEAD/current branch, records reflog state, and
 ///   renders the requested success output.
 ///
+/// Classify an empty-index refusal from the existing status worktree scan
+/// (ADR-HF-06 / M-COMMIT K1–K3). Unstaged tracked changes win over untracked-only;
+/// ignored-only paths stay "working tree clean".
+fn classify_nothing_to_commit() -> Result<CommitError, CommitError> {
+    let (visible, _ignored) = status::changes_to_be_staged_split_safe()
+        .map_err(|e| CommitError::StagedChanges(e.to_string()))?;
+    let has_unstaged_tracked =
+        !visible.modified.is_empty() || !visible.deleted.is_empty() || !visible.renamed.is_empty();
+    if has_unstaged_tracked {
+        Ok(CommitError::NoChangesAdded)
+    } else if !visible.new.is_empty() {
+        Ok(CommitError::NothingAddedUntracked)
+    } else {
+        Ok(CommitError::NothingToCommit)
+    }
+}
+
 /// # Errors
 /// Returns [`CliError`] when the repository is missing or corrupt, there is
 /// nothing to commit, identity/signing setup fails, object writes fail, or HEAD
@@ -2315,6 +2540,9 @@ pub async fn execute_safe(args: CommitArgs, output: &OutputConfig) -> CliResult<
         print!("{text}");
     } else {
         render_commit_output(&result, output)?;
+    }
+    for warning in result.warnings {
+        emit_post_envelope_warning(warning);
     }
     if !preview {
         dispatch_current_repo_vcs_event_to_history(VCS_EVENT_POST_COMMIT).await;
@@ -3112,15 +3340,23 @@ fn read_lfs_auto_stage_blob(
     Ok(Blob::from_content(&lfs::format_pointer_string(&oid, size)))
 }
 
-/// Get the current HEAD commit ID as parent.
-///
-/// If on a branch, returns the branch's commit ID; if detached HEAD, returns the HEAD commit ID.
-async fn get_parents_ids() -> Vec<ObjectHash> {
-    let current_commit_id = Head::current_commit().await;
-    match current_commit_id {
-        Some(id) => vec![id],
-        None => vec![], // first commit
+/// Get parent commit IDs: HEAD, or HEAD plus merge targets when a merge is
+/// in progress (#477 HF-27 / ADR-HF-21).
+async fn get_parents_ids(
+    merge: Option<&crate::command::merge::MergeState>,
+) -> Result<Vec<ObjectHash>, CommitError> {
+    if let Some(state) = merge {
+        return crate::command::merge::merge_commit_parents(state).map_err(|detail| {
+            CommitError::ParentCommitLoad {
+                commit_id: state.target.clone(),
+                detail,
+            }
+        });
     }
+    Ok(match Head::current_commit().await {
+        Some(id) => vec![id],
+        None => vec![],
+    })
 }
 
 /// Update HEAD to point to a new commit.
@@ -3299,6 +3535,14 @@ mod test {
             "nothing to commit, working tree clean",
         );
         assert_eq!(
+            CommitError::NothingAddedUntracked.to_string(),
+            "nothing added to commit but untracked files present (use \"libra add\" to track)",
+        );
+        assert_eq!(
+            CommitError::NoChangesAdded.to_string(),
+            "no changes added to commit (use \"libra add\" and/or \"libra commit -a\")",
+        );
+        assert_eq!(
             CommitError::NothingToCommitNoTracked.to_string(),
             "nothing to commit (create/copy files and use 'libra add' to track)",
         );
@@ -3313,6 +3557,10 @@ mod test {
         assert_eq!(
             CommitError::AmendUnsupported.to_string(),
             "amend is not supported for merge commits with multiple parents",
+        );
+        assert_eq!(
+            CommitError::AmendDuringMerge.to_string(),
+            "You are in the middle of a merge -- cannot amend.",
         );
         assert_eq!(
             CommitError::InvalidAuthor("missing '<email>'".to_string()).to_string(),
@@ -3420,6 +3668,20 @@ mod test {
     #[test]
     fn test_commit_error_nothing_to_commit_no_tracked_maps_to_repo_state() {
         let err: CliError = CommitError::NothingToCommitNoTracked.into();
+        assert_eq!(err.exit_code(), 128);
+        assert_eq!(err.stable_code().as_str(), "LBR-REPO-003");
+    }
+
+    #[test]
+    fn test_commit_error_nothing_added_untracked_maps_to_repo_state() {
+        let err: CliError = CommitError::NothingAddedUntracked.into();
+        assert_eq!(err.exit_code(), 128);
+        assert_eq!(err.stable_code().as_str(), "LBR-REPO-003");
+    }
+
+    #[test]
+    fn test_commit_error_no_changes_added_maps_to_repo_state() {
+        let err: CliError = CommitError::NoChangesAdded.into();
         assert_eq!(err.exit_code(), 128);
         assert_eq!(err.stable_code().as_str(), "LBR-REPO-003");
     }

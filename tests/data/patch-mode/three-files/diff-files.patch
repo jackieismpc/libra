@@ -1,0 +1,45 @@
+diff --git a/a.txt b/a.txt
+index c8b13a5..3deea47 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1,8 +1,8 @@
+ line 1
+ line 2
+-line 3
++line 3 x
+ line 4
+-line 5
++line 5 x
+ line 6
+ line 7
+ line 8
+diff --git a/b.txt b/b.txt
+index c8b13a5..3deea47 100644
+--- a/b.txt
++++ b/b.txt
+@@ -1,8 +1,8 @@
+ line 1
+ line 2
+-line 3
++line 3 x
+ line 4
+-line 5
++line 5 x
+ line 6
+ line 7
+ line 8
+diff --git a/c.txt b/c.txt
+index c8b13a5..3deea47 100644
+--- a/c.txt
++++ b/c.txt
+@@ -1,8 +1,8 @@
+ line 1
+ line 2
+-line 3
++line 3 x
+ line 4
+-line 5
++line 5 x
+ line 6
+ line 7
+ line 8

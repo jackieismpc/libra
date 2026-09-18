@@ -15,7 +15,9 @@ libra push [OPTIONS] [<repository> [<refspec>...]]
 
 `libra push` transfers commits, trees, blobs, and tags from the local repository to a
 remote. When invoked without arguments it pushes the current branch to its configured
-upstream remote. When a `repository` and one or more `refspec` values are given, all
+upstream remote. A configured local upstream (`branch.<name>.remote=.`) is refused
+before any network write (`LBR-CLI-003`, exit 129; Git `push` is 128 — intentional).
+Network support for local upstreams is deferred to [issues/480 HP-16](https://github.com/libra-tools/libra/issues/480). An explicit repository argument `.` keeps the existing `remote '.' not found` path. When a `repository` and one or more `refspec` values are given, all
 refspecs are validated before any network write and then sent in one receive-pack
 request. `--tags` pushes all local tags, and `--mirror` mirrors local branch/tag refs
 to the remote, including deletion of remote-only refs.
@@ -481,6 +483,7 @@ trigger a fuzzy match suggestion via edit distance.
 | HEAD is detached | `LBR-REPO-003` | 128 | "checkout a branch before pushing" |
 | No remote configured | `LBR-REPO-003` | 128 | "use 'libra remote add' to configure a remote" |
 | Remote not found | `LBR-CLI-003` | 129 | "use 'libra remote -v'" + fuzzy "did you mean?" |
+| Configured local upstream (`branch.<name>.remote=.`) | `LBR-CLI-003` | 129 | "use 'libra branch --unset-upstream' to clear the local upstream"; network support is issues/480 HP-16 (Git `push` is 128 — intentional) |
 | Invalid refspec | `LBR-CLI-002` | 129 | "use '\<name>' or '\<src>:\<dst>'" |
 | Source ref not found | `LBR-CLI-003` | 129 | "verify the local branch/ref exists" |
 | Delete target does not exist on remote | `LBR-CLI-003` | 129 | "check the remote's refs with 'libra ls-remote \<remote>'" |
@@ -694,3 +697,7 @@ reason that does not echo the remote bytes. It is no longer reported as a
 successful empty response. Check the remote Git service or proxy response before
 retrying. Valid empty repositories, supported SHA-1/SHA-256 advertisements,
 existing command hints and structured error fields retain their behavior.
+
+## Issue #477 notes
+
+refuses a local upstream (`branch.<name>.remote=.`)

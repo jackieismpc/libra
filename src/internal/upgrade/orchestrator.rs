@@ -292,7 +292,7 @@ async fn phase_a(
         *witness = Some(plan.new_state.clone());
     }
 
-    // Download into memory (SizeGate-bounded to ≤128 MiB). Do not touch the
+    // Download into memory (SizeGate-bounded to ≤256 MiB). Do not touch the
     // shared candidate filename until the Phase-B lock is held.
     let mut buf: Vec<u8> = Vec::new();
     download_artifact_to(
@@ -641,7 +641,7 @@ fn now_rfc3339(local_now: i64) -> String {
 
 /// Total wall-clock budget for a manual manifest fetch + decision.
 pub const MANUAL_CHECK_BUDGET: Duration = Duration::from_secs(30);
-/// Total wall-clock budget for the manual artifact download (≤128 MiB).
+/// Total wall-clock budget for the manual artifact download (≤256 MiB).
 pub const MANUAL_DOWNLOAD_BUDGET: Duration = Duration::from_secs(300);
 
 /// A manual check/install failure with a user-facing description.
@@ -738,7 +738,7 @@ impl ManualUpgrade {
     }
 
     /// Re-verify the live manifest, download the artifact (sha256/size
-    /// enforced, ≤128 MiB, bounded wall clock) and run the locked install
+    /// enforced, ≤256 MiB, bounded wall clock) and run the locked install
     /// transaction with pre/post probes and auto-rollback.
     pub async fn install(self) -> Result<ManualInstallReport, ManualUpgradeError> {
         let client = upgrade_http_client()?;

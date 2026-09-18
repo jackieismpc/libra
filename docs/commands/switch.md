@@ -42,7 +42,7 @@ OID, new OID, and branch flag `1`. Already-on no-ops do not invoke it. Set
 | `-c` | `--create` | `<name>` | Create a new branch and switch to it |
 | `-C` | `--force-create` | `<name>` | Create a new branch or reset an existing one and switch to it |
 | | `--orphan` | `<name>` | Create a new unborn orphan branch with no parents and switch to it |
-| `-d` | `--detach` | | Detach HEAD at the given commit, tag, or branch |
+| `-d` | `--detach` | | Detach HEAD at the given commit, tag, or branch. With no target, detach at the current HEAD (unborn HEAD is refused: `You are on a branch yet to be born`, `LBR-REPO-003`, exit 128) |
 | | `--track` | | Create a local branch tracking the given remote branch and switch to it |
 | | `--guess` | | Auto-create a tracking branch when `<branch>` uniquely matches one remote (default; DWIM) |
 | | `--no-guess` | | Disable the remote-tracking guess; require a local branch or explicit `--track` |
@@ -336,3 +336,7 @@ Every `SwitchError` variant maps to an explicit `StableErrorCode`.
 command conflict contract through `DelegatedCli`, so that path keeps the branch
 command's existing error shape instead of adding the `SwitchError::BranchAlreadyExists`
 hint.
+
+## Issue #477 notes
+
+`--detach` with no target detaches at the current commit

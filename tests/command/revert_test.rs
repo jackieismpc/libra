@@ -146,6 +146,9 @@ async fn test_basic_revert() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -182,6 +185,9 @@ async fn test_basic_revert() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -219,6 +225,9 @@ async fn test_basic_revert() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -340,6 +349,9 @@ async fn test_revert_no_commit() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -374,6 +386,9 @@ async fn test_revert_no_commit() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -461,6 +476,9 @@ async fn test_revert_root_commit() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -557,6 +575,9 @@ async fn test_revert_root_commit_creates_empty_tree_commit() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -769,6 +790,14 @@ fn test_revert_multiple_commits_rejects_no_commit() {
 
 /// Build a repo where reverting `c2` conflicts with a later change in `c3`,
 /// returning (repo, c2_hash).
+fn revert_subject_label(oid: &str, subject: &str) -> String {
+    format!("{} ({subject})", oid.chars().take(7).collect::<String>())
+}
+
+fn revert_parent_of_label(oid: &str, subject: &str) -> String {
+    format!("parent of {}", revert_subject_label(oid, subject))
+}
+
 fn setup_revert_conflict() -> (tempfile::TempDir, String) {
     let repo = create_committed_repo_via_cli();
     let p = repo.path();
@@ -820,8 +849,11 @@ fn test_revert_conflict_then_continue() {
         !conflict.contains("|||||||"),
         "MG-10 changes revert's no-favor default from diffy's implicit diff3 to the shared merge style: {conflict}"
     );
+    let revert = revert_parent_of_label(&c2, "c2");
     assert!(
-        conflict.starts_with("line1\n<<<<<<< ours\n") && conflict.ends_with("line3\n"),
+        conflict.starts_with("line1\n<<<<<<< HEAD\n")
+            && conflict.contains(&format!(">>>>>>> {revert}\n"))
+            && conflict.ends_with("line3\n"),
         "shared context stays outside the refined conflict: {conflict}"
     );
 
@@ -854,16 +886,18 @@ fn revert_conflict_honors_zdiff3_shared_renderer() {
     let out = run_libra_command(&["revert", c2.as_str()], p);
     assert!(!out.status.success(), "conflicting revert should pause");
     let conflict = fs::read_to_string(p.join("f.txt")).unwrap();
+    let subject = revert_subject_label(&c2, "c2");
+    let parent = format!("parent of {subject}");
     assert!(
-        conflict.starts_with("line1\n<<<<<<< ours\nDIVERGED\n"),
+        conflict.starts_with("line1\n<<<<<<< HEAD\nDIVERGED\n"),
         "shared prefix is outside the zdiff3 conflict: {conflict}"
     );
     assert!(
-        conflict.contains("||||||| original\nCHANGED\n=======\nline2\n"),
+        conflict.contains(&format!("||||||| {subject}\nCHANGED\n=======\nline2\n")),
         "zdiff3 preserves the revert base section: {conflict}"
     );
     assert!(
-        conflict.ends_with(">>>>>>> theirs\nline3\n"),
+        conflict.ends_with(&format!(">>>>>>> {parent}\nline3\n")),
         "shared suffix is outside the zdiff3 conflict: {conflict}"
     );
 }
@@ -1790,4 +1824,144 @@ fn test_revert_refuses_unmerged_index() {
     let abort = run_libra_command(&["revert", "--abort"], p);
     assert_ne!(abort.status.code(), Some(0), "no revert may be in progress");
     assert_eq!(super::cherry_pick_test::refusal_snapshot(p), before);
+}
+
+/// M-SEQ S4b (#477 HF-29, ADR-HF-03): resolving a stopped single-commit revert
+/// and committing clears the revert state so the next revert can start.
+#[test]
+fn test_commit_after_resolving_single_revert_clears_state() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let commit = |file: &str, content: &str, msg: &str| {
+        fs::write(p.join(file), content).unwrap();
+        assert_cli_success(&run_libra_command(&["add", file], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", msg, "--no-verify"], p),
+            "commit",
+        );
+    };
+    commit("shared.txt", "base\n", "base shared");
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], p),
+        "branch",
+    );
+    commit("shared.txt", "feature side\n", "feature edit");
+    let feat = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+    commit("shared.txt", "main side\n", "main edit");
+    assert_eq!(
+        run_libra_command(&["revert", "--no-edit", &feat], p)
+            .status
+            .code(),
+        Some(128),
+        "S4b revert conflicts"
+    );
+    fs::write(p.join("shared.txt"), "resolved\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "shared.txt"], p),
+        "stage the resolution",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "resolved revert", "--no-verify"], p),
+        "S4b commit",
+    );
+    let status = format!(
+        "{}{}",
+        String::from_utf8_lossy(&run_libra_command(&["status"], p).stdout),
+        String::from_utf8_lossy(&run_libra_command(&["status"], p).stderr)
+    );
+    assert!(
+        !status.contains("revert"),
+        "S4b: the concluding commit clears the revert: {status}"
+    );
+    assert!(!p.join(".libra/revert-state.json").exists());
+    commit("extra.txt", "extra\n", "clean follow-up");
+    let follow_up = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(
+        &run_libra_command(&["revert", "--no-edit", &follow_up], p),
+        "S4b: the next revert runs",
+    );
+}
+
+/// M-CONT C3 (#477 HF-02): `--continue` after reset drains remaining reverts
+/// instead of re-committing the stopped item.
+#[test]
+fn test_revert_continue_after_reset_skips_stopped_item() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let commit = |file: &str, content: &str, msg: &str| {
+        fs::write(p.join(file), content).unwrap();
+        assert_cli_success(&run_libra_command(&["add", file], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", msg, "--no-verify"], p),
+            "commit",
+        );
+    };
+    commit("a.txt", "one\n", "adds a");
+    let c1 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    commit("b.txt", "bee\n", "adds b");
+    let c2 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    commit("a.txt", "three\n", "a three");
+    assert_eq!(
+        run_libra_command(&["revert", "--no-edit", &c1, &c2], p)
+            .status
+            .code(),
+        Some(128),
+        "C3 first revert conflicts"
+    );
+    assert_cli_success(&run_libra_command(&["reset", "--hard"], p), "C3 reset");
+    assert!(p.join(".libra/revert-state.json").exists());
+    assert_cli_success(
+        &run_libra_command(&["revert", "--continue"], p),
+        "C3 continue",
+    );
+    assert!(!p.join(".libra/revert-state.json").exists());
+    assert!(
+        !p.join("b.txt").exists(),
+        "C3: the remaining revert of c2 is applied"
+    );
+    assert_eq!(
+        fs::read_to_string(p.join("a.txt")).unwrap(),
+        "three\n",
+        "C3: the stopped revert of c1 is not replayed"
+    );
+}
+
+/// M-LABEL L6 / L8c (#477 HF-04): revert labels are HEAD / parent of <abbrev> (subject).
+#[test]
+fn test_revert_conflict_labels_head_and_parent_of() {
+    let (repo, c2) = setup_revert_conflict();
+    let p = repo.path();
+    let subject = revert_subject_label(&c2, "c2");
+    let parent = format!("parent of {subject}");
+
+    let out = run_libra_command(&["revert", c2.as_str()], p);
+    assert!(!out.status.success(), "L6 conflict");
+    let body = fs::read_to_string(p.join("f.txt")).unwrap();
+    assert!(
+        body.contains("<<<<<<< HEAD\n") && body.contains(&format!(">>>>>>> {parent}\n")),
+        "L6 parent-of theirs: {body}"
+    );
+    assert_cli_success(&run_libra_command(&["revert", "--abort"], p), "L6 abort");
+
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.conflictStyle", "diff3"], p),
+        "L8c style",
+    );
+    let out = run_libra_command(&["revert", c2.as_str()], p);
+    assert!(!out.status.success(), "L8c conflict");
+    let body = fs::read_to_string(p.join("f.txt")).unwrap();
+    assert!(
+        body.contains(&format!("||||||| {subject}\n"))
+            && body.contains(&format!(">>>>>>> {parent}\n")),
+        "L8c subject base: {body}"
+    );
 }

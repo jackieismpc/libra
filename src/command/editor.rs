@@ -1,9 +1,11 @@
 //! Shared "open `$EDITOR` on a scratch file" helper.
 //!
 //! Used by `commit -e` / bare `commit`. Editor resolution follows Git
-//! precedence: `$GIT_EDITOR` → `core.editor` → `$VISUAL` → `$EDITOR`. An
-//! *explicitly configured* editor runs even without a TTY (so scripted editors
-//! work in tests and automation); the implicit `vi` fallback is the caller's
+//! precedence: `$GIT_EDITOR` → `core.editor` → `$VISUAL` → `$EDITOR`. Sequence
+//! editors (`resolve_sequence_editor`) insert `$GIT_SEQUENCE_EDITOR` and
+//! `sequence.editor` ahead of that chain (ADR-HF-19). An *explicitly
+//! configured* editor runs even without a TTY (so scripted editors work in
+//! tests and automation); the implicit `vi` fallback is the caller's
 //! responsibility and should only be used on an interactive terminal.
 
 use std::path::Path;
@@ -54,6 +56,61 @@ pub(crate) async fn resolve_editor() -> Option<String> {
     None
 }
 
+/// First non-empty value in Git sequence-editor order (M-TODO T6):
+/// `$GIT_SEQUENCE_EDITOR` → `sequence.editor` → `$GIT_EDITOR` →
+/// `core.editor` → `$VISUAL` → `$EDITOR`.
+pub(crate) fn pick_sequence_editor(
+    git_sequence_editor: Option<&str>,
+    sequence_editor: Option<&str>,
+    git_editor: Option<&str>,
+    core_editor: Option<&str>,
+    visual: Option<&str>,
+    editor: Option<&str>,
+) -> Option<String> {
+    for value in [
+        git_sequence_editor,
+        sequence_editor,
+        git_editor,
+        core_editor,
+        visual,
+        editor,
+    ] {
+        if let Some(value) = value
+            && !value.trim().is_empty()
+        {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+async fn config_value(key: &str) -> Option<String> {
+    ConfigKv::get_best_effort(key)
+        .await
+        .ok()
+        .flatten()
+        .map(|entry| entry.value)
+        .filter(|value| !value.trim().is_empty())
+}
+
+/// Resolve the sequence editor for `rebase -i` (ADR-HF-19 §4).
+pub(crate) async fn resolve_sequence_editor() -> Option<String> {
+    pick_sequence_editor(
+        nonempty_env("GIT_SEQUENCE_EDITOR").as_deref(),
+        config_value("sequence.editor").await.as_deref(),
+        nonempty_env("GIT_EDITOR").as_deref(),
+        config_value("core.editor").await.as_deref(),
+        nonempty_env("VISUAL").as_deref(),
+        nonempty_env("EDITOR").as_deref(),
+    )
+}
+
 /// Write `initial` to `path`, open `editor` on it, and return the edited
 /// contents.
 ///
@@ -92,7 +149,76 @@ pub(crate) async fn edit_message(
 
 #[cfg(test)]
 mod tests {
-    use super::shell_single_quote;
+    use super::{pick_sequence_editor, shell_single_quote};
+
+    #[test]
+    fn sequence_editor_precedence() {
+        assert_eq!(
+            pick_sequence_editor(
+                Some("seq-env"),
+                Some("seq-cfg"),
+                Some("git-ed"),
+                Some("core-ed"),
+                Some("visual"),
+                Some("editor"),
+            )
+            .as_deref(),
+            Some("seq-env")
+        );
+        assert_eq!(
+            pick_sequence_editor(
+                None,
+                Some("seq-cfg"),
+                Some("git-ed"),
+                Some("core-ed"),
+                Some("visual"),
+                Some("editor"),
+            )
+            .as_deref(),
+            Some("seq-cfg")
+        );
+        assert_eq!(
+            pick_sequence_editor(
+                None,
+                None,
+                Some("git-ed"),
+                Some("core-ed"),
+                Some("visual"),
+                Some("editor"),
+            )
+            .as_deref(),
+            Some("git-ed")
+        );
+        assert_eq!(
+            pick_sequence_editor(
+                None,
+                None,
+                None,
+                Some("core-ed"),
+                Some("visual"),
+                Some("editor"),
+            )
+            .as_deref(),
+            Some("core-ed")
+        );
+        assert_eq!(
+            pick_sequence_editor(None, None, None, None, Some("visual"), Some("editor"),)
+                .as_deref(),
+            Some("visual")
+        );
+        assert_eq!(
+            pick_sequence_editor(None, None, None, None, None, Some("editor"),).as_deref(),
+            Some("editor")
+        );
+        assert_eq!(
+            pick_sequence_editor(Some("   "), None, None, None, None, Some("editor"),).as_deref(),
+            Some("editor")
+        );
+        assert_eq!(
+            pick_sequence_editor(None, None, None, None, None, None),
+            None
+        );
+    }
 
     #[test]
     fn shell_single_quote_neutralizes_metacharacters() {

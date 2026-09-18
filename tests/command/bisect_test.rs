@@ -106,6 +106,9 @@ async fn create_linear_commits(count: usize) -> Vec<String> {
             renormalize: false,
             ignore_missing: false,
             resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         })
         .await;
         commit::execute(commit::CommitArgs {

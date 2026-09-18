@@ -6,6 +6,7 @@ use libra::{
     command::switch::SwitchError,
     utils::error::{CliError, StableErrorCode},
 };
+use tempfile::tempdir;
 
 use super::*;
 
@@ -117,14 +118,15 @@ fn missing_track_target_returns_cli_error_contract() {
 
 #[test]
 fn missing_detach_target_returns_cli_error_contract() {
-    let repo = create_committed_repo_via_cli();
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
     let output = run_libra_command(&["switch", "--detach"], repo.path());
     assert_cli_error_contract(
         &output,
-        129,
-        StableErrorCode::CliInvalidArguments,
-        "branch name is required when using --detach",
-        &["provide a commit, tag, or branch to detach at"],
+        128,
+        StableErrorCode::RepoStateInvalid,
+        "You are on a branch yet to be born",
+        &[],
     );
 }
 

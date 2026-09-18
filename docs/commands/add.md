@@ -199,6 +199,26 @@ libra add --resolved
 libra add --resolved path/to/file
 ```
 
+### `-p, --patch`
+
+Interactively stage hunks. For each hunk Libra prints the unified diff and
+prompts `Stage this hunk [y,n,q,a,d,s,e,p,P,?]? ` (letters shrink to the
+commands that apply). `s` splits a hunk at context islands; `e` opens the
+hunk in `$GIT_EDITOR` / `core.editor`. `--auto-advance` (default) moves to
+the next hunk after `y`/`n`; `--no-auto-advance` stays and offers `>`/`<`
+to cycle files. Cannot be combined with `--json`, `--machine`, `--dry-run`,
+or `--resolved`.
+
+```bash
+libra add -p
+libra add -p --no-auto-advance src/main.rs
+```
+
+### `--auto-advance` / `--no-auto-advance`
+
+Last one wins. `--no-auto-advance` without `-p`/`--patch` is
+`LBR-CLI-002` / 128: `the option '--no-auto-advance' requires '--interactive/--patch'`.
+
 ## Common Commands
 
 ```bash
@@ -213,6 +233,7 @@ libra add ':(glob)src/*.rs' ':(exclude)src/generated.rs'
 libra add --chmod=+x scripts/build.sh
 libra add --renormalize
 libra add --resolved
+libra add -p
 ```
 
 Unmerged (conflict) paths are part of the same candidate set: `add`, `add -A`,
@@ -345,14 +366,11 @@ cognitive overhead without meaningfully improving the review experience. Users w
 to review new files before committing can use `libra add --dry-run` followed by
 `libra diff --staged` after staging.
 
-### No `--patch` / `-p` interactive staging
+### `--patch` / `-p` interactive staging
 
-Git's `--patch` mode provides an interactive hunk-by-hunk staging interface within the
-terminal. Libra deliberately omits interactive staging from the CLI `add` command because
-the `libra code` Web Code UI provides a richer, visual staging experience with full file and hunk
-selection. Interactive terminal prompts are also incompatible with AI agent workflows
-(MCP/stdio mode), which are a primary design target for Libra. Keeping `libra add`
-non-interactive ensures it works identically in human, scripted, and agent contexts.
+`libra add -p` is the Git-compatible hunk session (`y/n/q/a/d/j/J/k/K/g///s/e/p/P/?`,
+`--[no-]auto-advance`). `--json` / `--machine` / `--dry-run` stay refused with the
+patch session so agents keep a non-interactive path. `add -i` remains declined (D15).
 
 ### `--refresh` as explicit flag
 
@@ -392,7 +410,7 @@ overrides.
 | Verbose output | `git add -v` | N/A | `libra add -v` |
 | Ignore errors | `git add --ignore-errors` | N/A | `libra add --ignore-errors` |
 | Intent to add | `git add -N` / `--intent-to-add` | N/A | N/A (not implemented) |
-| Interactive patch | `git add -p` / `--patch` | N/A | N/A (use the `libra code` Web Code UI) |
+| Interactive patch | `git add -p` / `--patch` | N/A | `libra add -p` / `--patch` |
 | Interactive select | `git add -i` / `--interactive` | N/A | N/A (use the `libra code` Web Code UI) |
 | Edit diff before staging | `git add -e` / `--edit` | N/A | N/A |
 | Chmod only | `git add --chmod=+x` | N/A | N/A |
@@ -440,3 +458,8 @@ staging operation returns exit 9 / `LBR-WARN-001`; retrying `add` is unnecessary
 - `.gitignore` and `.libraignore` both use Git ignore syntax; `.libraignore`
   remains the Libra-specific override file when both exist in the same directory
 - LFS-tracked files are automatically converted to pointer files during staging
+- Remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001` (`-i`/`--interactive`, D15 remainder). Use `libra add -p` or `libra add <pathspec>`.
+
+## Issue #477 notes
+
+remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001`

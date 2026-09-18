@@ -1014,6 +1014,9 @@ async fn test_worktree_add_rejects_existing_non_empty_directory() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     exec_commit(&["-m", "initial"])
@@ -1109,6 +1112,9 @@ async fn test_worktree_add_rolls_back_link_on_restore_failure() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     exec_commit(&["-m", "initial"])
@@ -1175,6 +1181,9 @@ async fn test_worktree_add_rolls_back_populated_files_when_state_save_fails() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     exec_commit(&["-m", "initial"])
@@ -1377,6 +1386,9 @@ async fn test_worktree_add_does_not_reset_index() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1400,6 +1412,9 @@ async fn test_worktree_add_does_not_reset_index() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1450,6 +1465,9 @@ async fn test_worktree_add_populates_from_head_not_staged_index() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     exec_commit(&["-m", "initial"])
@@ -1472,6 +1490,9 @@ async fn test_worktree_add_populates_from_head_not_staged_index() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 

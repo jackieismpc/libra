@@ -250,6 +250,9 @@ async fn test_basic_cherry_pick() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -305,6 +308,9 @@ async fn test_basic_cherry_pick() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -347,6 +353,9 @@ async fn test_basic_cherry_pick() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -500,6 +509,9 @@ async fn test_cherry_pick_with_commit() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -551,6 +563,9 @@ async fn test_cherry_pick_with_commit() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -659,6 +674,9 @@ async fn test_cherry_pick_multiple_commits() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -711,6 +729,9 @@ async fn test_cherry_pick_multiple_commits() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -748,6 +769,9 @@ async fn test_cherry_pick_multiple_commits() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1015,6 +1039,9 @@ async fn test_cherry_pick_sha256_hash_handling() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(commit::CommitArgs {
@@ -1065,6 +1092,9 @@ async fn test_cherry_pick_sha256_hash_handling() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(commit::CommitArgs {
@@ -1691,6 +1721,10 @@ async fn cherry_pick_state_roundtrip_persists_and_clears() {
 
 /// Build a repo where cherry-picking the returned `feat` commit onto `main`
 /// conflicts on `shared.txt` (base/ours/theirs all differ). HEAD on `main`.
+fn cherry_pick_subject_label(oid: &str, subject: &str) -> String {
+    format!("{} ({subject})", oid.chars().take(7).collect::<String>())
+}
+
 fn conflict_repo() -> (tempfile::TempDir, String) {
     let repo = create_committed_repo_via_cli();
     let p = repo.path();
@@ -1808,11 +1842,12 @@ fn rerere_conflict_sequence_repo() -> (tempfile::TempDir, String, String) {
 
 /// `merge.conflictStyle = diff3` is honored by cherry-pick's line-level markers
 /// (parity with `libra merge` — Git honors the config for both): the base block
-/// appears as `||||||| base` with the common-ancestor content (lore.md §1.3).
+/// is `||||||| parent of <abbrev7> (subject)` (HF-04 / ADR-HF-05 L8b).
 #[test]
 fn cherry_pick_conflict_honors_diff3_style() {
     let (repo, feat) = conflict_repo();
     let p = repo.path();
+    let pick = cherry_pick_subject_label(&feat, "feature edit");
     assert_cli_success(
         &run_libra_command(&["config", "merge.conflictStyle", "diff3"], p),
         "set conflictStyle",
@@ -1821,7 +1856,7 @@ fn cherry_pick_conflict_honors_diff3_style() {
     assert_eq!(out.status.code(), Some(128), "conflict exit");
     let body = std::fs::read_to_string(p.join("shared.txt")).unwrap();
     assert!(
-        body.contains("||||||| base\nbase\n=======\n"),
+        body.contains(&format!("||||||| parent of {pick}\nbase\n=======\n")),
         "diff3 base block with ancestor content: {body:?}"
     );
 }
@@ -1840,8 +1875,9 @@ fn cherry_pick_conflict_honors_zdiff3_style() {
     let out = run_libra_command(&["cherry-pick", &feat], p);
     assert_eq!(out.status.code(), Some(128), "conflict exit");
     let body = std::fs::read_to_string(p.join("shared.txt")).unwrap();
+    let pick = cherry_pick_subject_label(&feat, "feature edit");
     assert!(
-        body.contains("||||||| base\nbase\n=======\n"),
+        body.contains(&format!("||||||| parent of {pick}\nbase\n=======\n")),
         "zdiff3 base block comes from the shared renderer: {body:?}"
     );
     assert!(
@@ -4099,18 +4135,10 @@ fn test_reset_keeps_multi_pick_sequence() {
         report.error_code, "LBR-CONFLICT-002",
         "S7a: a new pick is still refused: {human}"
     );
-    // In the HF-01 window `--continue` refuses instead of recording the reset
-    // index as the concluded commit; `--skip` applies the rest.
-    let cont = run_libra_command(&["cherry-pick", "--continue"], p);
-    let (human, report) = parse_cli_error_stderr(&cont.stderr);
-    assert_eq!(report.error_code, "LBR-REPO-003", "S7a --continue: {human}");
-    assert!(
-        human.contains("concluded by a later reset"),
-        "S7a --continue: {human}"
-    );
+    // HF-02: `--continue` consumes the marker and applies the remaining picks.
     assert_cli_success(
-        &run_libra_command(&["cherry-pick", "--skip"], p),
-        "S7a skip",
+        &run_libra_command(&["cherry-pick", "--continue"], p),
+        "S7a continue",
     );
     assert!(
         head_paths(p).contains("extra.txt"),
@@ -4209,5 +4237,287 @@ fn test_reset_warns_when_the_stopped_sequence_payload_is_unreadable() {
         repo_table_rows(p, "sequence_state"),
         before,
         "the unreadable row is left byte-identical"
+    );
+}
+
+fn resolve_shared_and_commit(p: &std::path::Path, message: &str) {
+    std::fs::write(p.join("shared.txt"), "resolved\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "shared.txt"], p),
+        "stage the resolution",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", message, "--no-verify"], p),
+        "commit the resolution",
+    );
+}
+
+/// M-SEQ S3, S7b, S9b (#477 HF-29, ADR-HF-03): a real commit concludes a
+/// stopped cherry-pick the same way reset does; `--dry-run` does not.
+#[test]
+fn test_commit_concludes_stopped_pick_matrix() {
+    // S3: resolve + commit ends a stopped single-commit pick.
+    let (repo, f1, f2) = conflict_sequence_repo();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["cherry-pick", &f1], p).status.code(),
+        Some(128),
+        "S3 pick conflicts"
+    );
+    resolve_shared_and_commit(p, "resolved pick");
+    assert!(
+        !status_text(p).contains("cherry-pick"),
+        "S3: the concluding commit clears the pick: {}",
+        status_text(p)
+    );
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", &f2], p),
+        "S3: the next pick runs",
+    );
+
+    // S7b: resolve + commit keeps a multi-commit sequence and marks the stop.
+    let (repo, f1, f2) = conflict_sequence_repo();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["cherry-pick", &f1, &f2], p)
+            .status
+            .code(),
+        Some(128),
+        "S7b multi pick conflicts"
+    );
+    resolve_shared_and_commit(p, "resolved stop");
+    assert!(
+        status_text(p).contains("cherry-pick in progress"),
+        "S7b: the sequence survives the commit: {}",
+        status_text(p)
+    );
+    let rows = repo_table_rows(p, "sequence_state");
+    assert_eq!(rows.len(), 1, "S7b: the row is kept");
+    assert!(
+        rows[0].contains(r#""stop_concluded":true"#) && rows[0].contains(&f2),
+        "S7b: the stopped commit is marked concluded and the todo is kept: {}",
+        rows[0]
+    );
+    assert!(
+        rows[0].contains(&f1),
+        "S7b: `current_oid` still names the stopped commit: {}",
+        rows[0]
+    );
+    let blocked = run_libra_command(&["cherry-pick", &f1, &f2], p);
+    let (human, report) = parse_cli_error_stderr(&blocked.stderr);
+    assert_eq!(
+        report.error_code, "LBR-CONFLICT-002",
+        "S7b: a new pick is still refused: {human}"
+    );
+
+    // S9b: `--dry-run` changes no sequence state.
+    let (repo, f1, _f2) = conflict_sequence_repo();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["cherry-pick", &f1], p).status.code(),
+        Some(128),
+        "S9b pick conflicts"
+    );
+    let before = repo_table_rows(p, "sequence_state");
+    assert_cli_success(
+        &run_libra_command(&["commit", "--dry-run", "-m", "preview", "--no-verify"], p),
+        "S9b dry-run",
+    );
+    assert_eq!(
+        repo_table_rows(p, "sequence_state"),
+        before,
+        "S9b: dry-run leaves the sequence untouched"
+    );
+    assert!(
+        status_text(p).contains("cherry-pick in progress"),
+        "S9b: the pick is still in progress: {}",
+        status_text(p)
+    );
+}
+
+/// M-CONT C1, C2, C4, C5, C6a, C6b (#477 HF-02, ADR-HF-03).
+#[test]
+fn test_continue_after_external_conclusion_skips_stopped_pick_matrix() {
+    // C1: reset --hard then --continue applies only the remaining pick.
+    let (repo, f1, f2) = conflict_sequence_repo();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["cherry-pick", &f1, &f2], p)
+            .status
+            .code(),
+        Some(128),
+        "C1 pick conflicts"
+    );
+    assert_cli_success(&run_libra_command(&["reset", "--hard"], p), "C1 reset");
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--continue"], p),
+        "C1 continue",
+    );
+    assert!(
+        head_paths(p).contains("extra.txt"),
+        "C1: the remaining commit is applied"
+    );
+    let subjects = log_subjects(p).join("\n");
+    assert!(
+        subjects.contains("f2 add extra") && subjects.contains("main edit"),
+        "C1 log: {subjects}"
+    );
+    assert!(
+        !subjects.contains("f1 edit"),
+        "C1: the stopped pick is not re-committed: {subjects}"
+    );
+    assert!(!status_text(p).contains("cherry-pick in progress"));
+
+    // C2: resolve + commit then --continue keeps the resolution and applies the rest.
+    let (repo, f1, f2) = conflict_sequence_repo();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["cherry-pick", &f1, &f2], p)
+            .status
+            .code(),
+        Some(128),
+        "C2 pick conflicts"
+    );
+    resolve_shared_and_commit(p, "resolved");
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--continue"], p),
+        "C2 continue",
+    );
+    let subjects = log_subjects(p).join("\n");
+    assert!(
+        subjects.contains("f2 add extra") && subjects.contains("resolved"),
+        "C2 log: {subjects}"
+    );
+    assert!(
+        !subjects.contains("f1 edit"),
+        "C2: the stopped pick is not re-committed: {subjects}"
+    );
+    assert!(head_paths(p).contains("extra.txt"));
+    assert!(!status_text(p).contains("cherry-pick in progress"));
+
+    // C4: staged changes after reset make --continue refuse with no writes.
+    let (repo, f1, f2) = conflict_sequence_repo();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["cherry-pick", &f1, &f2], p)
+            .status
+            .code(),
+        Some(128),
+        "C4 pick conflicts"
+    );
+    assert_cli_success(&run_libra_command(&["reset", "--hard"], p), "C4 reset");
+    std::fs::write(p.join("staged.txt"), "keep me\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "staged.txt"], p), "C4 stage");
+    let before_head = cp_rev_parse(p, "HEAD");
+    let before_rows = repo_table_rows(p, "sequence_state");
+    let blocked = run_libra_command(&["cherry-pick", "--continue"], p);
+    assert_eq!(blocked.status.code(), Some(128), "C4 continue");
+    let (human, report) = parse_cli_error_stderr(&blocked.stderr);
+    assert_eq!(report.error_code, "LBR-CONFLICT-001", "C4: {human}");
+    assert!(
+        human.contains("local changes would be overwritten"),
+        "C4: {human}"
+    );
+    assert_eq!(cp_rev_parse(p, "HEAD"), before_head);
+    assert_eq!(repo_table_rows(p, "sequence_state"), before_rows);
+    assert!(p.join("staged.txt").exists());
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--skip"], p),
+        "C4 skip still works",
+    );
+
+    // C5: the regular resolve + add + --continue path still records the stop.
+    let (repo, f1, f2) = conflict_sequence_repo();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["cherry-pick", &f1, &f2], p)
+            .status
+            .code(),
+        Some(128),
+        "C5 pick conflicts"
+    );
+    std::fs::write(p.join("shared.txt"), "resolved\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "C5 add");
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--continue"], p),
+        "C5 continue",
+    );
+    let subjects = log_subjects(p).join("\n");
+    assert!(
+        subjects.contains("f1 edit") && subjects.contains("f2 add extra"),
+        "C5 records the original stop message: {subjects}"
+    );
+
+    // C6a: --skip after reset applies the rest.
+    let (repo, f1, f2) = conflict_sequence_repo();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["cherry-pick", &f1, &f2], p)
+            .status
+            .code(),
+        Some(128),
+        "C6a pick conflicts"
+    );
+    assert_cli_success(&run_libra_command(&["reset", "--hard"], p), "C6a reset");
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--skip"], p),
+        "C6a skip",
+    );
+    assert!(head_paths(p).contains("extra.txt"));
+    assert!(!log_subjects(p).join("\n").contains("f1 edit"));
+    assert!(!status_text(p).contains("cherry-pick in progress"));
+
+    // C6b: --abort after reset restores the pre-sequence HEAD.
+    let (repo, f1, f2) = conflict_sequence_repo();
+    let p = repo.path();
+    let orig = cp_rev_parse(p, "HEAD");
+    assert_eq!(
+        run_libra_command(&["cherry-pick", &f1, &f2], p)
+            .status
+            .code(),
+        Some(128),
+        "C6b pick conflicts"
+    );
+    assert_cli_success(&run_libra_command(&["reset", "--hard"], p), "C6b reset");
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--abort"], p),
+        "C6b abort",
+    );
+    assert_eq!(cp_rev_parse(p, "HEAD"), orig);
+    assert!(!p.join("extra.txt").exists());
+    assert!(!status_text(p).contains("cherry-pick in progress"));
+}
+
+/// M-LABEL L5 / L8b (#477 HF-04): cherry-pick labels include the subject.
+#[test]
+fn test_cherry_pick_conflict_label_includes_subject() {
+    let (repo, feat) = conflict_repo();
+    let p = repo.path();
+    let pick = cherry_pick_subject_label(&feat, "feature edit");
+    let parent = format!("parent of {pick}");
+
+    let out = run_libra_command(&["cherry-pick", &feat], p);
+    assert_eq!(out.status.code(), Some(128), "L5 conflict");
+    let body = fs::read_to_string(p.join("shared.txt")).unwrap();
+    assert!(
+        body.contains("<<<<<<< HEAD\n") && body.contains(&format!(">>>>>>> {pick}\n")),
+        "L5 subject form: {body}"
+    );
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--abort"], p),
+        "L5 abort",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.conflictStyle", "diff3"], p),
+        "L8b style",
+    );
+    let out = run_libra_command(&["cherry-pick", &feat], p);
+    assert_eq!(out.status.code(), Some(128), "L8b conflict");
+    let body = fs::read_to_string(p.join("shared.txt")).unwrap();
+    assert!(
+        body.contains(&format!("||||||| {parent}\n"))
+            && body.contains(&format!(">>>>>>> {pick}\n")),
+        "L8b parent-of base: {body}"
     );
 }

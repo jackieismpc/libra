@@ -11,7 +11,7 @@ libra push [OPTIONS] [<repository> [<refspec>...]]
 
 ## 说明
 
-`libra push` 将提交、树、blob 和标签从本地仓库传输到远程。无参数调用时，它会把当前分支推送到已配置的上游远程。给出 `repository` 和一个或多个 `refspec` 值时，所有 refspec 会在任何网络写入前完成校验，然后作为一个 receive-pack 请求发送。`--tags` 推送所有本地标签，`--mirror` 将本地分支/标签 refs 镜像到远程，包括删除远程独有 refs。
+`libra push` 将提交、树、blob 和标签从本地仓库传输到远程。无参数调用时，它会把当前分支推送到已配置的上游远程。已配置的本地 upstream（`branch.<name>.remote=.`）会在任何网络写入前被拒绝（`LBR-CLI-003`，退出 129；Git `push` 为 128，属有意差异）。本地 upstream 上的网络操作延后到 [issues/480 HP-16](https://github.com/libra-tools/libra/issues/480)。显式仓库参数 `.` 仍走现有的 `remote '.' not found`。给出 `repository` 和一个或多个 `refspec` 值时，所有 refspec 会在任何网络写入前完成校验，然后作为一个 receive-pack 请求发送。`--tags` 推送所有本地标签，`--mirror` 将本地分支/标签 refs 镜像到远程，包括删除远程独有 refs。
 
 该命令会与远程协商以确定缺失对象，把它们打包为单个 pack 文件，并随 ref-update 请求一起发送。如果远程 ref 已分叉（非快进），除非使用 `--force`，否则推送会被拒绝。
 
@@ -355,6 +355,7 @@ Git LFS 需要单独的二进制（`git-lfs`）和 post-push hook 来上传大�
 | HEAD 已分离 | `LBR-REPO-003` | 128 | "checkout a branch before pushing" |
 | 未配置远程 | `LBR-REPO-003` | 128 | "use 'libra remote add' to configure a remote" |
 | 找不到远程 | `LBR-CLI-003` | 129 | "use 'libra remote -v'" + 模糊 "did you mean?" |
+| 已配置本地 upstream（`branch.<name>.remote=.`） | `LBR-CLI-003` | 129 | 用 `libra branch --unset-upstream` 清除；网络支持见 issues/480 HP-16（Git `push` 为 128，属有意差异） |
 | 无效 refspec | `LBR-CLI-002` | 129 | "use '\<name>' or '\<src>:\<dst>'" |
 | 找不到源 ref | `LBR-CLI-003` | 129 | "verify the local branch/ref exists" |
 | 本地文件远程 | `LBR-CLI-003` | 129 | "push supports network remotes only" |
@@ -506,3 +507,7 @@ HTTP(S) 广告声明仓库为空后，仍会校验剩余的全部 pkt-line 帧�
 原因固定且不回显远端字节，不再误报为空仓库成功。重试前请核对远端 Git 服务或代理
 响应。合法空仓库、支持的 SHA-1/SHA-256 广告、既有命令 hint 和结构化错误字段保持
 原有行为。
+
+## Issue #477 notes
+
+拒绝对本地 upstream（`remote=.`）执行

@@ -2845,7 +2845,7 @@ pub const GC_OBJECT_FILE_SOURCE_INVENTORY: &[GcObjectSource] = &[
     },
     GcObjectSource {
         origin: GcSourceOrigin::File,
-        location: "<gitdir>/COMMIT_EDITMSG, MERGE_MSG, CHERRY_PICK_MSG, REVERT_EDITMSG, TAG_EDITMSG, NOTES_EDITMSG, BRANCH_DESCRIPTION_EDITMSG",
+        location: "<gitdir>/COMMIT_EDITMSG, MERGE_MSG, SQUASH_MSG, CHERRY_PICK_MSG, REVERT_EDITMSG, TAG_EDITMSG, NOTES_EDITMSG, BRANCH_DESCRIPTION_EDITMSG",
         column: "",
         status: GcSourceStatus::NonRoot,
         kind: GcStorageKind::Sidecar,
@@ -4993,6 +4993,18 @@ mod tests {
             (
                 "obliteration-audit.jsonl",
                 "audit trail; the AntiRoot itself is the `object_obliteration` table",
+            ),
+            (
+                "ADD_EDIT.patch",
+                "temporary add/reset -p hunk-edit buffer; contains no object ids and is removed after the session",
+            ),
+            (
+                "rebase-merge",
+                "temporary interactive rebase editor directory; durable OIDs live in rebase-aux.json",
+            ),
+            (
+                "git-rebase-todo",
+                "temporary sequence-editor buffer under rebase-merge/; cleaned up after edit",
             ),
         ];
 

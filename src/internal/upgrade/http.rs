@@ -7,7 +7,7 @@
 //! conservative connect/read deadlines, and re-checks the effective URL
 //! before reading any body byte. Download streaming is bounded by
 //! [`SizeGate`]: a declared `Content-Length` larger than the manifest's
-//! artifact size (or the global 128 MiB cap) aborts before the body, every
+//! artifact size (or the global 256 MiB cap) aborts before the body, every
 //! chunk is counted with immediate abort past the expected size, and the
 //! stream must end at EXACTLY the expected size with a matching sha256.
 
@@ -151,7 +151,7 @@ pub struct SizeGate {
 
 impl SizeGate {
     /// `expected` must already satisfy the manifest bound
-    /// `0 < expected <= 128 MiB`; violations are rejected here again as
+    /// `0 < expected <= 256 MiB`; violations are rejected here again as
     /// defense in depth.
     pub fn new(expected: u64) -> Result<Self, UpgradeHttpError> {
         if expected == 0 || expected > MAX_ARTIFACT_BYTES {

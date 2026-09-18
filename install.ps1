@@ -22,7 +22,7 @@ $ErrorActionPreference = "Stop"
 # One of the release version surfaces. `compat_version_surface_sync` pins it
 # to Cargo.toml: this value is substituted verbatim into the download URL, so
 # a stale value silently installs an old binary when -Version is not given.
-$DefaultVersion = "v0.22.47"
+$DefaultVersion = "v0.22.49"
 # Public-only trust anchor for stable-manifest verification. It deliberately
 # has no environment override: the install-smoke harness rewrites these
 # clearly-marked constants in a temporary COPY of this script.
@@ -345,13 +345,13 @@ function Resolve-StableChannel {
         throw "signed artifact URL does not match the pinned origin/version layout: $($artifact.url)"
     }
     # Digest must be exactly 64 lowercase hex; size mirrors the native
-    # (0, 128 MiB] bound — a signed zero-byte or oversized row is refused.
+    # (0, 256 MiB] bound — a signed zero-byte or oversized row is refused.
     if ([string]$artifact.sha256 -cnotmatch '^[0-9a-f]{64}$') {
         throw "signed manifest artifact sha256 is not 64 lowercase hex - refusing to install"
     }
     $artifactSize = [long]$artifact.size
-    if ($artifactSize -le 0 -or $artifactSize -gt 134217728) {
-        throw "signed manifest artifact size $artifactSize is outside (0, 128 MiB] - refusing to install"
+    if ($artifactSize -le 0 -or $artifactSize -gt 268435456) {
+        throw "signed manifest artifact size $artifactSize is outside (0, 256 MiB] - refusing to install"
     }
     return @{
         Version = "v$payloadVersion"

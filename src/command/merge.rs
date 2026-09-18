@@ -37,7 +37,7 @@ use crate::{
         commit::{CleanupMode, cleanup_commit_message, parse_cleanup_mode},
         editor,
     },
-    common_utils::format_commit_msg,
+    common_utils::{format_commit_msg, parse_commit_msg},
     info_println,
     internal::{
         branch::{Branch, BranchStoreError},
@@ -1975,6 +1975,230 @@ fn snapshot_held_autostash() -> Result<Option<AutostashSnapshot>, String> {
     MergeAutostash::load_snapshot()
 }
 
+/// In-progress merge (and optional held autostash) captured before a user
+/// `reset` writes HEAD/index. ADR-HF-03 item 5 (#477 HF-26).
+pub(crate) struct StoppedMerge {
+    merge_state_bytes: Option<Vec<u8>>,
+    autostash: Option<AutostashSnapshot>,
+}
+
+/// Snapshot merge-state.json and merge-autostash.json before a whole-tree
+/// reset, so conclusion can only ever finish the merge this reset observed.
+pub(crate) fn snapshot_stopped_merge() -> Result<Option<StoppedMerge>, String> {
+    let path = MergeState::path();
+    let merge_state_bytes = if path.exists() {
+        Some(
+            fs::read(&path)
+                .map_err(|error| format!("failed to read {}: {error}", path.display()))?,
+        )
+    } else {
+        None
+    };
+    let autostash = snapshot_held_autostash()?;
+    if merge_state_bytes.is_none() && autostash.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(StoppedMerge {
+        merge_state_bytes,
+        autostash,
+    }))
+}
+
+fn merge_autostash_promote_warning(detail: &str) -> String {
+    format!(
+        "reset completed, but the merge autostash could not be moved into the stash list \
+         ({detail}); merge-state.json and merge-autostash.json were left in place. \
+         Recover the local changes with `libra merge --abort`."
+    )
+}
+
+fn merge_reset_promote_fail_injected() -> bool {
+    std::env::var_os("LIBRA_TEST").is_some()
+        && std::env::var("LIBRA_TEST_MERGE_AUTOSTASH_PROMOTE")
+            .ok()
+            .as_deref()
+            == Some("fail")
+}
+
+/// After a successful user reset: promote a held merge autostash into the
+/// stash list first, then drop merge-state.json. Promotion failure leaves
+/// both sidecars and stops later sequence conclusions (ADR-HF-03 item 5).
+pub(crate) async fn conclude_stopped_merge(snapshot: StoppedMerge) -> Result<Vec<String>, String> {
+    let mut notes = Vec::new();
+    if let Some(autostash) = snapshot.autostash {
+        if merge_reset_promote_fail_injected() {
+            return Err(merge_autostash_promote_warning("test-injected failure"));
+        }
+        let oid = ObjectHash::from_str(&autostash.sidecar.stash_commit).map_err(|error| {
+            merge_autostash_promote_warning(&format!("invalid stash OID ({error})"))
+        })?;
+        crate::command::stash::store_stash_commit(&oid, "autostash")
+            .await
+            .map_err(|error| merge_autostash_promote_warning(&error.to_string()))?;
+        match cleanup_autostash_if_matches(&autostash) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(merge_autostash_promote_warning(
+                    "the autostash sidecar changed while it was being promoted",
+                ));
+            }
+            Err(error) => return Err(merge_autostash_promote_warning(&error)),
+        }
+        notes.push(
+            "Your changes are safe in the stash (stash@{0}).\nAfter resolving any conflicts, run \"libra stash pop\" to restore your local changes."
+                .to_string(),
+        );
+    }
+
+    if let Some(expected) = snapshot.merge_state_bytes {
+        let path = MergeState::path();
+        let current = if path.exists() {
+            fs::read(&path).map_err(|error| {
+                format!(
+                    "reset completed, but merge-state.json could not be re-read ({error}); \
+                     it was left in place. Finish or abort the merge with `libra merge --abort`."
+                )
+            })?
+        } else {
+            Vec::new()
+        };
+        if current == expected {
+            MergeState::cleanup().map_err(|error| {
+                format!(
+                    "reset completed, but merge-state.json could not be removed ({error}); \
+                     it was left in place. Finish or abort the merge with `libra merge --abort`."
+                )
+            })?;
+        }
+    }
+
+    if let Err(error) =
+        crate::internal::sequencer::clear(crate::internal::sequencer::SequenceKind::Merge).await
+    {
+        notes.push(format!(
+            "reset cleared merge-state.json, but the merge sequencer row could not be removed ({error})"
+        ));
+    }
+    Ok(notes)
+}
+
+/// Parent OIDs for a user `commit` that finishes this merge: HEAD plus every
+/// recorded target (ADR-HF-21 / #477 HF-27).
+pub(crate) fn merge_commit_parents(state: &MergeState) -> Result<Vec<ObjectHash>, String> {
+    let mut parents = vec![
+        object_hash_from_state("orig_head", &state.orig_head).map_err(|error| error.to_string())?,
+    ];
+    let targets: Vec<&str> = if state.targets.is_empty() {
+        vec![state.target.as_str()]
+    } else {
+        state.targets.iter().map(String::as_str).collect()
+    };
+    for target in targets {
+        parents.push(object_hash_from_state("target", target).map_err(|error| error.to_string())?);
+    }
+    Ok(parents)
+}
+
+/// Default message replayed by `commit` when no `-m`/`-F` is given.
+pub(crate) fn merge_commit_message(state: &MergeState) -> String {
+    state
+        .message
+        .clone()
+        .unwrap_or_else(|| format!("Merge {} into {}", state.target_ref, state.head_name))
+}
+
+fn squash_message_path() -> PathBuf {
+    util::request_worktree_gitdir_strict().join("SQUASH_MSG")
+}
+
+/// Git's `SQUASH_MSG` analog: a squash merge writes this, `commit` reads it,
+/// and a successful commit deletes it (MC12).
+pub(crate) fn load_squash_message() -> Result<Option<String>, String> {
+    let path = squash_message_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    fs::read_to_string(&path)
+        .map(Some)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))
+}
+
+pub(crate) fn clear_squash_message() -> Result<(), String> {
+    let path = squash_message_path();
+    if !path.exists() {
+        return Ok(());
+    }
+    crate::utils::atomic_write::remove_durably(&path)
+        .map_err(|error| format!("failed to remove {}: {error}", path.display()))
+}
+
+fn record_squash_message(message: &str) -> Result<(), PullMergeError> {
+    let path = squash_message_path();
+    let body = if message.starts_with("Squashed commit of the following:") {
+        message.to_string()
+    } else {
+        format!("Squashed commit of the following:\n\n{message}")
+    };
+    write_merge_message(&path, &body)
+}
+
+fn append_conflict_comments(message: &str, paths: &[PathBuf]) -> String {
+    if paths.is_empty() {
+        return message.to_string();
+    }
+    let mut out = message.trim_end().to_string();
+    out.push_str("\n\n# Conflicts:\n");
+    for path in paths {
+        out.push_str("#\t");
+        out.push_str(&path.display().to_string());
+        out.push('\n');
+    }
+    out
+}
+
+/// After a user `commit` that finished the merge: drop merge-state.json, then
+/// apply a held autostash onto the new tree (ADR-HF-21).
+pub(crate) async fn conclude_merge_after_commit(
+    snapshot: StoppedMerge,
+    output: &OutputConfig,
+) -> Result<Vec<String>, String> {
+    let mut notes = Vec::new();
+    if let Some(expected) = snapshot.merge_state_bytes {
+        let path = MergeState::path();
+        let current = if path.exists() {
+            fs::read(&path).map_err(|error| {
+                format!(
+                    "commit completed, but merge-state.json could not be re-read ({error}); \
+                     it was left in place. Finish or abort the merge with `libra merge --abort`."
+                )
+            })?
+        } else {
+            Vec::new()
+        };
+        if current == expected {
+            MergeState::cleanup().map_err(|error| {
+                format!(
+                    "commit completed, but merge-state.json could not be removed ({error}); \
+                     it was left in place. Finish or abort the merge with `libra merge --abort`."
+                )
+            })?;
+        }
+    }
+    if let Err(error) =
+        crate::internal::sequencer::clear(crate::internal::sequencer::SequenceKind::Merge).await
+    {
+        notes.push(format!(
+            "commit cleared merge-state.json, but the merge sequencer row could not be removed ({error})"
+        ));
+    }
+    if let Some(autostash) = snapshot.autostash
+        && let Some(status) = resolve_pending_autostash_with(output, autostash, false).await
+    {
+        notes.push(format!("merge autostash: {status}"));
+    }
+    Ok(notes)
+}
+
 async fn resolve_pending_autostash(
     output: &OutputConfig,
     preserve_conflicts: bool,
@@ -2427,6 +2651,7 @@ async fn run_octopus_merge(
 
         if options.squash {
             reset_index_and_workdir_to_tree(&tree_id)?;
+            record_squash_message(&resolved_message)?;
             let summary = PullMergeSummary {
                 strategy: "squash".to_string(),
                 selected_strategy: None,
@@ -3591,7 +3816,8 @@ pub(crate) async fn merge_rebase_trees(
             head_name: String::new(),
             message: String::new(),
             squash: true,
-            upstream: replay_label,
+            upstream: replay_label.clone(),
+            marker_labels: GitConflictLabels::for_rebase_replay(&replay_label),
             base: recorded_merge_base(base_commits),
             allow_unrelated_histories: false,
             skip_hooks: false,
@@ -3762,6 +3988,7 @@ async fn perform_ours_merge(
     }
 
     if options.squash {
+        record_squash_message(&resolved_message)?;
         return Ok(PullMergeSummary {
             strategy: "squash".to_string(),
             selected_strategy: None,
@@ -4128,6 +4355,10 @@ async fn perform_three_way_merge(
             message: resolved_message,
             squash: options.squash,
             upstream: upstream.to_string(),
+            marker_labels: GitConflictLabels::for_merge(
+                upstream,
+                recorded_merge_base(&base_commits).as_ref(),
+            ),
             base: recorded_merge_base(&base_commits),
             allow_unrelated_histories: options.allow_unrelated_histories,
             skip_hooks: options.skip_hooks,
@@ -4210,6 +4441,7 @@ async fn perform_three_way_merge(
         // create a commit or move HEAD, leaving the result staged for a normal
         // `commit`. No MERGE_HEAD/merge info is recorded (matches Git).
         reset_index_and_workdir_to_tree(&tree_id)?;
+        record_squash_message(&resolved_message)?;
         return Ok(PullMergeSummary {
             strategy: "squash".to_string(),
             selected_strategy: None,
@@ -4412,6 +4644,8 @@ struct MergeConflictInput {
     /// Resolved merge message (see [`MergeState::message`]).
     message: String,
     upstream: String,
+    /// Worktree / AUTO_MERGE conflict-marker labels (HF-04 / ADR-HF-05).
+    marker_labels: GitConflictLabels,
     /// Real common ancestor, or `None` for the virtual empty base used by an
     /// unrelated-history merge.
     base: Option<ObjectHash>,
@@ -4514,7 +4748,6 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
     refuse_symlink_traversal(&util::working_dir(), &paths_to_write, &removals)?;
 
     let workdir = util::working_dir();
-    let theirs_abbrev = short_object_id(&input.theirs);
     // Create the automatic conflict-result tree before publishing the state
     // that roots it. This tree deliberately contains the same marker content
     // written below, rather than reading the worktree after a write.
@@ -4524,7 +4757,7 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
         Some(automatic_merge_tree(
             &input.merged_items,
             &placements,
-            &theirs_abbrev,
+            &input.marker_labels,
             input.conflict_style,
         )?)
     };
@@ -4601,7 +4834,7 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
             .iter()
             .map(|path| path.display().to_string())
             .collect(),
-        message: Some(input.message),
+        message: Some(append_conflict_comments(&input.message, &conflict_paths)),
         auto_merge: auto_merge.map(|tree| tree.to_string()),
     };
     // Git builtin/merge.c writes merge state only for a non-squash result.
@@ -4670,8 +4903,14 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
                 .map_err(PullMergeError::WorkdirReset)?;
             continue;
         }
-        write_conflict_markers(&workdir, path, &theirs_abbrev, *kind, input.conflict_style)
-            .map_err(PullMergeError::WorkdirReset)?;
+        write_conflict_markers(
+            &workdir,
+            path,
+            &input.marker_labels,
+            *kind,
+            input.conflict_style,
+        )
+        .map_err(PullMergeError::WorkdirReset)?;
     }
 
     Ok(())
@@ -4708,7 +4947,7 @@ fn moved_file_content(kind: &ConflictKind) -> Option<MergeTreeEntry> {
 fn automatic_merge_tree(
     merged_items: &HashMap<PathBuf, MergeTreeEntry>,
     placements: &[(PathBuf, ConflictKind, Option<PathBuf>)],
-    commit_abbrev: &str,
+    labels: &GitConflictLabels,
     conflict_style: ConflictStyle,
 ) -> Result<ObjectHash, PullMergeError> {
     let mut items = merged_items.clone();
@@ -4716,10 +4955,10 @@ fn automatic_merge_tree(
         let entry = if original.is_some() {
             match moved_file_content(kind) {
                 Some(entry) => entry,
-                None => automatic_conflict_entry(kind, commit_abbrev, conflict_style)?,
+                None => automatic_conflict_entry(kind, labels, conflict_style)?,
             }
         } else {
-            automatic_conflict_entry(kind, commit_abbrev, conflict_style)?
+            automatic_conflict_entry(kind, labels, conflict_style)?
         };
         items.insert(path.clone(), entry);
     }
@@ -4728,7 +4967,7 @@ fn automatic_merge_tree(
 
 fn automatic_conflict_entry(
     kind: &ConflictKind,
-    commit_abbrev: &str,
+    labels: &GitConflictLabels,
     conflict_style: ConflictStyle,
 ) -> Result<MergeTreeEntry, PullMergeError> {
     let content = match *kind {
@@ -4766,7 +5005,7 @@ fn automatic_conflict_entry(
                         }
                         None => Vec::new(),
                     };
-                    match merge_bytes_with_refined_driver(
+                    match merge_bytes_with_refined_driver_labeled(
                         driver,
                         &base_data,
                         &ours_blob.data,
@@ -4774,6 +5013,7 @@ fn automatic_conflict_entry(
                         None,
                         conflict_style,
                         0,
+                        labels.as_marker_labels(),
                     )
                     .map_err(PullMergeError::TreeCreate)?
                     {
@@ -4785,7 +5025,7 @@ fn automatic_conflict_entry(
                     base,
                     &ours_blob.data,
                     &theirs_blob.data,
-                    commit_abbrev,
+                    labels,
                     conflict_style,
                 )
                 .map_err(PullMergeError::TreeCreate)?,
@@ -4800,8 +5040,8 @@ fn automatic_conflict_entry(
             render_whole_file_conflict(
                 ours.as_bytes(),
                 &[],
-                "HEAD",
-                &format!("{commit_abbrev} (deleted)"),
+                GitConflictLabels::OURS,
+                &format!("{} (deleted)", labels.theirs),
             )
         }
         ConflictKind::TheirsModifiedOursDeleted { theirs } => {
@@ -4811,7 +5051,12 @@ fn automatic_conflict_entry(
                     detail: error.to_string(),
                 })?;
             let theirs = conflict_payload(&theirs_blob.data);
-            render_whole_file_conflict(&[], theirs.as_bytes(), "HEAD (deleted)", commit_abbrev)
+            render_whole_file_conflict(
+                &[],
+                theirs.as_bytes(),
+                &format!("{} (deleted)", GitConflictLabels::OURS),
+                &labels.theirs,
+            )
         }
         ConflictKind::FileDirectory { file, .. } => return Ok(file),
         ConflictKind::RenameMerged { content, .. } | ConflictKind::DirectorySplit { content } => {
@@ -6182,7 +6427,21 @@ fn try_merge_blob_contents(
 
     let (merged_bytes, content_clean) = match outcome {
         BuiltinMergeOutcome::Clean(bytes) => (bytes, true),
-        BuiltinMergeOutcome::Conflict(bytes) => (bytes, false),
+        BuiltinMergeOutcome::Conflict(bytes)
+            if matches!(driver, SelectedMergeDriver::External(_)) =>
+        {
+            (bytes, false)
+        }
+        BuiltinMergeOutcome::Conflict(bytes) => (
+            relabel_conflict_markers(
+                bytes,
+                marker_length,
+                &context.ours_label,
+                &context.theirs_label,
+                &context.ancestor_label,
+            ),
+            false,
+        ),
     };
     let clean = content_clean && mode_clean;
     let rendered = matches!(driver, SelectedMergeDriver::External(_))
@@ -7173,6 +7432,11 @@ pub(crate) fn merge_bytes_with_driver(
         conflict_style.into(),
         extra_marker_size,
         false,
+        ConflictMarkerLabels {
+            ours: "ours",
+            base: "original",
+            theirs: "theirs",
+        },
     )
 }
 
@@ -7188,6 +7452,33 @@ pub(crate) fn merge_bytes_with_refined_driver(
     conflict_style: ConflictStyle,
     extra_marker_size: usize,
 ) -> Result<BuiltinMergeOutcome, String> {
+    merge_bytes_with_refined_driver_labeled(
+        driver,
+        base,
+        ours,
+        theirs,
+        favor,
+        conflict_style,
+        extra_marker_size,
+        ConflictMarkerLabels {
+            ours: "ours",
+            base: "original",
+            theirs: "theirs",
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn merge_bytes_with_refined_driver_labeled(
+    driver: BuiltinMergeDriver,
+    base: &[u8],
+    ours: &[u8],
+    theirs: &[u8],
+    favor: Option<MergeFavor>,
+    conflict_style: ConflictStyle,
+    extra_marker_size: usize,
+    labels: ConflictMarkerLabels<'_>,
+) -> Result<BuiltinMergeOutcome, String> {
     merge_bytes_with_driver_impl(
         driver,
         base,
@@ -7197,6 +7488,7 @@ pub(crate) fn merge_bytes_with_refined_driver(
         conflict_style,
         extra_marker_size,
         true,
+        labels,
     )
 }
 
@@ -7210,6 +7502,7 @@ fn merge_bytes_with_driver_impl(
     conflict_style: ConflictStyle,
     extra_marker_size: usize,
     refine: bool,
+    labels: ConflictMarkerLabels<'_>,
 ) -> Result<BuiltinMergeOutcome, String> {
     // High-level merge consumers normally settle these OID-equality cases
     // before low-level dispatch. Keep the shared helper equally safe for
@@ -7272,11 +7565,7 @@ fn merge_bytes_with_driver_impl(
                         base,
                         ours,
                         theirs,
-                        ConflictMarkerLabels {
-                            ours: "ours",
-                            base: "original",
-                            theirs: "theirs",
-                        },
+                        labels,
                     )?;
                     Ok(if has_conflicts {
                         BuiltinMergeOutcome::Conflict(rendered)
@@ -7294,10 +7583,10 @@ fn merge_bytes_with_driver_impl(
 }
 
 #[derive(Clone, Copy)]
-struct ConflictMarkerLabels<'a> {
-    ours: &'a str,
-    base: &'a str,
-    theirs: &'a str,
+pub(crate) struct ConflictMarkerLabels<'a> {
+    pub ours: &'a str,
+    pub base: &'a str,
+    pub theirs: &'a str,
 }
 
 fn marker_bytes(byte: u8, marker_len: usize, label: Option<&str>, eol: &[u8]) -> Vec<u8> {
@@ -10939,7 +11228,7 @@ fn rename_destination_conflict(
     path: &Path,
     ours: &MergeTreeEntry,
     theirs: &MergeTreeEntry,
-    upstream: &str,
+    _upstream: &str,
     conflict_style: ConflictStyle,
     context: &mut TreeMergeContext<'_>,
 ) -> Result<ConflictKind, PullMergeError> {
@@ -10982,7 +11271,11 @@ fn rename_destination_conflict(
                         None,
                         &ours_blob.data,
                         &theirs_blob.data,
-                        upstream,
+                        &GitConflictLabels {
+                            ours: context.ours_label.clone(),
+                            base: context.ancestor_label.clone(),
+                            theirs: context.theirs_label.clone(),
+                        },
                         conflict_style,
                     )
                     .map_err(PullMergeError::TreeCreate)?
@@ -13174,6 +13467,7 @@ async fn perform_incremental_three_way_merge(
             message: resolved_message,
             squash: options.squash,
             upstream: upstream.to_string(),
+            marker_labels: GitConflictLabels::for_merge(upstream, recorded_base.as_ref()),
             base: recorded_base,
             allow_unrelated_histories: options.allow_unrelated_histories,
             skip_hooks: options.skip_hooks,
@@ -13247,6 +13541,7 @@ async fn perform_incremental_three_way_merge(
     if options.squash {
         report_incremental_walk_stats();
         reset_index_and_workdir_to_tree(&tree_id)?;
+        record_squash_message(&resolved_message)?;
         return Ok(Some(PullMergeSummary {
             strategy: "squash".to_string(),
             selected_strategy: None,
@@ -13920,7 +14215,7 @@ fn conflict_payload(content: &[u8]) -> Cow<'_, str> {
 fn write_conflict_markers(
     workdir: &Path,
     path: &Path,
-    commit_abbrev: &str,
+    labels: &GitConflictLabels,
     kind: ConflictKind,
     conflict_style: ConflictStyle,
 ) -> Result<(), String> {
@@ -13951,7 +14246,7 @@ fn write_conflict_markers(
                         }
                         None => Vec::new(),
                     };
-                    match merge_bytes_with_refined_driver(
+                    match merge_bytes_with_refined_driver_labeled(
                         driver,
                         &base_data,
                         &ours_blob.data,
@@ -13959,6 +14254,7 @@ fn write_conflict_markers(
                         None,
                         conflict_style,
                         0,
+                        labels.as_marker_labels(),
                     )? {
                         BuiltinMergeOutcome::Clean(bytes)
                         | BuiltinMergeOutcome::Conflict(bytes) => bytes,
@@ -13968,7 +14264,7 @@ fn write_conflict_markers(
                     base,
                     &ours_blob.data,
                     &theirs_blob.data,
-                    commit_abbrev,
+                    labels,
                     conflict_style,
                 )?,
             }
@@ -13979,14 +14275,19 @@ fn write_conflict_markers(
             render_whole_file_conflict(
                 ours.as_bytes(),
                 &[],
-                "HEAD",
-                &format!("{commit_abbrev} (deleted)"),
+                GitConflictLabels::OURS,
+                &format!("{} (deleted)", labels.theirs),
             )
         }
         ConflictKind::TheirsModifiedOursDeleted { theirs } => {
             let theirs_blob: Blob = load_object(&theirs).map_err(|error| error.to_string())?;
             let theirs = conflict_payload(&theirs_blob.data);
-            render_whole_file_conflict(&[], theirs.as_bytes(), "HEAD (deleted)", commit_abbrev)
+            render_whole_file_conflict(
+                &[],
+                theirs.as_bytes(),
+                &format!("{} (deleted)", GitConflictLabels::OURS),
+                &labels.theirs,
+            )
         }
         // The directory kept the original path; `path` here is already the
         // file's `unique_path`, and its content is written verbatim — Git
@@ -14025,13 +14326,18 @@ fn both_changed_conflict_content(
     base: Option<ObjectHash>,
     ours: &[u8],
     theirs: &[u8],
-    commit_abbrev: &str,
+    labels: &GitConflictLabels,
     conflict_style: ConflictStyle,
 ) -> Result<Vec<u8>, String> {
     let whole_file = || {
         let ours = conflict_payload(ours);
         let theirs = conflict_payload(theirs);
-        render_whole_file_conflict(ours.as_bytes(), theirs.as_bytes(), "HEAD", commit_abbrev)
+        render_whole_file_conflict(
+            ours.as_bytes(),
+            theirs.as_bytes(),
+            &labels.ours,
+            &labels.theirs,
+        )
     };
 
     // Load the common-ancestor content (if any) and defer to the shared
@@ -14043,11 +14349,11 @@ fn both_changed_conflict_content(
         }
         None => None,
     };
-    Ok(render_line_level_conflict(
+    Ok(render_line_level_conflict_labeled(
         base_data.as_deref(),
         ours,
         theirs,
-        commit_abbrev,
+        labels,
         conflict_style,
     )?
     .unwrap_or_else(whole_file))
@@ -14064,11 +14370,34 @@ fn both_changed_conflict_content(
 /// common-ancestor content (`None` for an add/add conflict with no base).
 /// `commit_label` is the `>>>>>>>` side label (e.g. the other commit's
 /// abbreviation).
+#[cfg(test)]
 pub(crate) fn render_line_level_conflict(
     base: Option<&[u8]>,
     ours: &[u8],
     theirs: &[u8],
     commit_label: &str,
+    conflict_style: ConflictStyle,
+) -> Result<Option<Vec<u8>>, String> {
+    render_line_level_conflict_labeled(
+        base,
+        ours,
+        theirs,
+        &GitConflictLabels {
+            ours: GitConflictLabels::OURS.to_string(),
+            base: "base".to_string(),
+            theirs: commit_label.to_string(),
+        },
+        conflict_style,
+    )
+}
+
+/// Same as [`render_line_level_conflict`], but uses the full Git-form label
+/// triple (HF-04 / ADR-HF-05) including the diff3 ancestor label.
+pub(crate) fn render_line_level_conflict_labeled(
+    base: Option<&[u8]>,
+    ours: &[u8],
+    theirs: &[u8],
+    labels: &GitConflictLabels,
     conflict_style: ConflictStyle,
 ) -> Result<Option<Vec<u8>>, String> {
     if std::str::from_utf8(ours).is_err()
@@ -14097,11 +14426,7 @@ pub(crate) fn render_line_level_conflict(
             base.unwrap_or(&[]),
             ours,
             theirs,
-            ConflictMarkerLabels {
-                ours: "HEAD",
-                base: "base",
-                theirs: commit_label,
-            },
+            labels.as_marker_labels(),
         )
         .map(|(rendered, has_conflicts)| has_conflicts.then_some(rendered)),
         // Content merged cleanly with no markers (no real text conflict — e.g. a
@@ -14396,6 +14721,97 @@ fn index_mode_to_tree_item_mode(mode: u32) -> Result<TreeItemMode, PullMergeErro
 fn short_object_id(object_id: &ObjectHash) -> String {
     let object_id = object_id.to_string();
     object_id.chars().take(7).collect()
+}
+
+/// Git-form conflict-marker labels (issue #477 HF-04 / ADR-HF-05).
+///
+/// Ours is always `HEAD`. Theirs and the diff3 ancestor label depend on the
+/// command: merge uses the user's original target spelling and the merge-base
+/// abbrev7; cherry-pick uses `<abbrev7> (subject)`; revert uses
+/// `parent of <abbrev7> (subject)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitConflictLabels {
+    pub ours: String,
+    pub base: String,
+    pub theirs: String,
+}
+
+impl GitConflictLabels {
+    pub(crate) const OURS: &'static str = "HEAD";
+
+    /// Strip control characters so a subject or user spelling cannot inject
+    /// extra marker lines.
+    pub(crate) fn sanitize(raw: &str) -> String {
+        raw.chars().filter(|c| !c.is_control()).collect()
+    }
+
+    pub(crate) fn first_subject_line(message: &str) -> String {
+        let (body, _) = parse_commit_msg(message);
+        let subject = body.lines().next().unwrap_or("").trim();
+        Self::sanitize(subject)
+    }
+
+    pub(crate) fn abbrev7(id: &ObjectHash) -> String {
+        short_object_id(id)
+    }
+
+    pub(crate) fn commit_subject(id: &ObjectHash, message: &str) -> String {
+        format!(
+            "{} ({})",
+            Self::abbrev7(id),
+            Self::first_subject_line(message)
+        )
+    }
+
+    pub(crate) fn parent_of(id: &ObjectHash, message: &str) -> String {
+        format!("parent of {}", Self::commit_subject(id, message))
+    }
+
+    /// Merge: theirs is the user's original target spelling; diff3 base is the
+    /// merge-base abbrev7, or `"base"` when there is no single real ancestor.
+    pub(crate) fn for_merge(target_spelling: &str, merge_base: Option<&ObjectHash>) -> Self {
+        Self {
+            ours: Self::OURS.to_string(),
+            base: merge_base
+                .map(Self::abbrev7)
+                .unwrap_or_else(|| "base".to_string()),
+            theirs: Self::sanitize(target_spelling),
+        }
+    }
+
+    pub(crate) fn for_cherry_pick(id: &ObjectHash, message: &str) -> Self {
+        Self {
+            ours: Self::OURS.to_string(),
+            base: Self::parent_of(id, message),
+            theirs: Self::commit_subject(id, message),
+        }
+    }
+
+    pub(crate) fn for_revert(id: &ObjectHash, message: &str) -> Self {
+        Self {
+            ours: Self::OURS.to_string(),
+            base: Self::commit_subject(id, message),
+            theirs: Self::parent_of(id, message),
+        }
+    }
+
+    /// Rebase replay keeps the historical hash / `base` labels so its existing
+    /// marker contract is unchanged (HF-04 only retargets merge/pick/revert).
+    fn for_rebase_replay(replay_label: &str) -> Self {
+        Self {
+            ours: Self::OURS.to_string(),
+            base: "base".to_string(),
+            theirs: replay_label.to_string(),
+        }
+    }
+
+    pub(crate) fn as_marker_labels(&self) -> ConflictMarkerLabels<'_> {
+        ConflictMarkerLabels {
+            ours: &self.ours,
+            base: &self.base,
+            theirs: &self.theirs,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -15268,6 +15684,56 @@ mod tests {
                 "theirs modified / ours deleted stays a conflict under {favor:?}"
             );
         }
+    }
+
+    #[test]
+    fn merge_commit_message_keeps_conflict_comments_for_no_edit() {
+        let message =
+            append_conflict_comments("Merge feature into main", &[PathBuf::from("shared.txt")]);
+        assert!(
+            message.contains("# Conflicts:\n#\tshared.txt\n"),
+            "{message}"
+        );
+        let state = MergeState {
+            head_name: "main".into(),
+            orig_head: "1".repeat(40),
+            target: "2".repeat(40),
+            target_ref: "feature".into(),
+            targets: Vec::new(),
+            target_refs: Vec::new(),
+            base: None,
+            strategy: None,
+            allow_unrelated_histories: false,
+            skip_hooks: false,
+            signing_policy: None,
+            signoff: false,
+            rerere_autoupdate: None,
+            conflicted_paths: vec!["shared.txt".into()],
+            message: Some(message.clone()),
+            auto_merge: None,
+        };
+        assert_eq!(merge_commit_message(&state), message);
+    }
+
+    #[test]
+    fn git_conflict_labels_helper_pins_git_forms() {
+        let id = ObjectHash::from_str(&"abcd1234".repeat(5)[..40]).expect("valid sha-1 hex");
+        let merge = GitConflictLabels::for_merge("refs/heads/side", Some(&id));
+        assert_eq!(merge.ours, "HEAD");
+        assert_eq!(merge.theirs, "refs/heads/side");
+        assert_eq!(merge.base, "abcd123");
+
+        let pick = GitConflictLabels::for_cherry_pick(&id, "subject line\n\nbody\n");
+        assert_eq!(pick.theirs, "abcd123 (subject line)");
+        assert_eq!(pick.base, "parent of abcd123 (subject line)");
+
+        let revert = GitConflictLabels::for_revert(&id, "subject line\n");
+        assert_eq!(revert.theirs, "parent of abcd123 (subject line)");
+        assert_eq!(revert.base, "abcd123 (subject line)");
+
+        let sanitized = GitConflictLabels::for_merge("side\u{0007}x", None);
+        assert_eq!(sanitized.theirs, "sidex");
+        assert_eq!(sanitized.base, "base");
     }
 
     #[test]

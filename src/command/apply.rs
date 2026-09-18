@@ -618,7 +618,7 @@ fn map_reason(reason: SectionApplyError) -> PatchPreparationError {
     }
 }
 
-enum SectionApplyError {
+pub(crate) enum SectionApplyError {
     Invalid(String),
     DoesNotApply(String),
 }
@@ -627,7 +627,7 @@ enum SectionApplyError {
 /// diffy engine (UTF-8 required), binary sections through the literal /
 /// delta decoder. Returns the bytes, the git-mode override, and whether
 /// the three-way fallback left conflict markers in the bytes.
-fn apply_section_content(
+pub(crate) fn apply_section_content(
     section: &str,
     headers: &SectionHeaders,
     base: Vec<u8>,
@@ -789,7 +789,7 @@ fn read_patch(patches: &[String]) -> Result<String, String> {
 
 /// PD-09 ②: parsed git extended headers of one file section.
 #[derive(Debug, Default)]
-struct SectionHeaders {
+pub(crate) struct SectionHeaders {
     /// `diff --git a/<old> b/<new>` sides, already `-p`-stripped.
     git_old: Option<String>,
     git_new: Option<String>,

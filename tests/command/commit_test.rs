@@ -81,6 +81,9 @@ async fn test_commit_requires_configured_identity_in_strict_mode() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -261,6 +264,9 @@ async fn test_execute_commit() {
             renormalize: false,
             ignore_missing: false,
             resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         };
         add::execute(args).await;
     }
@@ -359,6 +365,9 @@ async fn test_commit_with_all_flag_stages_tracked_changes() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -439,6 +448,9 @@ async fn test_commit_with_all_flag_records_deletions() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -544,6 +556,9 @@ async fn test_commit_sha256() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -638,6 +653,9 @@ async fn test_commit_with_custom_author() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -901,6 +919,9 @@ async fn test_commit_with_actual_changes() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     };
     add::execute(add_args).await;
 
@@ -989,6 +1010,9 @@ async fn test_commit_signoff_persists_trailer() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1158,6 +1182,9 @@ async fn test_commit_without_identity_fails_by_default() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1245,6 +1272,9 @@ async fn test_commit_cleanup_strips_comments() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1437,6 +1467,9 @@ async fn test_commit_trailer_appended() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1476,6 +1509,9 @@ async fn test_commit_dry_run_does_not_create_commit() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1516,6 +1552,9 @@ async fn test_commit_reuse_message() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1543,6 +1582,9 @@ async fn test_commit_reuse_message() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1584,6 +1626,9 @@ async fn test_commit_fixup_sets_subject() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1609,6 +1654,9 @@ async fn test_commit_fixup_sets_subject() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1958,4 +2006,403 @@ fn commit_with_terminal_index_failure_is_repaired_without_recommitting() {
         0,
         "repair must not require creating a second commit"
     );
+}
+
+fn merge_conflict_repo_for_commit() -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("shared.txt"), "top\nl1\nORIG\nl3\nbottom\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base shared", "--no-verify"], p),
+        "commit base",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "branch");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], p),
+        "co feature",
+    );
+    std::fs::write(p.join("shared.txt"), "top\nl1\nFEATURE\nl3\nbottom\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "add feature");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "feature edit", "--no-verify"], p),
+        "commit feature",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "co main");
+    std::fs::write(p.join("shared.txt"), "top\nl1\nMAIN\nl3\nbottom\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "add main");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main edit", "--no-verify"], p),
+        "commit main",
+    );
+    repo
+}
+
+fn resolve_merge_conflict(p: &std::path::Path) {
+    std::fs::write(p.join("shared.txt"), "top\nl1\nRESOLVED\nl3\nbottom\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "shared.txt"], p),
+        "stage resolution",
+    );
+}
+
+fn head_parent_count(p: &std::path::Path) -> usize {
+    let out = run_libra_command(&["cat-file", "-p", "HEAD"], p);
+    assert_cli_success(&out, "cat-file HEAD");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| line.starts_with("parent "))
+        .count()
+}
+
+fn head_message_body(p: &std::path::Path) -> String {
+    let out = run_libra_command(&["cat-file", "-p", "HEAD"], p);
+    assert_cli_success(&out, "cat-file HEAD message");
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split_once("\n\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default()
+}
+
+/// M-MCOMMIT MC1–MC9, MC11 (#477 HF-27): commit finishes an in-progress merge.
+#[test]
+fn test_commit_concludes_in_progress_merge_matrix() {
+    // MC5: unresolved conflicts still refuse.
+    let repo = merge_conflict_repo_for_commit();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["merge", "feature"], p).status.code(),
+        Some(128)
+    );
+    let refused = run_libra_command(&["commit", "-m", "nope", "--no-verify"], p);
+    assert_eq!(refused.status.code(), Some(128), "MC5");
+    assert!(
+        p.join(".libra/merge-state.json").exists(),
+        "MC5 keeps state"
+    );
+
+    // MC6: --amend during merge refuses and does not move HEAD.
+    let before = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    let amend = run_libra_command(&["commit", "--amend", "--no-edit", "--no-verify"], p);
+    assert_eq!(amend.status.code(), Some(128), "MC6");
+    assert!(
+        String::from_utf8_lossy(&amend.stderr).contains("cannot amend"),
+        "MC6: {}",
+        String::from_utf8_lossy(&amend.stderr)
+    );
+    let after = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    assert_eq!(before, after, "MC6 HEAD unchanged");
+    assert!(
+        p.join(".libra/merge-state.json").exists(),
+        "MC6 keeps state"
+    );
+
+    // MC9: --dry-run writes nothing and does not print a fake hash.
+    resolve_merge_conflict(p);
+    let dry = run_libra_command(&["commit", "--dry-run", "-m", "preview", "--no-verify"], p);
+    assert_cli_success(&dry, "MC9 dry-run");
+    let dry_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&dry.stdout),
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    assert!(
+        dry_out.contains("Would finish the in-progress merge"),
+        "MC9 preview: {dry_out}"
+    );
+    assert!(
+        !dry_out.contains("[main "),
+        "MC9 must not print a fake commit: {dry_out}"
+    );
+    assert!(
+        p.join(".libra/merge-state.json").exists(),
+        "MC9 keeps state"
+    );
+
+    // MC7: partial commit stays a 129 usage error.
+    let partial = run_libra_command(&["commit", "shared.txt", "--no-verify"], p);
+    assert_eq!(partial.status.code(), Some(129), "MC7 path");
+    let only = run_libra_command(&["commit", "-o", "shared.txt", "--no-verify"], p);
+    assert_eq!(only.status.code(), Some(129), "MC7 -o");
+    assert!(
+        p.join(".libra/merge-state.json").exists(),
+        "MC7 keeps state"
+    );
+
+    // MC2 / MC2b / MC2c: -m creates a two-parent commit and clears merge state.
+    let committed = run_libra_command(&["commit", "-m", "finish merge", "--no-verify"], p);
+    assert_cli_success(&committed, "MC2");
+    assert_eq!(head_parent_count(p), 2, "MC2 two parents");
+    assert!(
+        head_message_body(p).contains("finish merge"),
+        "MC2 message: {}",
+        head_message_body(p)
+    );
+    assert!(!p.join(".libra/merge-state.json").exists(), "MC2 cleared");
+    let abort = run_libra_command(&["merge", "--abort"], p);
+    assert!(
+        String::from_utf8_lossy(&abort.stderr).contains("no merge in progress"),
+        "MC2b: {}",
+        String::from_utf8_lossy(&abort.stderr)
+    );
+    let cont = run_libra_command(&["merge", "--continue"], p);
+    assert!(
+        String::from_utf8_lossy(&cont.stderr).contains("no merge in progress"),
+        "MC2c: {}",
+        String::from_utf8_lossy(&cont.stderr)
+    );
+    let after_abort = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    let after_commit = String::from_utf8_lossy(&committed.stdout);
+    assert!(!after_abort.is_empty(), "MC2b HEAD still exists");
+    let _ = after_commit;
+
+    // MC1: editor does not change the seeded merge message (comments stripped).
+    let repo = merge_conflict_repo_for_commit();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["merge", "feature"], p).status.code(),
+        Some(128)
+    );
+    resolve_merge_conflict(p);
+    let mc1 = run_libra_command_with_env(&["commit", "--no-verify"], p, &[("GIT_EDITOR", "true")]);
+    assert_cli_success(&mc1, "MC1");
+    assert_eq!(head_parent_count(p), 2, "MC1 two parents");
+    let body = head_message_body(p);
+    assert!(
+        !body.contains("# Conflicts:"),
+        "MC1 editor cleanup strips comments: {body}"
+    );
+    assert!(!p.join(".libra/merge-state.json").exists(), "MC1 cleared");
+
+    // MC3: --no-edit keeps # Conflicts:.
+    let repo = merge_conflict_repo_for_commit();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["merge", "feature"], p).status.code(),
+        Some(128)
+    );
+    resolve_merge_conflict(p);
+    let mc3 = run_libra_command(&["commit", "--no-edit", "--no-verify"], p);
+    assert_cli_success(&mc3, "MC3");
+    assert_eq!(head_parent_count(p), 2, "MC3 two parents");
+    let body = head_message_body(p);
+    assert!(body.contains("# Conflicts:"), "MC3 keeps comments: {body}");
+
+    // MC4: -F overrides the message.
+    let repo = merge_conflict_repo_for_commit();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["merge", "feature"], p).status.code(),
+        Some(128)
+    );
+    resolve_merge_conflict(p);
+    std::fs::write(p.join("msg.txt"), "from file\n").unwrap();
+    let mc4 = run_libra_command(&["commit", "-F", "msg.txt", "--no-verify"], p);
+    assert_cli_success(&mc4, "MC4");
+    assert_eq!(head_parent_count(p), 2, "MC4 two parents");
+    assert!(
+        head_message_body(p).contains("from file"),
+        "{}",
+        head_message_body(p)
+    );
+
+    // MC8: commit -a after a resolved worktree edit.
+    let repo = merge_conflict_repo_for_commit();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["merge", "feature"], p).status.code(),
+        Some(128)
+    );
+    resolve_merge_conflict(p);
+    std::fs::write(p.join("shared.txt"), "top\nl1\nRESOLVED-A\nl3\nbottom\n").unwrap();
+    let mc8 = run_libra_command(&["commit", "-a", "-m", "via -a", "--no-verify"], p);
+    assert_cli_success(&mc8, "MC8");
+    assert_eq!(head_parent_count(p), 2, "MC8 two parents");
+    assert!(!p.join(".libra/merge-state.json").exists(), "MC8 cleared");
+
+    // MC11: clean --no-commit then commit.
+    let repo = merge_conflict_repo_for_commit();
+    let p = repo.path();
+    // Make a non-conflicting extra file merge via --no-commit on a clean-able pair.
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], p),
+        "mc11 feature",
+    );
+    std::fs::write(p.join("extra.txt"), "only feature\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "extra.txt"], p), "mc11 add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "feature extra", "--no-verify"], p),
+        "mc11 commit extra",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "mc11 main");
+    // Use a second repo that's clean: merge --no-commit of a non-conflicting branch.
+    let clean = create_committed_repo_via_cli();
+    let cp = clean.path();
+    std::fs::write(cp.join("base.txt"), "base\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "base.txt"], cp), "base add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], cp),
+        "base commit",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "feature"], cp),
+        "clean branch",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], cp),
+        "clean feature",
+    );
+    std::fs::write(cp.join("feat.txt"), "feat\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "feat.txt"], cp), "feat add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "feat", "--no-verify"], cp),
+        "feat commit",
+    );
+    assert_cli_success(&run_libra_command(&["checkout", "main"], cp), "clean main");
+    assert_cli_success(
+        &run_libra_command(&["merge", "--no-commit", "feature"], cp),
+        "MC11 no-commit",
+    );
+    assert!(cp.join(".libra/merge-state.json").exists());
+    let mc11 = run_libra_command(&["commit", "--no-edit", "--no-verify"], cp);
+    assert_cli_success(&mc11, "MC11 commit");
+    assert_eq!(head_parent_count(cp), 2, "MC11 two parents");
+    assert!(
+        head_message_body(cp).to_ascii_lowercase().contains("merge"),
+        "MC11 prefilled merge message: {}",
+        head_message_body(cp)
+    );
+    assert!(!cp.join(".libra/merge-state.json").exists(), "MC11 cleared");
+}
+
+fn stage_one(repo: &std::path::Path, name: &str, body: &str) {
+    std::fs::write(repo.join(name), body).unwrap();
+    assert_cli_success(&run_libra_command(&["add", name], repo), name);
+}
+
+/// M-EMPTY E1–E3, E5, E6, E8–E10 (#477 HF-06).
+#[test]
+fn test_commit_allow_empty_message_matrix() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    stage_one(p, "e1.txt", "e1\n");
+    let e1 = run_libra_command(&["commit", "-m", "", "--no-verify"], p);
+    assert_eq!(e1.status.code(), Some(128), "E1 still aborts");
+    assert!(
+        String::from_utf8_lossy(&e1.stderr).contains("empty commit message"),
+        "E1: {}",
+        String::from_utf8_lossy(&e1.stderr)
+    );
+
+    let e2 = run_libra_command(
+        &["commit", "--allow-empty-message", "-m", "", "--no-verify"],
+        p,
+    );
+    assert_cli_success(&e2, "E2 empty -m");
+
+    stage_one(p, "e3.txt", "e3\n");
+    let empty_file = p.join("empty-msg.txt");
+    std::fs::write(&empty_file, "").unwrap();
+    let e3 = run_libra_command(
+        &[
+            "commit",
+            "--allow-empty-message",
+            "-F",
+            empty_file.to_str().unwrap(),
+            "--no-verify",
+        ],
+        p,
+    );
+    assert_cli_success(&e3, "E3 empty -F");
+
+    stage_one(p, "e5.txt", "e5\n");
+    let e5 = run_libra_command(
+        &[
+            "commit",
+            "--allow-empty-message",
+            "-m",
+            "   ",
+            "--no-verify",
+        ],
+        p,
+    );
+    assert_cli_success(&e5, "E5 whitespace -m");
+
+    let e6 = run_libra_command(
+        &[
+            "commit",
+            "--amend",
+            "--allow-empty-message",
+            "-m",
+            "",
+            "--no-verify",
+        ],
+        p,
+    );
+    assert_cli_success(&e6, "E6 amend empty");
+
+    // E8: commit-msg hook still rejects an empty message file.
+    stage_one(p, "e8.txt", "e8\n");
+    let hook_dir = p.join(".libra/hooks");
+    std::fs::create_dir_all(&hook_dir).unwrap();
+    let hook = hook_dir.join("commit-msg");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\nif ! grep -q '[^[:space:]]' \"$1\"; then echo hook-empty; exit 1; fi\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&hook).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hook, perms).unwrap();
+    }
+    let e8 = run_libra_command(&["commit", "--allow-empty-message", "-m", ""], p);
+    assert_ne!(e8.status.code(), Some(0), "E8 hook still refuses");
+    assert!(
+        String::from_utf8_lossy(&e8.stderr).contains("hook")
+            || String::from_utf8_lossy(&e8.stderr).contains("commit-msg"),
+        "E8: {}",
+        String::from_utf8_lossy(&e8.stderr)
+    );
+    std::fs::remove_file(&hook).unwrap();
+
+    // E9: empty message still signs when vault signing is already on
+    // (`create_committed_repo_via_cli` uses default `init`, which creates
+    // the PGP key — a second `generate-gpg-key` would LBR-CONFLICT-002).
+    stage_one(p, "e9.txt", "e9\n");
+    let e9 = run_libra_command(
+        &[
+            "--json",
+            "commit",
+            "--allow-empty-message",
+            "-m",
+            "",
+            "--no-verify",
+        ],
+        p,
+    );
+    assert_cli_success(&e9, "E9 signed empty");
+    assert_eq!(
+        parse_json_stdout(&e9)["data"]["signed"].as_bool(),
+        Some(true),
+        "E9 signed: {}",
+        String::from_utf8_lossy(&e9.stdout)
+    );
+
+    // E10: log / show / oneline render an empty subject.
+    let log = run_libra_command(&["log", "-1"], p);
+    assert_cli_success(&log, "E10 log");
+    let oneline = run_libra_command(&["log", "-1", "--oneline"], p);
+    assert_cli_success(&oneline, "E10 oneline");
+    let show = run_libra_command(&["show", "-s", "--oneline"], p);
+    assert_cli_success(&show, "E10 show");
 }

@@ -33,6 +33,9 @@ async fn add_and_commit(message: &str, pathspec: Vec<String>) {
             renormalize: false,
             ignore_missing: false,
             resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         },
         &OutputConfig::default(),
     )
@@ -340,6 +343,8 @@ async fn test_grep_tree_accepts_branch_revisions() {
             delete: None,
             delete_safe: None,
             set_upstream_to: None,
+            track: None,
+            no_track: false,
             unset_upstream: None,
             edit_description: None,
             show_current: false,

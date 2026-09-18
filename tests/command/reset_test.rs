@@ -649,6 +649,9 @@ async fn test_reset_hard_io_failure_rolls_back_index_and_keeps_head() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -684,6 +687,9 @@ async fn test_reset_hard_io_failure_rolls_back_index_and_keeps_head() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -719,6 +725,9 @@ async fn test_reset_hard_io_failure_rolls_back_index_and_keeps_head() {
             pathspec_from_file: None,
             pathspec_file_nul: false,
             no_refresh: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         },
         &libra::utils::output::OutputConfig::default(),
     )
@@ -769,6 +778,9 @@ async fn setup_standard_repo(
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -797,6 +809,8 @@ async fn setup_standard_repo(
         delete: None,
         delete_safe: None,
         set_upstream_to: None,
+        track: None,
+        no_track: false,
         unset_upstream: None,
         edit_description: None,
         show_current: false,
@@ -834,6 +848,9 @@ async fn setup_standard_repo(
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -862,6 +879,8 @@ async fn setup_standard_repo(
         delete: None,
         delete_safe: None,
         set_upstream_to: None,
+        track: None,
+        no_track: false,
         unset_upstream: None,
         edit_description: None,
         show_current: false,
@@ -899,6 +918,9 @@ async fn setup_standard_repo(
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -927,6 +949,8 @@ async fn setup_standard_repo(
         delete: None,
         delete_safe: None,
         set_upstream_to: None,
+        track: None,
+        no_track: false,
         unset_upstream: None,
         edit_description: None,
         show_current: false,
@@ -964,6 +988,9 @@ async fn setup_standard_repo(
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -992,6 +1019,8 @@ async fn setup_standard_repo(
         delete: None,
         delete_safe: None,
         set_upstream_to: None,
+        track: None,
+        no_track: false,
         unset_upstream: None,
         edit_description: None,
         show_current: false,
@@ -1038,6 +1067,9 @@ async fn setup_test_state() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 }
@@ -1065,6 +1097,9 @@ async fn test_reset_soft() {
         pathspec_from_file: None,
         pathspec_file_nul: false,
         no_refresh: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1115,6 +1150,9 @@ async fn test_reset_mixed() {
         pathspec_from_file: None,
         pathspec_file_nul: false,
         no_refresh: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1169,6 +1207,9 @@ async fn test_reset_hard() {
         pathspec_from_file: None,
         pathspec_file_nul: false,
         no_refresh: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1243,6 +1284,9 @@ async fn test_reset_mixed_same_target_resets_index_without_moving_head() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1279,6 +1323,9 @@ async fn test_reset_mixed_same_target_resets_index_without_moving_head() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1295,6 +1342,9 @@ async fn test_reset_mixed_same_target_resets_index_without_moving_head() {
             pathspec_from_file: None,
             pathspec_file_nul: false,
             no_refresh: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         },
         &libra::utils::output::OutputConfig::default(),
     )
@@ -1341,6 +1391,9 @@ async fn test_reset_hard_same_target_restores_worktree_and_removes_staged_additi
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1377,6 +1430,9 @@ async fn test_reset_hard_same_target_restores_worktree_and_removes_staged_additi
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1393,6 +1449,9 @@ async fn test_reset_hard_same_target_restores_worktree_and_removes_staged_additi
             pathspec_from_file: None,
             pathspec_file_nul: false,
             no_refresh: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         },
         &libra::utils::output::OutputConfig::default(),
     )
@@ -1444,6 +1503,9 @@ async fn test_reset_hard_removes_paths_tracked_only_by_head_tree() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1479,6 +1541,9 @@ async fn test_reset_hard_removes_paths_tracked_only_by_head_tree() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1524,6 +1589,9 @@ async fn test_reset_hard_removes_paths_tracked_only_by_head_tree() {
             pathspec_from_file: None,
             pathspec_file_nul: false,
             no_refresh: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         },
         &libra::utils::output::OutputConfig::default(),
     )
@@ -1568,6 +1636,9 @@ async fn test_reset_with_head_reference() {
         pathspec_from_file: None,
         pathspec_file_nul: false,
         no_refresh: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1617,6 +1688,9 @@ async fn test_reset_on_branch() {
                 pathspec_from_file: None,
                 pathspec_file_nul: false,
                 no_refresh: false,
+                patch: false,
+                auto_advance: false,
+                no_auto_advance: false,
             })
             .await;
 
@@ -1667,6 +1741,9 @@ async fn test_reset_hard_skips_ignored_directories() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1710,6 +1787,9 @@ async fn test_reset_hard_skips_ignored_directories() {
         pathspec_from_file: None,
         pathspec_file_nul: false,
         no_refresh: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -2093,6 +2173,140 @@ fn seq_status(p: &std::path::Path) -> String {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     )
+}
+
+/// Two-branch repo whose `feature` edit conflicts with `main` on `shared.txt`.
+fn merge_conflict_repo() -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let commit = |msg: &str| {
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", msg, "--no-verify"], p),
+            "commit",
+        );
+    };
+    std::fs::write(p.join("shared.txt"), "top\nl1\nORIG\nl3\nbottom\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "add base");
+    commit("base shared");
+    assert_cli_success(&run_libra_command(&["branch", "feature"], p), "branch");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], p),
+        "co feature",
+    );
+    std::fs::write(p.join("shared.txt"), "top\nl1\nFEATURE\nl3\nbottom\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "add feature");
+    commit("feature edit");
+    assert_cli_success(&run_libra_command(&["checkout", "main"], p), "co main");
+    std::fs::write(p.join("shared.txt"), "top\nl1\nMAIN\nl3\nbottom\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "add main");
+    commit("main edit");
+    repo
+}
+
+/// M-SEQ S5a/S5b (#477 HF-26): a whole-tree reset ends an in-progress merge;
+/// a pathspec reset leaves merge-state.json alone.
+#[test]
+fn test_reset_clears_merge_state_matrix() {
+    for (row, mode) in [("S5a", "--hard"), ("S5b", "--mixed")] {
+        let repo = merge_conflict_repo();
+        let p = repo.path();
+        assert_eq!(
+            run_libra_command(&["merge", "feature"], p).status.code(),
+            Some(128),
+            "{row} merge conflicts"
+        );
+        assert!(
+            p.join(".libra/merge-state.json").exists(),
+            "{row}: merge state is present"
+        );
+        assert_cli_success(
+            &run_libra_command(&["reset", mode], p),
+            &format!("{row} reset"),
+        );
+        assert!(
+            !p.join(".libra/merge-state.json").exists(),
+            "{row}: reset {mode} clears merge-state.json"
+        );
+        let abort = run_libra_command(&["merge", "--abort"], p);
+        let abort_err = String::from_utf8_lossy(&abort.stderr);
+        assert!(
+            !abort.status.success(),
+            "{row}: merge --abort has nothing to abort"
+        );
+        assert!(
+            abort_err.contains("no merge in progress"),
+            "{row}: {abort_err}"
+        );
+    }
+
+    let repo = merge_conflict_repo();
+    let p = repo.path();
+    assert_eq!(
+        run_libra_command(&["merge", "feature"], p).status.code(),
+        Some(128),
+        "pathspec merge conflicts"
+    );
+    assert_cli_success(
+        &run_libra_command(&["reset", "shared.txt"], p),
+        "pathspec reset",
+    );
+    assert!(
+        p.join(".libra/merge-state.json").exists(),
+        "pathspec reset leaves merge-state.json"
+    );
+    assert_cli_success(
+        &run_libra_command(&["merge", "--abort"], p),
+        "cleanup abort",
+    );
+}
+
+/// M-SEQ S6 failure (#477 HF-26): injected autostash promotion failure keeps
+/// both sidecars and names `libra merge --abort`.
+#[test]
+fn test_reset_merge_autostash_promotion_failure_keeps_state() {
+    let repo = merge_conflict_repo();
+    let p = repo.path();
+    std::fs::write(p.join("unrelated.txt"), "precious\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "unrelated.txt"], p),
+        "add dirty",
+    );
+    assert_eq!(
+        run_libra_command(&["merge", "feature", "--autostash"], p)
+            .status
+            .code(),
+        Some(128),
+        "autostash merge conflicts"
+    );
+    assert!(p.join(".libra/merge-state.json").exists());
+    assert!(p.join(".libra/merge-autostash.json").exists());
+    let reset = run_libra_command_with_env(
+        &["reset", "--hard"],
+        p,
+        &[("LIBRA_TEST_MERGE_AUTOSTASH_PROMOTE", "fail")],
+    );
+    assert_cli_success(&reset, "reset still succeeds");
+    let stderr = String::from_utf8_lossy(&reset.stderr);
+    assert!(
+        stderr.contains("libra merge --abort"),
+        "warning names merge --abort: {stderr}"
+    );
+    assert!(
+        p.join(".libra/merge-state.json").exists(),
+        "merge-state.json kept"
+    );
+    assert!(
+        p.join(".libra/merge-autostash.json").exists(),
+        "merge-autostash.json kept"
+    );
+    let list = run_libra_command(&["stash", "list"], p);
+    assert!(
+        String::from_utf8_lossy(&list.stdout)
+            .lines()
+            .all(|line| line.trim().is_empty()),
+        "autostash was not promoted: {}",
+        String::from_utf8_lossy(&list.stdout)
+    );
 }
 
 /// M-SEQ S0-S2, S4a, S8, S9a (#477 HF-01, ADR-HF-03): a whole-tree reset ends a
@@ -2604,9 +2818,9 @@ fn multi_revert_repo() -> (tempfile::TempDir, String, String) {
     (repo, c1, c2)
 }
 
-/// M-SEQ S4a, multi-commit half (#477 HF-01, ADR-HF-03): a whole-tree reset
-/// marks a stopped multi-commit revert instead of clearing it, and `--continue`
-/// then refuses rather than recording the reset index as the concluded revert.
+/// M-SEQ S4a, multi-commit half (#477 HF-01/HF-02, ADR-HF-03): a whole-tree
+/// reset marks a stopped multi-commit revert instead of clearing it, and
+/// `--continue` then drains the remaining reverts onto the reset target.
 #[test]
 fn test_reset_marks_multi_revert_and_continue_refuses() {
     let (repo, c1, c2) = multi_revert_repo();
@@ -2637,21 +2851,9 @@ fn test_reset_marks_multi_revert_and_continue_refuses() {
         p.join(".libra/revert-state.json").exists(),
         "the multi-commit sequence is kept, not cleared"
     );
-    let cont = run_libra_command(&["revert", "--continue"], p);
-    assert!(
-        !cont.status.success(),
-        "--continue must refuse a concluded stop: {}",
-        String::from_utf8_lossy(&cont.stdout)
-    );
-    let (human, report) = parse_cli_error_stderr(&cont.stderr);
-    assert_eq!(report.error_code, "LBR-REPO-003", "{human}");
-    assert!(
-        human.contains("concluded by a later reset"),
-        "the refusal names the cause: {human}"
-    );
     assert_cli_success(
-        &run_libra_command(&["revert", "--skip"], p),
-        "--skip drains",
+        &run_libra_command(&["revert", "--continue"], p),
+        "HF-02: --continue drains the remaining reverts",
     );
     assert!(
         !p.join(".libra/revert-state.json").exists(),
@@ -2662,8 +2864,8 @@ fn test_reset_marks_multi_revert_and_continue_refuses() {
         target,
         "--skip built on the reset target instead of restoring the original HEAD"
     );
-    // --abort deliberately restores the pre-revert state, unlike --skip's
-    // reset-target continuation. The refusal must describe that consequence.
+    // --abort still restores the pre-revert state after an external reset,
+    // discarding later tracked edits on the reset target.
     let (repo, c1, c2) = multi_revert_repo();
     let p = repo.path();
     let original = super::cherry_pick_test::cp_rev_parse(p, "HEAD");
@@ -2680,19 +2882,7 @@ fn test_reset_marks_multi_revert_and_continue_refuses() {
         "reset before abort",
     );
     fs::write(p.join("a.txt"), "later tracked edit\n").expect("later edit");
-    let continued = run_libra_command(&["revert", "--continue"], p);
-    let (human, report) = parse_cli_error_stderr(&continued.stderr);
-    assert_eq!(report.error_code, "LBR-REPO-003", "{human}");
-    assert!(human.contains("restore the pre-revert state"), "{human}");
-    assert!(
-        human.contains("discarding later tracked changes"),
-        "{human}"
-    );
     assert_eq!(super::cherry_pick_test::cp_rev_parse(p, "HEAD"), target);
-    assert_eq!(
-        fs::read(p.join("a.txt")).expect("refusal keeps edits"),
-        b"later tracked edit\n"
-    );
     assert_cli_success(
         &run_libra_command(&["revert", "--abort"], p),
         "abort restores pre-revert state",

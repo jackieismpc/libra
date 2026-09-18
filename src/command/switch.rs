@@ -46,6 +46,7 @@ EXAMPLES:
     libra switch -                         Return to the previous checkout target
     libra switch -c feature-x              Create and switch to a new branch
     libra switch -c fix-123 abc1234        Create branch from specific commit
+    libra switch --detach                  Detach HEAD at the current commit
     libra switch --detach v1.0             Detach HEAD at a tag
     libra switch --track origin/main       Track and switch to remote branch
     libra switch feature                   Auto-create a tracking branch from a unique remote (guess)
@@ -152,8 +153,12 @@ pub enum SwitchError {
     #[error("remote branch name is required")]
     MissingTrackTarget,
 
+    #[allow(dead_code)]
     #[error("branch name is required when using --detach")]
     MissingDetachTarget,
+
+    #[error("You are on a branch yet to be born")]
+    UnbornHead,
 
     #[error("branch name is required")]
     MissingBranchName,
@@ -221,6 +226,8 @@ impl From<SwitchError> for CliError {
             SwitchError::MissingDetachTarget => CliError::command_usage(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("provide a commit, tag, or branch to detach at."),
+            SwitchError::UnbornHead => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid),
             SwitchError::MissingBranchName => CliError::command_usage(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("provide a branch name."),
@@ -1043,6 +1050,25 @@ async fn run_switch(args: SwitchArgs, output: &OutputConfig) -> Result<SwitchOut
     };
 
     if detach {
+        if branch.is_none() {
+            let Some(commit) = previous_commit.as_deref() else {
+                return Err(SwitchError::UnbornHead);
+            };
+            let commit_hash = ObjectHash::from_str(commit)
+                .map_err(|error| SwitchError::CommitResolve(error.to_string()))?;
+            detach_head_in_place(commit_hash, NavigationCommand::Switch).await?;
+            return Ok(SwitchOutput {
+                previous_branch,
+                previous_commit,
+                branch: None,
+                commit: commit_hash.to_string(),
+                created: false,
+                detached: true,
+                unborn: false,
+                already_on: false,
+                tracking: None,
+            });
+        }
         let target = branch.ok_or(SwitchError::MissingDetachTarget)?;
         let commit_base = match previous_target {
             Some(PreviousCheckoutTarget::Branch { commit, .. })
@@ -1432,6 +1458,44 @@ async fn move_to_commit(
     Ok(commit_hash)
 }
 
+/// Detach HEAD at `commit_hash` without restoring the worktree. Used for
+/// bare `--detach` (same commit as the current HEAD) so uncommitted edits
+/// are kept.
+pub(crate) async fn detach_head_in_place(
+    commit_hash: ObjectHash,
+    navigation_command: NavigationCommand,
+) -> Result<ObjectHash, SwitchError> {
+    let db = get_db_conn_instance().await;
+    let (old_oid, from_ref_name) = current_navigation_state(&db).await?;
+    let action = navigation_reflog_action(
+        navigation_command,
+        from_ref_name,
+        short_object_id(commit_hash),
+    );
+    let context = ReflogContext {
+        old_oid,
+        new_oid: commit_hash.to_string(),
+        action,
+    };
+
+    if let Err(error) = with_reflog(
+        context,
+        move |txn: &sea_orm::DatabaseTransaction| {
+            Box::pin(async move {
+                Head::update_result_with_conn(txn, Head::Detached(commit_hash), None)
+                    .await
+                    .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))
+            })
+        },
+        false,
+    )
+    .await
+    {
+        return Err(SwitchError::HeadUpdate(error.to_string()));
+    }
+    Ok(commit_hash)
+}
+
 async fn switch_to_resolved_branch(
     target_branch: ResolvedSwitchBranch,
     output: &OutputConfig,
@@ -1686,6 +1750,10 @@ mod tests {
         assert_eq!(
             SwitchError::MissingDetachTarget.to_string(),
             "branch name is required when using --detach",
+        );
+        assert_eq!(
+            SwitchError::UnbornHead.to_string(),
+            "You are on a branch yet to be born",
         );
         assert_eq!(
             SwitchError::MissingBranchName.to_string(),

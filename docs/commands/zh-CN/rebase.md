@@ -7,11 +7,14 @@
 ## 概要
 
 ```
-libra rebase [--autosquash] [--reapply-cherry-picks] [--autostash] [--exec <cmd>] [--update-refs] [--fork-point] [--rerere-autoupdate | --no-rerere-autoupdate] [--keep-empty | --no-keep-empty] [--empty=<mode>] <upstream>
+libra rebase [--autosquash | --no-autosquash] [--reapply-cherry-picks] [--autostash] [--exec <cmd>] [--update-refs] [--fork-point] [--rerere-autoupdate | --no-rerere-autoupdate] [--keep-empty | --no-keep-empty] [--empty=<mode>] <upstream>
 libra rebase --onto <newbase> <upstream> [<branch>]
+libra rebase --root [--onto <newbase>] [<branch>]
 libra rebase --continue
 libra rebase --abort
 libra rebase --skip
+libra rebase -i <upstream>
+libra rebase --edit-todo
 ```
 
 ## 说明
@@ -21,6 +24,12 @@ libra rebase --skip
 如果重放期间发生冲突，rebase 会停止并报告冲突文件。用户手动解决冲突、暂存已解决文件，然后运行 `libra rebase --continue` 继续。或者，`--abort` 会恢复原始分支状态，`--skip` 会丢弃当前提交并继续下一个。
 
 每次 replay 都使用与 `libra merge` 相同的三路树引擎。因此，rename 检测（包括 `merge.renames` / `merge.renameLimit`）、`.gitattributes` 与 `merge.default` driver、`merge.conflictStyle` 的冲突精化以及文件/目录冲突处理，都会以相同语义作用于 rebase。普通 first-parent replay 遇到已有 merge commit 时，会先把该提交的所有原始 parent 折叠为引擎的 recursive virtual base，再执行 replay；改写结果仍是扁平的单 parent 提交。这不表示已实现 `--rebase-merges`，也不会保留 merge topology。
+
+显式 `--autosquash` 不再走「无需变基」捷径，会按 autosquash todo 重放线性历史上的 `fixup!`/`squash!`/`amend!`；`--no-autosquash` 撤销先前的 `--autosquash`（后者生效）。`rebase.autosquash` 配置不影响非交互 rebase。
+
+`--root` 从根提交起重放全部提交。可选位置参数是 `<branch>`（先切换），不是 `<upstream>`；与 `<upstream>` 位置参数同用为用法错误。无 `--onto` 时根提交保持无父、未改变的 pick 保持原 hash；有 `--onto <newbase>` 时全部提交重放到该 landing。可与 `--autosquash`、`--exec`、`--autostash`、`-i` 组合。
+
+`libra rebase -i` 生成 Git 形状的 todo，运行 sequence editor，并重放结果。`--edit-todo` 改写进行中交互 rebase 的剩余命令。`-i` 也会读取 `rebase.autosquash`（除非 `--no-autosquash` 生效）。`-i --update-refs` 为用法错误。
 
 `--autostash` 会在重放前把 tracked index/worktree 变更保存为 held stash，并在成功或中止后分别恢复 staged index 层与 unstaged worktree 层。可重复的 `--exec <cmd>` 会在每个重放提交后通过 Libra 强制 workspace-write、禁网 sandbox 依次执行；失败会停止序列，`--continue` 重试失败命令。exec 失败后的 `--skip` 保留已重放提交并跳过该提交剩余命令。`--update-refs` 原子重定向重写区间中的其他本地分支，但排除任何 worktree 已检出的分支。`--fork-point` 从 upstream reflog 选择仍是 `HEAD` 祖先的最具体旧 tip，找不到时回退普通 merge base。
 
@@ -34,12 +43,16 @@ Rebase 状态（剩余和已完成提交列表、原始 HEAD 和目标 base）�
 
 | 选项 | 长选项 | 说明 |
 |--------|------|-------------|
-| `<upstream>` | | 要 rebase 到的 upstream 分支或提交。除非指定 `--continue`、`--abort` 或 `--skip`，否则必需。可以是分支名、提交哈希或任何 Git 引用。 |
-| | `--onto <newbase>` | 把 `<upstream>..HEAD` 区间重放到 `<newbase>`，而不是 `<upstream>`。 |
+| `<upstream>` | | 要 rebase 到的 upstream 分支或提交。除非指定 `--continue`、`--abort`、`--skip` 或 `--root`，否则必需。可以是分支名、提交哈希或任何 Git 引用。 |
+| | `--onto <newbase>` | 把 `<upstream>..HEAD` 区间重放到 `<newbase>`，而不是 `<upstream>`。与 `--root` 组合时把全部历史重放到 `<newbase>`。 |
+| | `--root` | `--root` 从根提交起重放全部提交。可选位置参数是 `<branch>`，不是 `<upstream>`。 |
 | | `--continue` | 在解决冲突后继续 rebase。与 `--abort`、`--skip` 和 `<upstream>` 互斥。 |
 | | `--abort` | 中止当前 rebase，并将原始分支恢复到 rebase 前状态。与 `--continue`、`--skip` 和 `<upstream>` 互斥。 |
 | | `--skip` | 跳过当前冲突提交；exec 失败时则保留已重放提交并跳过剩余命令。与 `--continue`、`--abort` 和 `<upstream>` 互斥。 |
-| | `--autosquash` | 在重放时把 `fixup!`、`squash!`、`amend!` 提交移动并折叠到目标提交。 |
+| `-i` | `--interactive` | 打开 Git 形状的 todo（`pick`/`reword`/`edit`/`squash`/`fixup [-C\|-c]`/`exec`/`break`/`drop`）。可与 `--autosquash`（以及 `rebase.autosquash`）、`--root`、`--exec`、`--autostash` 组合。`-i --update-refs` 为用法错误（129）。 |
+| | `--edit-todo` | 改写进行中交互 rebase 的剩余命令。无 rebase 或非交互 rebase 时拒绝。 |
+| | `--autosquash` | 在重放时把 `fixup!`、`squash!`、`amend!` 提交移动并折叠到目标提交。显式 `--autosquash` 不再走「无需变基」捷径。 |
+| | `--no-autosquash` | 不折叠 `fixup!`/`squash!`/`amend!`，撤销先前的 `--autosquash`（后者生效）。单独使用为 no-op：非交互 rebase 不读取 `rebase.autosquash`。 |
 | | `--reapply-cherry-picks` | 显式重放 clean cherry-pick；这与 Libra 默认线性重放行为一致。 |
 | | `--autostash` / `--no-autostash` | 重放前保存 tracked index/worktree 变更，分别保持 staged 与 unstaged 层，并在成功或中止后恢复。恢复冲突时先保存为 `stash@{0}` 并警告。最后一个 toggle 生效。 |
 | | `--exec <cmd>` | 在每个重放提交后，通过强制 workspace-write、禁网 sandbox 执行可重复 shell 命令。非零退出或超时停止 rebase，`--continue` 重试。 |
@@ -49,6 +62,23 @@ Rebase 状态（剩余和已完成提交列表、原始 HEAD 和目标 base）�
 | | `--keep-empty` | 保留 start-empty（重放前就为空）的提交而非丢弃。为 Git 兼容性接受的 no-op：Libra 的 rebase 默认就保留空提交。与 `--no-keep-empty` 组成 toggle，last-wins。 |
 | | `--no-keep-empty` | 丢弃 start-empty 提交（其 tree 等于父 tree，未引入变更）而非重放。与 `--keep-empty` 组成 toggle。（此项控制*开始*就为空的提交；`--empty=<mode>` 控制 replay 后*变空*的提交。） |
 | | `--empty=<mode>` | 如何处理 replay 后*变空*的提交（其变更已在新 base 上）：`drop` 跳过它（HEAD 不前进，并打印 `dropping <sha> <subject> -- patch contents already upstream`），`keep` 保留这个空提交。省略时 Libra **保留**——有意与 Git 不同（Git 默认 drop）；需要 Git 行为请用 `--empty=drop`。该模式会跨冲突 round-trip 到 `--continue`/`--skip`。Git 的 `stop`/`ask`（停下交由你决定）不支持（Libra 非交互 rebase 无 halt-on-empty 续作流）；它们与任何未知值均为用法错误（`LBR-CLI-002`，退出 129）。 |
+
+### 交互式 todo 指令
+
+序列编辑器解析顺序为 `GIT_SEQUENCE_EDITOR` → `sequence.editor` → 普通编辑器链（`GIT_EDITOR` / `core.editor` / `VISUAL` / `EDITOR`）。`--edit-todo` 只改写剩余命令，并附进行中提示。
+
+| 指令 | 缩写 | 含义 |
+|---|---|---|
+| `pick` | `p` | 使用该提交 |
+| `reword` | `r` | 使用该提交并编辑消息 |
+| `edit` | `e` | 使用该提交后停下以便 amend |
+| `squash` | `s` | 折叠进上一提交并拼接消息 |
+| `fixup [-C\|-c]` | `f` | 折叠进上一提交；`-C` 保留本提交消息，`-c` 保留并打开编辑器 |
+| `exec` | `x` | 在沙箱中运行行内命令 |
+| `break` | `b` | 在此停止，之后用 `libra rebase --continue` |
+| `drop` | `d` | 删除该提交 |
+
+`label` / `reset` / `merge` / `update-ref` 行延后（DEFER-02）。
 
 ### 选项细节
 
@@ -155,6 +185,12 @@ libra rebase --abort
 
 # 跳过有问题的提交
 libra rebase --skip
+
+# 交互式 rebase
+libra rebase -i main
+
+# 交互 rebase 停下时改写剩余命令
+libra rebase --edit-todo
 
 # 使用别名
 libra rb main
@@ -316,11 +352,11 @@ Rebase 状态存储在 `rebase_state` SQLite 表中，包含以下字段：
 
 ## 设计理由
 
-### 为什么没有 `--interactive` / `-i`？
+### 交互式 rebase（`-i` / `--edit-todo`）
 
-Git 的交互式 rebase 会打开编辑器，包含一份可以重排、squash、edit 或 drop 的提交列表。这是 Git 最强大的功能之一，但本质上是交互式的：它需要编辑器会话，并在启动时由人类决策。
+`libra rebase -i` 生成 Git 形状的 `git-rebase-todo`，打开 sequence editor（`GIT_SEQUENCE_EDITOR` → `sequence.editor` → 普通编辑器链），并重放 `pick`/`reword`/`edit`/`squash`/`fixup [-C|-c]`/`exec`/`break`/`drop`。`--edit-todo` 只改写进行中交互 rebase 的剩余命令。
 
-Libra 面向 AI 代理和自动化工作流，在这些场景中交互式编辑器会话不可行。Libra 不提供交互式 rebase，而是鼓励将复杂历史重写拆成离散操作：使用 `rebase` 进行线性重放，并在未来使用专用命令进行 squash 或重排。
+`-i` 可与 `--autosquash`（以及 `rebase.autosquash=true`）、`--root`、`--exec`（每个生成的 pick 后插入 `exec <cmd>`）和 `--autostash` 组合。`-i --update-refs` 为用法错误（129）。`--rebase-merges` 仍拒绝（`LBR-UNSUPPORTED-001`，D16 / DEFER-02）。
 
 ### `--onto`
 
@@ -352,8 +388,9 @@ Libra 提供折中方案：带 conflict-stop 语义的线性 rebase（Git 用户
 | Continue | `--continue` | `--continue` | N/A（冲突存储在提交中） |
 | Abort | `--abort` | `--abort` | `jj op undo` |
 | Skip | `--skip` | `--skip` | N/A |
-| Interactive | 不支持 | `-i` / `--interactive` | N/A |
+| Interactive | `-i` / `--interactive` 与 `--edit-todo` | `-i` / `--interactive`、`--edit-todo` | N/A |
 | Onto | `--onto <newbase>` | `--onto <newbase>` | 带 `-s` / `--source` 的 `-d` |
+| Root | `--root [--onto <newbase>] [<branch>]` | `--root [--onto <newbase>] [<branch>]` | N/A |
 | Exec | 支持；可重复、强制 workspace-write/禁网 sandbox、失败可续作 | `--exec <cmd>` | N/A |
 | Autosquash | 支持（`--autosquash`） | `--autosquash` | N/A |
 | Autostash | 支持 `--autostash` / `--no-autostash`；tracked 变更跨 sequencer 停止保持 held | `--autostash` / `--no-autostash` | N/A |
@@ -369,6 +406,8 @@ Libra 提供折中方案：带 conflict-stop 语义的线性 rebase（Git 用户
 | 状态持久化 | SQLite 数据库 | `.git/rebase-merge/` 目录 | 不适用 |
 
 注意：jj 在 rebase 期间不会因冲突停止。相反，冲突会 materialize 到提交内容中，并可稍后解决，因此不需要 `--continue`/`--abort`/`--skip`。
+
+其余仍不支持的交互选项以 `LBR-UNSUPPORTED-001` 拒绝（`-r`/`--rebase-merges`，D16）。线性历史使用 `libra rebase -i`。
 
 ## 错误处理
 
@@ -396,3 +435,8 @@ Libra 提供折中方案：带 conflict-stop 语义的线性 rebase（Git 用户
 
 重写后的提交统一经过 ChangeRevisionBuilder，继承 sidecar 中的稳定
 Change ID，并记录类型化的 `rebase` predecessor 边；不会向 Git commit 注入 Change ID header。
+
+## Issue #477 notes
+
+仍不支持的交互入口返回 `LBR-UNSUPPORTED-001`
+交互式 rebase 的 todo 指令表

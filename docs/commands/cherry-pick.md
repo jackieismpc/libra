@@ -43,7 +43,7 @@ can therefore resolve an overlapping pick by keeping current content followed
 by picked content; a binary-driver conflict keeps the complete surviving side
 (current when present) without adding text markers.
 
-A stopped pick does not outlive the working tree it stopped in: a later reset that clears unresolved index stages ends the stopped single-commit pick, so the next cherry-pick starts cleanly. In a multi-commit sequence the remaining commits are kept and the stopped commit is recorded as concluded; `--continue` then refuses rather than recording the reset index under that commit, and `libra cherry-pick --skip` applies the rest.
+A stopped pick does not outlive the working tree it stopped in: a later reset ends the stopped single-commit pick once it clears unresolved index stages, so the next cherry-pick starts cleanly. Resolving the conflict and running a later commit ends the stopped single-commit pick the same way. In a multi-commit sequence the remaining commits are kept and the stopped commit is recorded as concluded; `--continue` does not re-commit a stop that was concluded outside the sequence, and instead applies the remaining commits.
 
 ## Options
 
@@ -259,7 +259,7 @@ Git maintains `.git/CHERRY_PICK_HEAD` and sequencer state files. Libra persists 
 
 ### Line-level conflict hunks
 
-A divergent path is surfaced with line-level conflict markers, matching Git: a three-way merge (base = parent tree, ours = current index, theirs = picked tree) encloses only the diverging hunks between `<<<<<<< HEAD` / `=======` / `>>>>>>> <short-source>`, leaving lines that both sides share outside the markers. A delete/modify conflict (one side absent) or binary content falls back to a whole-file presentation, where a line-level merge would be meaningless. The `>>>>>>>` label is the picked commit's abbreviation (Libra omits the commit subject Git appends).
+A divergent path is surfaced with line-level conflict markers, matching Git: a three-way merge (base = parent tree, ours = current index, theirs = picked tree) encloses only the diverging hunks between `<<<<<<< HEAD` / `=======` / `>>>>>>> <abbrev7> (<subject>)`, leaving lines that both sides share outside the markers. A delete/modify conflict (one side absent) or binary content falls back to a whole-file presentation, where a line-level merge would be meaningless. Under `merge.conflictStyle=diff3`, the ancestor label is `parent of <abbrev7> (<subject>)`.
 
 The Git-compatible `merge.conflictStyle` config is honored, same as `libra merge`: `merge` re-diffs the two postimages to expose common edges and longer common runs, `diff3` adds the complete ancestor block, and `zdiff3` keeps that ancestor block while trimming common postimage prefixes and suffixes. An unknown value is a hard error before index or working-tree writes whenever a divergent content merge needs the renderer. Marker lines follow uniformly CRLF input; otherwise they use LF. See the [merge documentation](merge.md#conflict-style-mergeconflictstyle).
 
@@ -317,3 +317,8 @@ The Git-compatible `merge.conflictStyle` config is honored, same as `libra merge
 Cherry-picked revisions use the sidecar Change ID projection and typed
 predecessor genealogy. Existing commit headers remain readable for import, but
 new commits do not depend on or inject a `change-id` header.
+
+## Issue #477 notes
+
+--continue does not re-commit a stop that was concluded outside the sequence
+conflict markers label the picked side as the abbreviated commit and its subject

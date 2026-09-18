@@ -1568,3 +1568,119 @@ async fn test_prefetch_releases_pack_keep_pins() {
         "prefetch released every pack .keep pin: {leftover_keeps:?}"
     );
 }
+
+fn setup_local_upstream_current_branch() -> (TempDir, String) {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let current = run_libra_command(&["branch", "--show-current"], p);
+    assert_cli_success(&current, "show current branch");
+    let base = String::from_utf8_lossy(&current.stdout).trim().to_string();
+    assert_cli_success(&run_libra_command(&["branch", "alpha"], p), "create alpha");
+    assert_cli_success(&run_libra_command(&["switch", "alpha"], p), "switch alpha");
+    assert_cli_success(
+        &run_libra_command(&["branch", "-u", &base], p),
+        "set local upstream",
+    );
+    (repo, "alpha".to_string())
+}
+
+fn branch_config_snapshot(repo: &Path) -> String {
+    let output = run_libra_command(&["config", "--get-regexp", r"^branch\."], repo);
+    let mut lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    lines.sort();
+    lines.join("\n")
+}
+
+fn refs_snapshot(repo: &Path) -> String {
+    let output = run_libra_command(&["show-ref"], repo);
+    let mut lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(ToString::to_string)
+        .collect();
+    lines.sort();
+    lines.join("\n")
+}
+
+fn fetch_head_snapshot(repo: &Path) -> String {
+    fs::read_to_string(repo.join(".libra/FETCH_HEAD")).unwrap_or_default()
+}
+
+fn assert_local_upstream_network_refusal(cmd: &[&str], verb: &str, branch: &str, repo: &Path) {
+    let refs_before = refs_snapshot(repo);
+    let cfg_before = branch_config_snapshot(repo);
+    let fetch_before = fetch_head_snapshot(repo);
+
+    let output = run_libra_command(cmd, repo);
+    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+    assert_eq!(output.status.code(), Some(129), "{stderr}");
+    assert_eq!(report.error_code, "LBR-CLI-003");
+    assert!(
+        stderr.contains(&format!("cannot {verb}")) && stderr.contains("local upstream"),
+        "human stderr should name the local-upstream refusal: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("branch '{branch}'"))
+            && stderr.contains("issues/480")
+            && stderr.contains("HP-16"),
+        "human stderr should name the branch and HP-16: {stderr}"
+    );
+
+    let mut json_cmd = vec!["--json"];
+    json_cmd.extend_from_slice(cmd);
+    let json_out = run_libra_command(&json_cmd, repo);
+    let (_json_human, json_report) = parse_cli_error_stderr(&json_out.stderr);
+    assert_eq!(json_out.status.code(), Some(129));
+    assert_eq!(json_report.error_code, "LBR-CLI-003");
+    assert!(
+        json_report.message.contains("local upstream")
+            && json_report.message.contains("issues/480 HP-16"),
+        "json envelope should carry the refusal: {}",
+        json_report.message
+    );
+    assert_eq!(
+        json_report.details.get("remote").and_then(|v| v.as_str()),
+        Some(".")
+    );
+    assert_eq!(
+        json_report
+            .details
+            .get("upstream_kind")
+            .and_then(|v| v.as_str()),
+        Some("local")
+    );
+
+    assert_eq!(refs_snapshot(repo), refs_before, "refs must stay unchanged");
+    assert_eq!(
+        branch_config_snapshot(repo),
+        cfg_before,
+        "branch.* config must stay unchanged"
+    );
+    assert_eq!(
+        fetch_head_snapshot(repo),
+        fetch_before,
+        "FETCH_HEAD must stay unchanged"
+    );
+}
+
+/// M-UPSTREAM P8 (#477 HF-30): `pull` refuses a configured local upstream
+/// before any network or FETCH_HEAD write.
+#[test]
+fn test_pull_refuses_local_upstream() {
+    let (repo, branch) = setup_local_upstream_current_branch();
+    let p = repo.path();
+    assert_local_upstream_network_refusal(&["pull"], "pull", &branch, p);
+
+    let explicit = run_libra_command(&["pull", "."], p);
+    let (stderr, report) = parse_cli_error_stderr(&explicit.stderr);
+    assert_eq!(explicit.status.code(), Some(129));
+    assert_eq!(report.error_code, "LBR-CLI-003");
+    assert!(
+        stderr.contains("remote '.' not found") || report.message.contains("remote '.' not found"),
+        "explicit '.' must keep the existing remote-not-found path: {stderr} / {}",
+        report.message
+    );
+}

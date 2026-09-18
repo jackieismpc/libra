@@ -32,6 +32,9 @@ async fn setup_repo_with_commit(temp: &tempfile::TempDir) {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -263,6 +266,9 @@ async fn test_for_each_ref_merged_resolves_remote_tracking_namespace() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -291,6 +297,9 @@ async fn test_for_each_ref_merged_resolves_remote_tracking_namespace() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1055,6 +1064,9 @@ async fn test_for_each_ref_sort_by_committerdate() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1086,6 +1098,9 @@ async fn test_for_each_ref_sort_by_committerdate() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1166,6 +1181,9 @@ async fn test_for_each_ref_sort_creatordate_uses_tagger_date_for_annotated_tags(
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1197,6 +1215,9 @@ async fn test_for_each_ref_sort_creatordate_uses_tagger_date_for_annotated_tags(
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1282,6 +1303,9 @@ async fn test_for_each_ref_sort_peels_nested_annotated_tags() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1761,6 +1785,9 @@ async fn test_for_each_ref_deref_size_errors_on_broken_tag_chain() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2754,6 +2781,9 @@ async fn test_for_each_ref_symref_atom() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {

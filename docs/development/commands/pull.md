@@ -57,6 +57,7 @@ flowchart TD
 - 公开参数/子命令包括：`[<repository>]`、`[<refspec>]`、`-r, --rebase`、`--no-rebase`、`--ff-only`、`--ff`、`--no-ff`、`--depth <n>`、`--squash`、`--no-commit`、`--commit`、`--autostash`、`--no-progress`。`--depth` 不在 pull 层实现浅历史，而是原样透传给 fetch；本地 Libra upstream 的 fail-closed 行为在 fetch 层发生，失败后不进入集成阶段。`--autostash` 在 fetch 之后、整合（merge/rebase）之前 stash 已跟踪改动（`stash::autostash_push`，无改动时返回 false 不 stash），整合完成（成功或失败）后再 `stash::autostash_pop` 回；为此 `run_pull` 把整合结果捕获为 `integrate_result` 以便失败时也能先 pop 再传播错误。pop 失败映射为 `PullError::Autostash`，提示用 `libra stash pop` 恢复。`--no-progress` 把进度抑制转发给 fetch：`run_pull` 用 `fetch::apply_no_progress` 把传给 fetch 的 child output 的 `progress` 强制为 `ProgressMode::None`，从而抑制 fetch 的 “Receiving objects” 进度条，对齐 `git pull --no-progress`。`--no-rebase`（经 clap `overrides_with` 与 `-r`/`--rebase` 互为最后一个生效）选择 merge 路径并覆盖 `pull.rebase`；CLI 未指定 rebase/ff 行为时，`branch.<name>.rebase`、`pull.rebase` 与 `pull.ff` 按 local → global → system 级联参与合成有效选项；无效/空值在任何 fetch 或集成副作用前失败。
 - `--commit`：提交 merge 结果；与 `--no-commit` 互为 last-one-wins（命令行最后出现者生效），与 `--squash`/`--rebase` 冲突。它可与 `--ff`/`--no-ff`/`--ff-only` 组合且不自行覆盖快进策略；`--ff-only` 也可与 `--squash`/`--no-commit` 组合，对齐 Git 的参数表面。配置选中的 rebase 会在成功 JSON 中表现为 `data.rebase`，即使命令行没有 `--rebase`；有效 rebase 不读取 merge-only 的 `pull.ff`。
 - 无 upstream 的 `libra pull`：保留 `LBR-REPO-003` / exit 128，但 human stderr 使用 Git 风格 advisory block（无 `error:` 前缀），包含 `libra pull <remote> <branch>` 和 `libra branch --set-upstream-to=...`；当且仅当配置里只有一个 remote 时，set-upstream 示例使用该 remote 名，否则保留 `<remote>/<branch>` 占位。
+- 本地 upstream（`branch.<name>.remote=.`，由 HF-07 的 `branch -u` 写入）：在解析到跟踪配置后、查找 `remote.<name>` / 建立连接之前零写入拒绝，`LBR-CLI-003` / exit 129，文案指向 issues/480 HP-16（HF-30 / ADR-HF-08 第 4 条）。显式 `libra pull .` 仍报 `remote '.' not found`。Git 2.54 的 `pull` 可用，属有意差异（DEFER-08）。
 
 
 ## 还未实现的功能
@@ -326,3 +327,7 @@ unchanged. This is framing validation, not a new advertisement content grammar:
 a missing final flush at a frame boundary and well-framed semantically unused
 tail data retain their existing treatment. Git/SSH readers already validate the
 framing of the advertisement buffer before calling the shared parser.
+
+## Issue #477 notes
+
+本地 upstream（remote=.）fail-closed

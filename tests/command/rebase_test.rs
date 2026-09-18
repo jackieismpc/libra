@@ -690,6 +690,344 @@ fn test_rebase_autosquash_folds_fixup_commit() {
     );
 }
 
+/// M-AUTOSQUASH A1–A4 / A6 (HF-12): explicit `--autosquash` skips the
+/// already-up-to-date shortcut; `--no-autosquash` and `rebase.autosquash`
+/// do not fold a linear history.
+#[test]
+fn test_rebase_autosquash_on_up_to_date_branch_matrix() {
+    let linear_fixup = |name: &str| -> tempfile::TempDir {
+        let repo = tempdir().expect("failed to create temp repo");
+        let p = repo.path();
+        init_repo_via_cli(p);
+        configure_identity_via_cli(p);
+        commit_file_via_cli(p, "base.txt", "base\n", "init");
+        let output = run_libra_command(&["switch", "-c", name], p);
+        assert_cli_success(&output, "create topic");
+        commit_file_via_cli(p, "a.txt", "A\n", "A");
+        commit_file_via_cli(p, "a.txt", "A\nfixup\n", "fixup! A");
+        repo
+    };
+
+    let linear_plain = || -> tempfile::TempDir {
+        let repo = tempdir().expect("failed to create temp repo");
+        let p = repo.path();
+        init_repo_via_cli(p);
+        configure_identity_via_cli(p);
+        commit_file_via_cli(p, "base.txt", "base\n", "init");
+        let output = run_libra_command(&["switch", "-c", "topic"], p);
+        assert_cli_success(&output, "create topic");
+        commit_file_via_cli(p, "a.txt", "A\n", "A");
+        repo
+    };
+
+    let log_oneline = |p: &Path| -> String {
+        let output = run_libra_command(&["log", "--oneline"], p);
+        assert_cli_success(&output, "log --oneline");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    // A1: linear `init ← A ← fixup! A`, `rebase --autosquash main` folds to A, init.
+    let repo = linear_fixup("topic-a1");
+    let p = repo.path();
+    let before_a1 = rev_parse_cli(p, "HEAD");
+    let out = run_libra_command(&["--json", "rebase", "--autosquash", "main"], p);
+    assert_cli_success(&out, "A1 rebase --autosquash main");
+    let json = parse_json_stdout(&out);
+    assert_ne!(
+        json["data"]["status"], "already-up-to-date",
+        "A1 must skip the shortcut: {json}"
+    );
+    let log = log_oneline(p);
+    assert!(log.contains("A"), "A1 keeps A: {log}");
+    assert!(log.contains("init"), "A1 keeps init: {log}");
+    assert!(!log.contains("fixup! A"), "A1 must fold the fixup: {log}");
+    assert_eq!(log.lines().count(), 2, "A1 history is A then init: {log}");
+    assert_ne!(
+        rev_parse_cli(p, "HEAD"),
+        before_a1,
+        "A1 folded commit must be rewritten"
+    );
+
+    // A2: linear history without fixup/squash keeps original hashes.
+    let repo = linear_plain();
+    let p = repo.path();
+    let head_before = rev_parse_cli(p, "HEAD");
+    let main_before = rev_parse_cli(p, "main");
+    let out = run_libra_command(&["--json", "rebase", "--autosquash", "main"], p);
+    assert_cli_success(&out, "A2 rebase --autosquash main");
+    assert_eq!(rev_parse_cli(p, "HEAD"), head_before, "A2 HEAD hash");
+    assert_eq!(rev_parse_cli(p, "HEAD~1"), main_before, "A2 parent hash");
+
+    // A3: `--no-autosquash` keeps the existing already-up-to-date shortcut.
+    let repo = linear_fixup("topic-a3");
+    let p = repo.path();
+    let head_before = rev_parse_cli(p, "HEAD");
+    let out = run_libra_command(&["--json", "rebase", "--no-autosquash", "main"], p);
+    assert_cli_success(&out, "A3 rebase --no-autosquash main");
+    let json = parse_json_stdout(&out);
+    assert_eq!(
+        json["data"]["status"], "already-up-to-date",
+        "A3 shortcut: {json}"
+    );
+    assert_eq!(rev_parse_cli(p, "HEAD"), head_before, "A3 no rewrite");
+    assert!(
+        log_oneline(p).contains("fixup! A"),
+        "A3 must not fold: {}",
+        log_oneline(p)
+    );
+
+    // A4: last flag wins.
+    let repo = linear_fixup("topic-a4-off");
+    let p = repo.path();
+    let out = run_libra_command(
+        &[
+            "--json",
+            "rebase",
+            "--autosquash",
+            "--no-autosquash",
+            "main",
+        ],
+        p,
+    );
+    assert_cli_success(&out, "A4 --autosquash --no-autosquash");
+    let json = parse_json_stdout(&out);
+    assert_eq!(
+        json["data"]["status"], "already-up-to-date",
+        "A4 latter --no-autosquash: {json}"
+    );
+    assert!(
+        log_oneline(p).contains("fixup! A"),
+        "A4 must not fold: {}",
+        log_oneline(p)
+    );
+
+    let repo = linear_fixup("topic-a4-on");
+    let p = repo.path();
+    let out = run_libra_command(
+        &[
+            "--json",
+            "rebase",
+            "--no-autosquash",
+            "--autosquash",
+            "main",
+        ],
+        p,
+    );
+    assert_cli_success(&out, "A4 --no-autosquash --autosquash");
+    let json = parse_json_stdout(&out);
+    assert_ne!(
+        json["data"]["status"], "already-up-to-date",
+        "A4 latter --autosquash: {json}"
+    );
+    assert!(
+        !log_oneline(p).contains("fixup! A"),
+        "A4 latter --autosquash must fold: {}",
+        log_oneline(p)
+    );
+
+    // A6: `rebase.autosquash=true` without a flag does not fold (t3415).
+    let repo = linear_fixup("topic-a6");
+    let p = repo.path();
+    let cfg = run_libra_command(&["config", "rebase.autosquash", "true"], p);
+    assert_cli_success(&cfg, "set rebase.autosquash");
+    let head_before = rev_parse_cli(p, "HEAD");
+    let out = run_libra_command(&["--json", "rebase", "main"], p);
+    assert_cli_success(&out, "A6 rebase main with config");
+    let json = parse_json_stdout(&out);
+    assert_eq!(
+        json["data"]["status"], "already-up-to-date",
+        "A6 config must not fold: {json}"
+    );
+    assert_eq!(rev_parse_cli(p, "HEAD"), head_before, "A6 no rewrite");
+    assert!(
+        log_oneline(p).contains("fixup! A"),
+        "A6 must not fold: {}",
+        log_oneline(p)
+    );
+}
+
+#[test]
+fn test_rebase_root_matrix() {
+    let linear_plain = || -> tempfile::TempDir {
+        let repo = tempdir().expect("failed to create temp repo");
+        let p = repo.path();
+        init_repo_via_cli(p);
+        configure_identity_via_cli(p);
+        commit_file_via_cli(p, "base.txt", "base\n", "init");
+        commit_file_via_cli(p, "a.txt", "A\n", "A");
+        repo
+    };
+    let linear_fixup = || -> tempfile::TempDir {
+        let repo = tempdir().expect("failed to create temp repo");
+        let p = repo.path();
+        init_repo_via_cli(p);
+        configure_identity_via_cli(p);
+        commit_file_via_cli(p, "base.txt", "base\n", "init");
+        commit_file_via_cli(p, "a.txt", "A\n", "A");
+        commit_file_via_cli(p, "a.txt", "A\nfixup\n", "fixup! A");
+        repo
+    };
+    let log_oneline = |p: &Path| -> String {
+        let output = run_libra_command(&["log", "--oneline"], p);
+        assert_cli_success(&output, "log --oneline");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let current_branch = |p: &Path| -> String {
+        let output = run_libra_command(&["branch", "--show-current"], p);
+        assert_cli_success(&output, "branch --show-current");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+
+    // R1: unchanged linear history keeps hashes.
+    let repo = linear_plain();
+    let p = repo.path();
+    let head_before = rev_parse_cli(p, "HEAD");
+    let root_before = rev_parse_cli(p, "HEAD~1");
+    let out = run_libra_command(&["--json", "rebase", "--root"], p);
+    assert_cli_success(&out, "R1 rebase --root");
+    let json = parse_json_stdout(&out);
+    assert_eq!(json["data"]["status"], "completed", "R1/R6 status: {json}");
+    assert_eq!(rev_parse_cli(p, "HEAD"), head_before, "R1 HEAD hash");
+    assert_eq!(rev_parse_cli(p, "HEAD~1"), root_before, "R1 root hash");
+    assert_eq!(
+        fs::read_to_string(p.join("a.txt")).unwrap(),
+        "A\n",
+        "R1 worktree"
+    );
+
+    // R2: `--root --autosquash` folds fixup! A, keeping init.
+    let repo = linear_fixup();
+    let p = repo.path();
+    let init_before = rev_parse_cli(p, "HEAD~2");
+    let out = run_libra_command(&["--json", "rebase", "--root", "--autosquash"], p);
+    assert_cli_success(&out, "R2 rebase --root --autosquash");
+    let log = log_oneline(p);
+    assert!(log.contains("A"), "R2 keeps A: {log}");
+    assert!(log.contains("init"), "R2 keeps init: {log}");
+    assert!(!log.contains("fixup! A"), "R2 must fold the fixup: {log}");
+    assert_eq!(log.lines().count(), 2, "R2 history is A then init: {log}");
+    assert_eq!(rev_parse_cli(p, "HEAD~1"), init_before, "R2 init hash");
+
+    // R3: `--root --onto other` replays the full history onto other.
+    let repo = tempdir().expect("failed to create temp repo");
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    commit_file_via_cli(p, "base.txt", "base\n", "init");
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "other"], p),
+        "R3 create other",
+    );
+    commit_file_via_cli(p, "other.txt", "other\n", "other");
+    let other_tip = rev_parse_cli(p, "HEAD");
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "R3 switch main");
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "topic"], p),
+        "R3 create topic",
+    );
+    commit_file_via_cli(p, "topic.txt", "topic\n", "topic");
+    let topic_before = rev_parse_cli(p, "HEAD");
+    let out = run_libra_command(&["--json", "rebase", "--root", "--onto", "other"], p);
+    assert_cli_success(&out, "R3 rebase --root --onto other");
+    let json = parse_json_stdout(&out);
+    assert_eq!(json["data"]["status"], "completed", "R3/R6 status: {json}");
+    assert_eq!(rev_parse_cli(p, "HEAD~2"), other_tip, "R3 lands on other");
+    assert_ne!(
+        rev_parse_cli(p, "HEAD"),
+        topic_before,
+        "R3 must rewrite topic"
+    );
+    assert_eq!(fs::read_to_string(p.join("other.txt")).unwrap(), "other\n");
+    assert_eq!(fs::read_to_string(p.join("topic.txt")).unwrap(), "topic\n");
+    assert_eq!(fs::read_to_string(p.join("base.txt")).unwrap(), "base\n");
+
+    // R4: `--root <branch>` checks the branch out, then replays from the root.
+    let repo = linear_plain();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "topic"], p),
+        "R4 create topic",
+    );
+    let topic_head = rev_parse_cli(p, "HEAD");
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "R4 switch main");
+    assert_eq!(current_branch(p), "main");
+    let out = run_libra_command(&["rebase", "--root", "topic"], p);
+    assert_eq!(out.status.code(), Some(0), "R4 exit 0");
+    assert_eq!(current_branch(p), "topic");
+    assert_eq!(rev_parse_cli(p, "HEAD"), topic_head, "R4 topic hashes");
+
+    // `--root` plus two positionals is a usage error (ADR-HF-13).
+    let repo = linear_plain();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "topic"], p),
+        "usage create topic",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "usage switch");
+    let out = run_libra_command(&["rebase", "--root", "main", "topic"], p);
+    assert_eq!(out.status.code(), Some(129), "root+upstream usage");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--root cannot be used together with <upstream>"),
+        "usage stderr: {stderr}"
+    );
+
+    // R5: `--root --onto other` add/add conflict, then --continue / --abort.
+    let conflict_repo = || -> tempfile::TempDir {
+        let repo = tempdir().expect("failed to create temp repo");
+        let p = repo.path();
+        init_repo_via_cli(p);
+        configure_identity_via_cli(p);
+        commit_file_via_cli(p, "base.txt", "base\n", "init");
+        assert_cli_success(
+            &run_libra_command(&["switch", "-c", "other"], p),
+            "R5 create other",
+        );
+        commit_file_via_cli(p, "conflict.txt", "other\n", "other adds conflict");
+        assert_cli_success(&run_libra_command(&["switch", "main"], p), "R5 switch main");
+        assert_cli_success(
+            &run_libra_command(&["switch", "-c", "topic"], p),
+            "R5 create topic",
+        );
+        commit_file_via_cli(p, "conflict.txt", "topic\n", "topic adds conflict");
+        repo
+    };
+
+    let repo = conflict_repo();
+    let p = repo.path();
+    let topic_before = rev_parse_cli(p, "HEAD");
+    let out = run_libra_command(&["rebase", "--root", "--onto", "other"], p);
+    assert_eq!(out.status.code(), Some(128), "R5 conflict exit");
+    let conflicted = fs::read_to_string(p.join("conflict.txt")).unwrap();
+    assert!(
+        conflicted.contains("<<<<<<<"),
+        "R5 conflict markers: {conflicted}"
+    );
+    assert_cli_success(
+        &run_libra_command(&["rebase", "--abort"], p),
+        "R5 rebase --abort",
+    );
+    assert_eq!(rev_parse_cli(p, "HEAD"), topic_before, "R5 abort restores");
+    assert_eq!(current_branch(p), "topic");
+
+    let repo = conflict_repo();
+    let p = repo.path();
+    let out = run_libra_command(&["rebase", "--root", "--onto", "other"], p);
+    assert_eq!(out.status.code(), Some(128), "R5 continue setup");
+    fs::write(p.join("conflict.txt"), "resolved\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "conflict.txt"], p),
+        "R5 stage resolution",
+    );
+    let cont = run_libra_command(&["--json", "rebase", "--continue"], p);
+    assert_cli_success(&cont, "R5 rebase --continue");
+    assert_eq!(
+        fs::read_to_string(p.join("conflict.txt")).unwrap(),
+        "resolved\n"
+    );
+    assert_eq!(current_branch(p), "topic");
+}
+
 #[test]
 fn test_rebase_autosquash_keeps_unmatched_fixup_as_pick() {
     let repo = tempdir().expect("failed to create temp repo");
@@ -1593,6 +1931,9 @@ async fn test_basic_rebase() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1628,6 +1969,9 @@ async fn test_basic_rebase() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1680,6 +2024,9 @@ async fn test_basic_rebase() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1715,6 +2062,9 @@ async fn test_basic_rebase() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1766,6 +2116,9 @@ async fn test_basic_rebase() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1819,7 +2172,11 @@ async fn test_basic_rebase() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -1890,6 +2247,9 @@ async fn test_rebase_preserves_untracked_files() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1941,6 +2301,9 @@ async fn test_rebase_preserves_untracked_files() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1992,6 +2355,9 @@ async fn test_rebase_preserves_untracked_files() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2048,7 +2414,11 @@ async fn test_rebase_preserves_untracked_files() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -2091,6 +2461,9 @@ async fn test_rebase_already_up_to_date() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2126,6 +2499,9 @@ async fn test_rebase_already_up_to_date() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2180,7 +2556,11 @@ async fn test_rebase_already_up_to_date() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -2215,6 +2595,9 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2266,6 +2649,9 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2317,6 +2703,9 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2371,7 +2760,11 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -2404,7 +2797,11 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
         continue_rebase: false,
         abort: true,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -2457,6 +2854,9 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2507,6 +2907,9 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2558,6 +2961,9 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2611,7 +3017,11 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -2672,7 +3082,11 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
         continue_rebase: false,
         abort: true,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -2723,6 +3137,9 @@ async fn test_rebase_continue_no_rebase() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2761,7 +3178,11 @@ async fn test_rebase_continue_no_rebase() {
         continue_rebase: true,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -2794,6 +3215,9 @@ async fn test_rebase_skip_no_rebase() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2832,7 +3256,11 @@ async fn test_rebase_skip_no_rebase() {
         continue_rebase: false,
         abort: false,
         skip: true,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -2867,6 +3295,9 @@ async fn test_rebase_with_conflict_and_abort() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2922,6 +3353,9 @@ async fn test_rebase_with_conflict_and_abort() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2973,6 +3407,9 @@ async fn test_rebase_with_conflict_and_abort() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3026,7 +3463,11 @@ async fn test_rebase_with_conflict_and_abort() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -3066,7 +3507,11 @@ async fn test_rebase_with_conflict_and_abort() {
         continue_rebase: false,
         abort: true,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -3132,6 +3577,9 @@ async fn test_rebase_binary_conflict_writes_markers() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3182,6 +3630,9 @@ async fn test_rebase_binary_conflict_writes_markers() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3232,6 +3683,9 @@ async fn test_rebase_binary_conflict_writes_markers() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3284,7 +3738,11 @@ async fn test_rebase_binary_conflict_writes_markers() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -3327,7 +3785,11 @@ async fn test_rebase_binary_conflict_writes_markers() {
         continue_rebase: false,
         abort: true,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -3367,6 +3829,9 @@ async fn test_rebase_with_conflict_and_skip() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3423,6 +3888,9 @@ async fn test_rebase_with_conflict_and_skip() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3463,6 +3931,9 @@ async fn test_rebase_with_conflict_and_skip() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3514,6 +3985,9 @@ async fn test_rebase_with_conflict_and_skip() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3567,7 +4041,11 @@ async fn test_rebase_with_conflict_and_skip() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -3599,7 +4077,11 @@ async fn test_rebase_with_conflict_and_skip() {
         continue_rebase: false,
         abort: false,
         skip: true,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -3644,6 +4126,9 @@ async fn test_rebase_with_conflict_and_continue() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3699,6 +4184,9 @@ async fn test_rebase_with_conflict_and_continue() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3750,6 +4238,9 @@ async fn test_rebase_with_conflict_and_continue() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3803,7 +4294,11 @@ async fn test_rebase_with_conflict_and_continue() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -3840,6 +4335,9 @@ async fn test_rebase_with_conflict_and_continue() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -3863,7 +4361,11 @@ async fn test_rebase_with_conflict_and_continue() {
         continue_rebase: true,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -3923,6 +4425,9 @@ async fn test_rebase_multiple_commits_partial_conflict() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3975,6 +4480,9 @@ async fn test_rebase_multiple_commits_partial_conflict() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4015,6 +4523,9 @@ async fn test_rebase_multiple_commits_partial_conflict() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4051,6 +4562,9 @@ async fn test_rebase_multiple_commits_partial_conflict() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4102,6 +4616,9 @@ async fn test_rebase_multiple_commits_partial_conflict() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4155,7 +4672,11 @@ async fn test_rebase_multiple_commits_partial_conflict() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -4188,7 +4709,11 @@ async fn test_rebase_multiple_commits_partial_conflict() {
         continue_rebase: false,
         abort: false,
         skip: true,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -4249,6 +4774,9 @@ async fn test_rebase_state_persistence() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4300,6 +4828,9 @@ async fn test_rebase_state_persistence() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4351,6 +4882,9 @@ async fn test_rebase_state_persistence() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4404,7 +4938,11 @@ async fn test_rebase_state_persistence() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -4454,7 +4992,11 @@ async fn test_rebase_state_persistence() {
         continue_rebase: false,
         abort: true,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -4499,6 +5041,9 @@ async fn test_rebase_fast_forward_branch_behind() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4566,6 +5111,9 @@ async fn test_rebase_fast_forward_branch_behind() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4621,7 +5169,11 @@ async fn test_rebase_fast_forward_branch_behind() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -4668,6 +5220,9 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4735,6 +5290,9 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4791,7 +5349,11 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -4838,6 +5400,9 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4905,6 +5470,9 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4961,7 +5529,11 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -5008,6 +5580,9 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5059,6 +5634,9 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5110,6 +5688,9 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5166,7 +5747,11 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -5220,6 +5805,9 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5272,6 +5860,9 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5323,6 +5914,9 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5376,7 +5970,11 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -5414,7 +6012,11 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
         continue_rebase: false,
         abort: true,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -5447,6 +6049,9 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5499,6 +6104,9 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5568,6 +6176,9 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5623,7 +6234,11 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -5658,7 +6273,11 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
         continue_rebase: false,
         abort: true,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -5691,6 +6310,9 @@ async fn test_rebase_continue_requires_resolution() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5742,6 +6364,9 @@ async fn test_rebase_continue_requires_resolution() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5793,6 +6418,9 @@ async fn test_rebase_continue_requires_resolution() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -5846,7 +6474,11 @@ async fn test_rebase_continue_requires_resolution() {
         continue_rebase: false,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -5880,7 +6512,11 @@ async fn test_rebase_continue_requires_resolution() {
         continue_rebase: true,
         abort: false,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;
@@ -5914,7 +6550,11 @@ async fn test_rebase_continue_requires_resolution() {
         continue_rebase: false,
         abort: true,
         skip: false,
+        root: false,
+        interactive: false,
+        edit_todo: false,
         autosquash: false,
+        no_autosquash: false,
         reapply_cherry_picks: false,
     })
     .await;

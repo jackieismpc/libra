@@ -1909,7 +1909,7 @@ pub(crate) fn record_algorithm_selector_events(args: &mut DiffArgs, argv: &[Stri
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum DiffAlgorithm {
+pub(crate) enum DiffAlgorithm {
     Myers,
     MyersMinimal,
     Patience,
@@ -5900,7 +5900,7 @@ fn materialize_indexed_changes<'a>(
 /// copy of git_internal's `compute_unified_diff`. Myers matches git_internal's
 /// initial body; Patience/Histogram/Anchored replace it with their selected
 /// anchors.
-fn compute_unified_hunks(
+pub(crate) fn compute_unified_hunks(
     old_text: &str,
     new_text: &str,
     context: usize,

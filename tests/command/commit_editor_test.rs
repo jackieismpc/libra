@@ -1020,3 +1020,111 @@ fn commit_template_status_section_stays_long_with_status_short_config() {
          status.short=true (Git behavior), got:\n{template}"
     );
 }
+
+/// M-COMMIT K5–K7 (#477 HF-05): a comment-only `-t` template is an empty
+/// message; an unedited non-empty template still reports "did not edit".
+#[cfg(unix)]
+#[test]
+fn test_comment_only_template_reports_empty_message() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    stage_file(&repo, "a.txt", "x\n");
+
+    let comments = temp.path().join("comments.txt");
+    fs::write(&comments, "# only a comment\n").unwrap();
+    let empty = run_libra_env(
+        &["commit", "-t", comments.to_str().unwrap(), "--no-verify"],
+        &repo,
+        &[("EDITOR", "true")],
+    );
+    assert_eq!(
+        empty.status.code(),
+        Some(128),
+        "comment-only template must abort: {}",
+        String::from_utf8_lossy(&empty.stderr)
+    );
+    let empty_err = String::from_utf8_lossy(&empty.stderr);
+    assert!(
+        empty_err.contains("aborting commit due to empty commit message"),
+        "K5 empty-message wording: {empty_err}"
+    );
+    assert!(
+        empty_err.contains("LBR-REPO-003"),
+        "K7 stable code for K5: {empty_err}"
+    );
+    assert!(
+        !empty_err.contains("did not edit the message"),
+        "comment-only must not be reported as unedited: {empty_err}"
+    );
+
+    let subject = temp.path().join("subject.txt");
+    fs::write(&subject, "templated subject\n").unwrap();
+    let unedited = run_libra_env(
+        &["commit", "-t", subject.to_str().unwrap(), "--no-verify"],
+        &repo,
+        &[("EDITOR", "true")],
+    );
+    assert_eq!(
+        unedited.status.code(),
+        Some(128),
+        "unedited template must abort: {}",
+        String::from_utf8_lossy(&unedited.stderr)
+    );
+    let unedited_err = String::from_utf8_lossy(&unedited.stderr);
+    assert!(
+        unedited_err.contains("did not edit the message"),
+        "K6 unedited wording: {unedited_err}"
+    );
+    assert!(
+        unedited_err.contains("LBR-REPO-003"),
+        "K7 stable code for K6: {unedited_err}"
+    );
+}
+
+/// M-EMPTY E4 / E7 (#477 HF-06).
+#[cfg(unix)]
+#[test]
+fn test_allow_empty_message_accepts_unedited_template() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    stage_file(&repo, "a.txt", "x\n");
+
+    let empty = run_libra_env(
+        &["commit", "--allow-empty-message", "--no-verify"],
+        &repo,
+        &[("EDITOR", "true")],
+    );
+    assert_eq!(
+        empty.status.code(),
+        Some(0),
+        "E4 empty editor: {}",
+        String::from_utf8_lossy(&empty.stderr)
+    );
+
+    stage_file(&repo, "b.txt", "y\n");
+    let tpl = temp.path().join("tpl.txt");
+    fs::write(&tpl, "templated subject\n").unwrap();
+    let templated = run_libra_env(
+        &[
+            "commit",
+            "-t",
+            tpl.to_str().unwrap(),
+            "--allow-empty-message",
+            "--no-verify",
+        ],
+        &repo,
+        &[("EDITOR", "true")],
+    );
+    assert_eq!(
+        templated.status.code(),
+        Some(0),
+        "E7 unedited template: {}",
+        String::from_utf8_lossy(&templated.stderr)
+    );
+    assert!(
+        last_commit_message(&repo).contains("templated subject"),
+        "E7 commits the template body"
+    );
+}

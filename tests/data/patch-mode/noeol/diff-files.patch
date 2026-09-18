@@ -1,0 +1,10 @@
+diff --git a/noeol.txt b/noeol.txt
+index 0a207c0..33d5d3b 100644
+--- a/noeol.txt
++++ b/noeol.txt
+@@ -1,2 +1,2 @@
+ a
+-b
+\ No newline at end of file
++B
+\ No newline at end of file

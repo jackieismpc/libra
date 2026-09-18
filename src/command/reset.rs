@@ -13,6 +13,7 @@ use git_internal::{
     internal::{
         index::{Index, IndexEntry},
         object::{
+            blob::Blob,
             commit::Commit,
             tree::{Tree, TreeItemMode},
         },
@@ -21,12 +22,19 @@ use git_internal::{
 use serde::Serialize;
 
 use crate::{
-    command::{load_object, symlink_target_blob_bytes},
+    command::{
+        diff::{DiffAlgorithm, compute_unified_hunks},
+        load_object, symlink_target_blob_bytes,
+    },
     common_utils::parse_commit_msg,
     internal::{
         branch::{self, Branch},
         db::get_db_conn_instance,
         head::Head,
+        patch_mode::{
+            FileDiff, HunkUse, PatchApplyMode, PatchSessionKind, SessionOptions,
+            apply_selected_hunks_to_blob, parse_unified_diff, run_session_with,
+        },
         reflog::{ReflogAction, ReflogContext, with_reflog},
     },
     utils::{
@@ -34,6 +42,7 @@ use crate::{
         object_ext::{BlobExt, TreeExt},
         output::{OutputConfig, emit_json_data},
         path,
+        pathspec::PathspecSet,
         text::short_display_hash,
         util, worktree,
     },
@@ -49,7 +58,8 @@ EXAMPLES:
     libra reset src/lib.rs                 Unstage a path back to HEAD
     libra reset HEAD -- src/lib.rs        Unstage a path back to HEAD
     libra reset --pathspec-from-file=paths.txt   Unstage paths read from a file ('-' for stdin)
-    libra reset --json --hard HEAD~1      Structured JSON output for agents";
+    libra reset --json --hard HEAD~1      Structured JSON output for agents
+    libra reset -p                        Interactively unstage hunks";
 
 pub(crate) const RESET_PATHSPEC_SEPARATOR_FLAG: &str = "__libra-reset-pathspec-separator";
 pub(crate) const DEFAULT_RESET_TARGET: &str = "HEAD";
@@ -107,6 +117,20 @@ pub struct ResetArgs {
     /// so this flag is a no-op.
     #[clap(long)]
     pub no_refresh: bool,
+
+    /// Interactively choose hunks to unstage or apply to the index (`reset -p`).
+    #[clap(short = 'p', long = "patch")]
+    pub patch: bool,
+
+    /// Auto-advance after each hunk decision (the `reset -p` default). Last
+    /// one wins against `--no-auto-advance`.
+    #[clap(long = "auto-advance", overrides_with = "no_auto_advance")]
+    pub auto_advance: bool,
+
+    /// Stay on the current hunk after `y`/`n` and enable `>`/`<` file
+    /// navigation. Requires `-p`.
+    #[clap(long = "no-auto-advance", overrides_with = "auto_advance")]
+    pub no_auto_advance: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -197,6 +221,33 @@ async fn execute_safe_inner(
     output: &OutputConfig,
     conclude_sequences: bool,
 ) -> CliResult<()> {
+    if (args.no_auto_advance || args.auto_advance) && !args.patch {
+        let option = if args.no_auto_advance {
+            "--no-auto-advance"
+        } else {
+            "--auto-advance"
+        };
+        return Err(
+            CliError::fatal(format!("the option '{option}' requires '--patch'"))
+                .with_exit_code(128)
+                .with_stable_code(StableErrorCode::CliInvalidArguments),
+        );
+    }
+    if args.patch {
+        if args.soft || args.mixed || args.hard || args.merge || args.keep {
+            return Err(CliError::command_usage(
+                "options '--patch' and '--soft/--mixed/--hard/--merge/--keep' cannot be used together",
+            )
+            .with_stable_code(StableErrorCode::CliInvalidArguments));
+        }
+        if output.is_json() {
+            return Err(CliError::command_usage(
+                "options '--json' and '--patch' cannot be used together",
+            )
+            .with_stable_code(StableErrorCode::CliInvalidArguments));
+        }
+        return run_reset_patch(&args).await;
+    }
     let result = run_reset(args, conclude_sequences)
         .await
         .map_err(CliError::from)?;
@@ -205,6 +256,377 @@ async fn execute_safe_inner(
         emit_post_envelope_warning(warning);
     }
     Ok(())
+}
+
+struct ResetPatchCandidate {
+    file: FileDiff,
+    old_bytes: Vec<u8>,
+}
+
+async fn run_reset_patch(args: &ResetArgs) -> CliResult<()> {
+    util::require_repo().map_err(|_| ResetError::NotInRepo)?;
+    let request = normalize_reset_request(args).await?;
+    let target_tree = util::resolve_tree_ish_typed(&request.target)
+        .await
+        .map_err(map_commit_base_error)?;
+    let head_oid = Head::current_commit_result()
+        .await
+        .map_err(map_reset_head_commit_error)?
+        .ok_or(ResetError::HeadUnborn)?;
+    let head_commit: Commit = load_object(&head_oid)
+        .map_err(|error| object_load_error("commit", head_oid.to_string(), error.to_string()))?;
+    let unstage = target_tree == head_commit.tree_id;
+    let apply_mode = if unstage {
+        PatchApplyMode::ResetHead
+    } else {
+        PatchApplyMode::ResetNotHead
+    };
+    let session_kind = if unstage {
+        PatchSessionKind::Unstage
+    } else {
+        PatchSessionKind::ApplyToIndex
+    };
+
+    let workdir = util::working_dir();
+    let current_dir =
+        std::env::current_dir().map_err(|source| ResetError::WorktreeRead(source.to_string()))?;
+    let pathspecs =
+        PathspecSet::from_workdir(&request.pathspecs, &current_dir, &workdir).map_err(|error| {
+            CliError::command_usage(error.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+        })?;
+
+    let index_path = path::index();
+    let mut index =
+        Index::load(&index_path).map_err(|error| ResetError::IndexLoad(error.to_string()))?;
+    let target_index = index_for_tree(&target_tree)?;
+    let mut candidates =
+        collect_reset_patch_candidates(&index, &target_index, &pathspecs, unstage)?;
+    candidates.sort_by(|a, b| a.file.path.as_bytes().cmp(b.file.path.as_bytes()));
+
+    let mut session_files: Vec<FileDiff> = candidates.iter().map(|c| c.file.clone()).collect();
+    let editor = crate::command::editor::resolve_editor().await;
+    let storage_path = util::try_get_storage_path(None).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            ResetError::NotInRepo
+        } else {
+            ResetError::WorktreeRead(source.to_string())
+        }
+    })?;
+    let edit_path = storage_path.join("ADD_EDIT.patch");
+    let index_blobs = candidates.iter().map(|c| c.old_bytes.clone()).collect();
+    {
+        let stdin = std::io::stdin();
+        let mut input = stdin.lock();
+        let mut stdout = std::io::stdout();
+        run_session_with(
+            &mut session_files,
+            &mut input,
+            &mut stdout,
+            SessionOptions {
+                auto_advance: !args.no_auto_advance,
+                editor,
+                edit_path: Some(edit_path.clone()),
+                index_blobs,
+                kind: session_kind,
+            },
+        )
+        .map_err(|source| {
+            CliError::fatal(format!("failed to read patch-mode input: {source}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+        let _ = std::fs::remove_file(&edit_path);
+    }
+
+    let mut pending = Vec::new();
+    for (i, file) in session_files.iter().enumerate() {
+        let decided = file
+            .hunks
+            .iter()
+            .any(|hunk| hunk.use_decision == HunkUse::Use);
+        if !decided {
+            continue;
+        }
+        let applied = apply_selected_hunks_to_blob(&candidates[i].old_bytes, file, apply_mode)
+            .map_err(|source| {
+                CliError::fatal(source.to_string())
+                    .with_stable_code(StableErrorCode::RepoStateInvalid)
+            })?;
+        pending.push((file.path.clone(), applied));
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+    for (path, applied) in pending {
+        match applied.bytes {
+            None => {
+                index.remove(&path, 0);
+            }
+            Some(bytes) => {
+                let blob = Blob::from_content_bytes(bytes);
+                blob.try_save().map_err(|source| ResetError::ObjectLoad {
+                    kind: "blob",
+                    object_id: path.clone(),
+                    detail: source.to_string(),
+                })?;
+                let mut entry =
+                    IndexEntry::new_from_blob(path.clone(), blob.id, blob.data.len() as u32);
+                if let Some(mode) = applied.mode {
+                    entry.mode = mode;
+                }
+                index.update(entry);
+            }
+        }
+    }
+    index
+        .save(&index_path)
+        .map_err(|source| ResetError::IndexSave(source.to_string()))?;
+    Ok(())
+}
+
+fn index_for_tree(tree_id: &ObjectHash) -> Result<Index, ResetError> {
+    let tree: Tree = load_object(tree_id)
+        .map_err(|error| object_load_error("tree", tree_id.to_string(), error.to_string()))?;
+    let mut index = Index::new();
+    rebuild_index_from_tree_typed(&tree, &mut index, "")?;
+    Ok(index)
+}
+
+fn collect_reset_patch_candidates(
+    index: &Index,
+    target_index: &Index,
+    pathspecs: &PathspecSet,
+    unstage: bool,
+) -> Result<Vec<ResetPatchCandidate>, ResetError> {
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for path in index.tracked_files() {
+        if let Some(name) = path.to_str()
+            && pathspecs.matches_path(&path)
+        {
+            names.insert(name.to_string());
+        }
+    }
+    for path in target_index.tracked_files() {
+        if let Some(name) = path.to_str()
+            && pathspecs.matches_path(&path)
+        {
+            names.insert(name.to_string());
+        }
+    }
+
+    let mut out = Vec::new();
+    for path in names {
+        let index_entry = index.get(&path, 0);
+        let target_entry = target_index.get(&path, 0);
+        match (index_entry, target_entry) {
+            (Some(index_ent), Some(target_ent))
+                if index_ent.hash == target_ent.hash && index_ent.mode == target_ent.mode =>
+            {
+                continue;
+            }
+            (None, None) => continue,
+            _ => {}
+        }
+        if let Some(candidate) =
+            build_reset_patch_candidate(&path, index_entry, target_entry, unstage)?
+        {
+            out.push(candidate);
+        }
+    }
+    Ok(out)
+}
+
+fn build_reset_patch_candidate(
+    path: &str,
+    index_entry: Option<&IndexEntry>,
+    target_entry: Option<&IndexEntry>,
+    unstage: bool,
+) -> Result<Option<ResetPatchCandidate>, ResetError> {
+    let index_bytes = match index_entry {
+        Some(entry) => load_blob_bytes(&entry.hash, path)?,
+        None => Vec::new(),
+    };
+    let target_bytes = match target_entry {
+        Some(entry) => load_blob_bytes(&entry.hash, path)?,
+        None => Vec::new(),
+    };
+    let index_mode = index_entry.map(|entry| entry.mode);
+    let target_mode = target_entry.map(|entry| entry.mode);
+    let binary = patch_bytes_are_binary(&index_bytes) || patch_bytes_are_binary(&target_bytes);
+
+    let (old_bytes, new_bytes, old_mode, new_mode, old_hash, new_hash, added, deleted) = if unstage
+    {
+        (
+            target_bytes,
+            index_bytes.clone(),
+            target_mode,
+            index_mode,
+            target_entry.map(|entry| entry.hash),
+            index_entry.map(|entry| entry.hash),
+            target_entry.is_none() && index_entry.is_some(),
+            index_entry.is_none() && target_entry.is_some(),
+        )
+    } else {
+        (
+            index_bytes.clone(),
+            target_bytes,
+            index_mode,
+            target_mode,
+            index_entry.map(|entry| entry.hash),
+            target_entry.map(|entry| entry.hash),
+            index_entry.is_none() && target_entry.is_some(),
+            target_entry.is_none() && index_entry.is_some(),
+        )
+    };
+
+    let header = build_reset_patch_header(
+        path,
+        old_hash.as_ref(),
+        new_hash.as_ref(),
+        old_mode,
+        new_mode,
+        added,
+        deleted,
+        binary,
+        !unstage,
+    );
+    if binary {
+        return Ok(Some(ResetPatchCandidate {
+            file: FileDiff {
+                path: path.to_string(),
+                header,
+                old_mode,
+                new_mode,
+                added,
+                deleted,
+                mode_change: old_mode.zip(new_mode).is_some_and(|(a, b)| a != b)
+                    && !added
+                    && !deleted,
+                binary: true,
+                hunks: Vec::new(),
+            },
+            old_bytes: index_bytes,
+        }));
+    }
+
+    let old_text = String::from_utf8(old_bytes.clone()).ok();
+    let new_text = String::from_utf8(new_bytes).ok();
+    let (Some(old_text), Some(new_text)) = (old_text, new_text) else {
+        return Ok(Some(ResetPatchCandidate {
+            file: FileDiff {
+                path: path.to_string(),
+                header,
+                old_mode,
+                new_mode,
+                added,
+                deleted,
+                mode_change: old_mode.zip(new_mode).is_some_and(|(a, b)| a != b)
+                    && !added
+                    && !deleted,
+                binary: true,
+                hunks: Vec::new(),
+            },
+            old_bytes: index_bytes,
+        }));
+    };
+    let hunk_body = if old_text == new_text {
+        String::new()
+    } else {
+        compute_unified_hunks(&old_text, &new_text, 3, &DiffAlgorithm::Myers)
+    };
+    if hunk_body.is_empty() && old_mode == new_mode {
+        return Ok(None);
+    }
+    let mut patch = header;
+    patch.push_str(&hunk_body);
+    let mut files = parse_unified_diff(&patch).map_err(|source| ResetError::ObjectLoad {
+        kind: "patch",
+        object_id: path.to_string(),
+        detail: source.to_string(),
+    })?;
+    let Some(mut file) = files.pop() else {
+        return Ok(None);
+    };
+    file.path = path.to_string();
+    file.added = added;
+    file.deleted = deleted;
+    file.old_mode = old_mode;
+    file.new_mode = new_mode;
+    file.mode_change = old_mode.zip(new_mode).is_some_and(|(a, b)| a != b) && !added && !deleted;
+    Ok(Some(ResetPatchCandidate {
+        file,
+        old_bytes: index_bytes,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_reset_patch_header(
+    path: &str,
+    old_hash: Option<&ObjectHash>,
+    new_hash: Option<&ObjectHash>,
+    old_mode: Option<u32>,
+    new_mode: Option<u32>,
+    added: bool,
+    deleted: bool,
+    binary: bool,
+    reverse_names: bool,
+) -> String {
+    let (left, right) = if reverse_names {
+        ("b", "a")
+    } else {
+        ("a", "b")
+    };
+    let mut header = format!("diff --git {left}/{path} {right}/{path}\n");
+    let old_mode = old_mode.unwrap_or(0o100644);
+    if deleted {
+        header.push_str(&format!("deleted file mode {old_mode:06o}\n"));
+        if let Some(hash) = old_hash {
+            header.push_str(&format!("index {}..0000000\n", abbrev7(hash)));
+        }
+        header.push_str(&format!("--- {left}/{path}\n+++ /dev/null\n"));
+        return header;
+    }
+    if added {
+        let new_mode = new_mode.unwrap_or(0o100644);
+        header.push_str(&format!("new file mode {new_mode:06o}\n"));
+        if let Some(hash) = new_hash {
+            header.push_str(&format!("index 0000000..{}\n", abbrev7(hash)));
+        }
+        header.push_str(&format!("--- /dev/null\n+++ {right}/{path}\n"));
+        return header;
+    }
+    let new_mode = new_mode.unwrap_or(old_mode);
+    if old_mode != new_mode {
+        header.push_str(&format!("old mode {old_mode:06o}\n"));
+        header.push_str(&format!("new mode {new_mode:06o}\n"));
+    }
+    header.push_str(&format!(
+        "index {}..{} {old_mode:06o}\n",
+        old_hash.map(abbrev7).unwrap_or_else(|| "0000000".into()),
+        new_hash.map(abbrev7).unwrap_or_else(|| "0000000".into())
+    ));
+    if binary {
+        header.push_str(&format!(
+            "Binary files {left}/{path} and {right}/{path} differ\n"
+        ));
+    } else {
+        header.push_str(&format!("--- {left}/{path}\n+++ {right}/{path}\n"));
+    }
+    header
+}
+
+fn load_blob_bytes(hash: &ObjectHash, path: &str) -> Result<Vec<u8>, ResetError> {
+    let blob: Blob = load_object(hash)
+        .map_err(|error| object_load_error("blob", format!("{path} {hash}"), error.to_string()))?;
+    Ok(blob.data)
+}
+
+fn patch_bytes_are_binary(bytes: &[u8]) -> bool {
+    bytes.contains(&0)
+}
+
+fn abbrev7(hash: &ObjectHash) -> String {
+    hash.to_string().chars().take(7).collect()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -546,13 +968,45 @@ async fn run_reset(
     } else {
         StoppedSequences::default()
     };
+    let stopped_merge = if conclude_sequences {
+        crate::command::merge::snapshot_stopped_merge()
+    } else {
+        Ok(None)
+    };
     let mut reset_stats = perform_reset(target_commit_id, mode, &request.target).await?;
 
     // The reset itself is already durable, so a bookkeeping failure only adds a
     // warning (exit 0) naming the command that finishes the leftover state.
     // Resets run as an internal step of cherry-pick/am keep their caller's
     // sequence intact.
+    //
+    // ADR-HF-03 item 5 (#477 HF-26): promote/clear an in-progress merge first.
+    // A merge-autostash promotion failure leaves both merge sidecars and must
+    // not touch cherry-pick/revert state.
+    let mut skip_sequence_conclusion = false;
+    if conclude_sequences {
+        match stopped_merge {
+            Ok(None) => {}
+            Ok(Some(snapshot)) => {
+                match crate::command::merge::conclude_stopped_merge(snapshot).await {
+                    Ok(notes) => reset_stats.warnings.extend(notes),
+                    Err(warning) => {
+                        reset_stats.warnings.push(warning);
+                        skip_sequence_conclusion = true;
+                    }
+                }
+            }
+            Err(error) => {
+                reset_stats.warnings.push(format!(
+                    "reset completed, but the in-progress merge state could not be read: {error}; \
+                     finish or abort it with `libra merge --abort`"
+                ));
+                skip_sequence_conclusion = true;
+            }
+        }
+    }
     if conclude_sequences
+        && !skip_sequence_conclusion
         && (!matches!(&stopped.cherry_pick, Ok(None)) || !matches!(&stopped.revert, Ok(None)))
     {
         // No snapshot means no recovery state to conclude or warn about. A

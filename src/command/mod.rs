@@ -92,6 +92,7 @@ pub mod pull;
 pub mod push;
 pub mod read_tree;
 pub mod rebase;
+pub mod rebase_todo;
 pub mod reflog;
 pub mod remote;
 pub mod remove;

@@ -281,6 +281,9 @@ async fn stage_path(path: &str) -> CliResult<()> {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     };
     crate::command::add::run_add(&args).await?;
 

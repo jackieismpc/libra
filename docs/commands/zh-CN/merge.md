@@ -18,7 +18,7 @@ libra merge --restart
 
 如果当前分支可以快进，Libra 会将分支指针移动到目标提交，并恢复索引和工作树。如果分支已经分叉，Libra 会使用 merge base 执行单头三方合并；当历史留下不止一个 merge base 时，改用由它们递归折叠出的虚拟祖先（见下文）。
 
-开始新合并前，Libra 同时检查 merge 状态和索引。已有 merge 状态时仍提示 `merge --continue`、`--abort` 或 `--quit`；`--quit` 只清除 merge bookkeeping，HEAD、索引 stage 和带冲突标记的文件均保持不动；若有 held autostash，则转存到可见的 stash list 而不回贴。没有进行中的 merge 时，`--quit` 返回 `LBR-REPO-003`（退出 128）并提示启动 merge；这有意不同于 Git 的静默 no-op。没有 merge 状态但索引仍有未解决条目时（例如冲突 squash 后），即使目标已经最新，或使用 `--dry-run`，也以 `LBR-CONFLICT-002` 拒绝（退出 128），HEAD、索引和工作树保持原样。先解决冲突、用 `libra add` 暂存，再运行普通 `libra commit`，然后才能开始新合并。
+开始新合并前，Libra 同时检查 merge 状态和索引。已有 merge 状态时仍提示 `merge --continue`、`--abort` 或 `--quit`。冲突已暂存后，普通 `libra commit` 也会结束 merge（双亲提交、预填合并消息，然后清除 merge 状态并应用持有的 autostash）；`--quit` 只清除 merge bookkeeping，HEAD、索引 stage 和带冲突标记的文件均保持不动；若有 held autostash，则转存到可见的 stash list 而不回贴。没有进行中的 merge 时，`--quit` 返回 `LBR-REPO-003`（退出 128）并提示启动 merge；这有意不同于 Git 的静默 no-op。没有 merge 状态但索引仍有未解决条目时（例如冲突 squash 后），即使目标已经最新，或使用 `--dry-run`，也以 `LBR-CONFLICT-002` 拒绝（退出 128），HEAD、索引和工作树保持原样。先解决冲突、用 `libra add` 暂存，再运行普通 `libra commit`，然后才能开始新合并。
 
 非 squash 合并因冲突停下时，Libra 会记录包含自动合并结果（含冲突标记）的 `AUTO_MERGE` tree。它是投影出的伪引用，而非落盘的 loose ref：仅在该 merge state 存在期间，`libra rev-parse AUTO_MERGE`、`libra cat-file` 和 `libra diff` 可以消费它。`merge --continue`、`--abort` 与 `--quit` 删除 state 后它会自动消失；干净合并和 squash 合并不会创建它。其它伪引用以及 `update-ref` 等全部写入路径仍会拒绝。
 
@@ -72,11 +72,11 @@ libra merge --restart
 
 没有共同祖先的历史默认仍被拒绝。显式传入 `--allow-unrelated-histories` 时，Libra 使用虚拟空 merge base：不相交的 root tree 正常合并，重叠新增正常冲突，且非 squash 合并的 conflict state 可跨 `--continue` / `--abort` / `--restart` 恢复，不会写入伪造的 base object。
 
-默认情况下，干净的三方合并会创建双父合并提交、更新 HEAD、重建索引、恢复工作树，并写入 merge reflog 条目。有冲突的三方合并会向工作树写入行级冲突标记（与 Git 一致——仅把发散的 hunk 包在 `<<<<<<< HEAD` / `=======` / `>>>>>>>` 之间；渲染器会重新比较双方 postimage，把共同边缘与足够长的共同片段留在标记外；二进制或 modify/delete 路径回退整文件标记），写入未合并的索引 stage，除 `--squash` 外保存 Libra merge 状态，并返回 `LBR-CONFLICT-002`。非 squash 冲突给出 `libra merge --continue` 和 `libra merge --abort` 的提示；squash 冲突则提示解决、暂存路径后用普通 `libra commit` 创建单亲提交。squash 即使冲突也不移动 HEAD、不记录 merge 状态，因此 `merge --continue`、`--abort`、`--restart` 均报 `no merge in progress`。
+默认情况下，干净的三方合并会创建双父合并提交、更新 HEAD、重建索引、恢复工作树，并写入 merge reflog 条目。有冲突的三方合并会向工作树写入行级冲突标记（与 Git 一致——仅把发散的 hunk 包在 `<<<<<<< HEAD` / `=======` / `>>>>>>> <用户写法>` 之间；`>>>>>>>` 标签是命令行给出的合并目标原文——`side`、`refs/heads/side` 或 hash 前缀，`--restart` 从 `merge-state.json` 重读该原文；渲染器会重新比较双方 postimage，把共同边缘与足够长的共同片段留在标记外；二进制或 modify/delete 路径回退整文件标记），写入未合并的索引 stage，除 `--squash` 外保存 Libra merge 状态，并返回 `LBR-CONFLICT-002`。非 squash 冲突给出 `libra merge --continue` 和 `libra merge --abort` 的提示；squash 冲突则提示解决、暂存路径后用普通 `libra commit` 创建单亲提交。squash 即使冲突也不移动 HEAD、不记录 merge 状态，因此 `merge --continue`、`--abort`、`--restart` 均报 `no merge in progress`。
 
 ### 冲突标记风格（`merge.conflictStyle`）
 
-标记格式遵循 Git 兼容的 `merge.conflictStyle` 配置键（仅配置——与 Git 一致，`merge` 无 CLI 风格参数）：`libra config merge.conflictStyle diff3`。`merge`（默认/未设置）使用双标记风格，并重新 diff 双方 postimage：共同前后缀移到 marker 外，超过三行的共同片段拆开相邻冲突块，至多三行的共同片段留在同一冲突块内以避免碎片化；`diff3` 额外在 `||||||| base` 与 `=======` 之间输出共同祖先；`zdiff3` 保留完整 ancestor 块，只把双方共同前后缀移出 marker，不做 `merge` 风格的内部共同片段拆分；其它值在需要渲染内容合并时直接报错（退出 128），绝不静默回落。**多 merge base 的合并是例外**：递归虚拟祖先自身的内容依赖该风格（Git 在每一层递归同样传入它），因此该值在合并开始前就被解析——非法值会拦下一个本来会干净完成的交叉合并。该配置同时被 `libra merge`、`libra cherry-pick` 与 `libra revert` 的文本冲突尊重；由 text 回退处理的 NUL 内容与 modify/delete 冲突保持两段式整文件呈现，显式 binary driver 则保留 ours 原文且不写 marker。所有可识别输入行尾均为 CRLF 时，marker 行也使用 CRLF；否则使用 LF。精化只改变呈现，不改变真实冲突结论；唯一例外是双方 postimage 完全相同时可简化为干净结果。`libra rebase` 目前始终渲染无 base 块的整文件标记、不受此配置影响。
+标记格式遵循 Git 兼容的 `merge.conflictStyle` 配置键（仅配置——与 Git 一致，`merge` 无 CLI 风格参数）：`libra config merge.conflictStyle diff3`。`merge`（默认/未设置）使用双标记风格，并重新 diff 双方 postimage：共同前后缀移到 marker 外，超过三行的共同片段拆开相邻冲突块，至多三行的共同片段留在同一冲突块内以避免碎片化；`diff3` 额外在 `||||||| <merge-base abbrev7>` 与 `=======` 之间输出共同祖先（多个 merge-base 时仍用历史 `base` 标签）；`zdiff3` 保留完整 ancestor 块，只把双方共同前后缀移出 marker，不做 `merge` 风格的内部共同片段拆分；其它值在需要渲染内容合并时直接报错（退出 128），绝不静默回落。**多 merge base 的合并是例外**：递归虚拟祖先自身的内容依赖该风格（Git 在每一层递归同样传入它），因此该值在合并开始前就被解析——非法值会拦下一个本来会干净完成的交叉合并。该配置同时被 `libra merge`、`libra cherry-pick` 与 `libra revert` 的文本冲突尊重；由 text 回退处理的 NUL 内容与 modify/delete 冲突保持两段式整文件呈现，显式 binary driver 则保留 ours 原文且不写 marker。所有可识别输入行尾均为 CRLF 时，marker 行也使用 CRLF；否则使用 LF。精化只改变呈现，不改变真实冲突结论；唯一例外是双方 postimage 完全相同时可简化为干净结果。`libra rebase` 目前始终渲染无 base 块的整文件标记、不受此配置影响。
 
 ### 按路径选择 merge driver（`gitattributes`）
 
@@ -438,3 +438,9 @@ Merge aborted.
 | `--continue` 仍有未解决的冲突 stage | `LBR-CONFLICT-002` | 128 |
 | 无法读取 merge 状态或索引 | `LBR-IO-001` | 128 |
 | 无法保存状态、索引、树、提交、HEAD 或工作树 | `LBR-IO-002` | 128 |
+
+## Issue #477 notes
+
+reset 会清除进行中的 merge，并把其 autostash 移入 stash 列表
+普通 commit 会结束进行中的 merge
+冲突标记按命令行原文标注合并目标

@@ -14,7 +14,7 @@
 ## 设计方案
 
 - 入口与分发：已公开接入 `src/cli.rs::Commands`；已由 `src/command/mod.rs` 导出。CLI 层在 `src/cli.rs` 把解析后的参数交给命令模块，命令模块负责把领域错误转换为 `CliError` / `CliResult`。
-- 源码分层：主要实现文件为 `src/command/add.rs`。参数/子命令类型包括：`AddArgs`；输出、错误或状态类型包括：`AddError`、`AddFailure`、`AddOutput`；主要执行函数包括：`execute`、`execute_safe`、`run_add`。
+- 源码分层：主要实现文件为 `src/command/add.rs`。参数/子命令类型包括：`AddArgs`；输出、错误或状态类型包括：`AddError`、`AddFailure`、`AddOutput`；主要执行函数包括：`execute`、`execute_safe`、`run_add`。patch mode hunk 引擎（src/internal/patch_mode/）提供 `FileDiff`/`Hunk` 模型、`s` 拆分、选中 hunk 重组，以及 `apply_selected_hunks_to_blob` 三种模式表（`Stage` / `ResetHead` / `ResetNotHead`）。add -p 自动前进会话状态机在 `src/internal/patch_mode/session.rs`：公开 `-p/--patch` 与 `--[no-]auto-advance`、按行读取 stdin、`y/n/q/a/d/j/J/k/K/g/'/'/s/e/p/P/?`（`s` 仅在可拆分时出现；`e` 仅在可编辑时出现），会话结束时一次性写入索引。关闭自动前进（--no-auto-advance）时的导航状态机停留在当前 hunk、回显 `(was: y|n)`、在多文件时提供 `>`/`<` 循环切换，并在全部决定后于 `?` 帮助追加 `HUNKS SUMMARY`。patch mode `s` 拆分规则：仅当 `splittable_into > 1` 时提示 `s`；成功输出 `Split into N hunks.` 并用子 hunk 替换当前 hunk（随后只重印 `@@` 头与内容）；不可拆分输出 `Sorry, cannot split this hunk`。导航后子 hunk 决定保留。patch mode `e` 手工编辑 hunk：缓冲区写入 gitdir `ADD_EDIT.patch`，头部为 `# Manual hunk edit mode -- see bottom for a quick guide.`，去掉 `#` 行后重算并 `apply --check` 等价检查；可应用则标记使用并前进，不可应用提示重试，清空则放弃编辑，删除与 mode 变更报 `Sorry, cannot edit this hunk`。
 - 源码意图：源码模块注释说明该命令会解析 pathspec 与模式标志，套用 Git/Libra ignore 策略，按工作区和索引分类路径，写入 blob 对象，最后保存更新后的索引。
 - 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；核心领域逻辑集中在 `run_add`；索引路径会加载、比较、刷新或保存 `.libra/index`；对象路径会解析 revision 并读写 blob/tree/commit/tag 等对象；LFS 路径会按 Git/Libra attributes 来源生成 pointer、锁或 batch 请求。
 
@@ -60,7 +60,7 @@ flowchart TD
 |---|---|---|
 | 兼容矩阵说明 | sparse-checkout 标志不支持 | 按当前兼容矩阵保留；实现状态变化时同步 `_compatibility.md` 和测试证据。 |
 | 兼容差异项 | Intent to add | 原始对照：git add -N / --intent-to-add；相关参数/替代：不适用；当前说明：不适用 (未实现)。 后续实现时需要补对应回归测试并同步兼容矩阵。 |
-| 兼容差异项 | Interactive patch (`-p`/`--patch`) | 原始对照：git add -p / --patch；当前 `AddArgs` 不含该参数（曾在 `57dc1cf8` 加入拒绝逻辑后被回退）。后续实现时需补回归测试并同步兼容矩阵。 |
+| ✅ 已实现 | Interactive patch (`-p`/`--patch`) | 原始对照：git add -p / --patch。公开 `-p/--patch`、`--[no-]auto-advance`、`s` 拆分与 `e` 手工编辑。回归：`add_patch_test`。 |
 | ✅ 已实现 | `add -u` index-known pathspec | 原始对照：git add -u + `dir.c:report_path_error`；当前说明：`-u` 的可匹配候选为索引任意 stage 路径，未跟踪工作树文件在暂存前以 `LBR-CLI-003` 拒绝（`known to the index`）；glob 无匹配仍用 `did not match any files`；`--ignore-errors` 跳过该校验。回归：`add_test::test_add_update_untracked_pathspec_fails_atomically_matrix`。 |
 | ✅ 已实现 | Unmerged path staging | 原始对照：git `add_files_to_cache` / `remove_file_from_index`；当前说明：`add`/`-A`/`.`/`-u` 把仅有冲突 stage 的路径纳入候选，写入 stage 0 时删除 1–3，工作树缺失则删除全部 stage；普通 add 不检查冲突标记。回归：`add_test::test_add_resolves_unmerged_entries_matrix`。 |
 | ✅ 已实现 | Default add silent off-TTY | 原始对照：git add 默认无 stdout；当前说明：stdout 非终端时默认摘要静默，`-v`/`--dry-run` 仍输出。回归：`add_test::test_add_default_output_silent_when_not_terminal_matrix`。 |

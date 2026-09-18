@@ -28,19 +28,27 @@ use std::{
 use clap::Parser;
 use git_internal::{
     errors::GitError,
+    hash::ObjectHash,
     internal::{
         index::{Index, IndexEntry},
-        object::blob::Blob,
+        object::{ObjectTrait, blob::Blob},
     },
 };
 use serde::Serialize;
 
 use crate::{
     command::{
+        diff::{DiffAlgorithm, compute_unified_hunks},
         read_worktree_blob_bytes,
         status::{self, Changes},
     },
-    internal::ai::automation::{VCS_EVENT_POST_ADD, dispatch_current_repo_vcs_event_to_history},
+    internal::{
+        ai::automation::{VCS_EVENT_POST_ADD, dispatch_current_repo_vcs_event_to_history},
+        patch_mode::{
+            FileDiff, HunkUse, PatchApplyMode, SessionOptions, apply_selected_hunks_to_blob,
+            parse_unified_diff, run_session_with,
+        },
+    },
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         object_ext::BlobExt,
@@ -61,7 +69,8 @@ EXAMPLES:
     libra add --dry-run .              Preview what would be staged
     libra add -f ignored_file.log      Force-add an ignored file
     libra add --refresh                Refresh index metadata without staging
-    libra add --resolved               Stage resolved unmerged paths";
+    libra add --resolved               Stage resolved unmerged paths
+    libra add -p                       Interactively stage hunks";
 
 /// Stage file contents for the next commit.
 // EXAMPLES are wired via `#[command(after_help = ADD_EXAMPLES)]` and render
@@ -142,6 +151,20 @@ pub struct AddArgs {
     /// considered. Mirrors Git's `add --resolved`.
     #[clap(long)]
     pub resolved: bool,
+
+    /// Interactively choose hunks to stage (`add -p`).
+    #[clap(short = 'p', long = "patch")]
+    pub patch: bool,
+
+    /// Auto-advance after each hunk decision (the `add -p` default). Last
+    /// one wins against `--no-auto-advance`.
+    #[clap(long = "auto-advance", overrides_with = "no_auto_advance")]
+    pub auto_advance: bool,
+
+    /// Stay on the current hunk after `y`/`n` and enable `>`/`<` file
+    /// navigation. Requires `-p`.
+    #[clap(long = "no-auto-advance", overrides_with = "auto_advance")]
+    pub no_auto_advance: bool,
 }
 
 /// Domain error for `libra add`.
@@ -452,7 +475,35 @@ pub async fn execute_safe(mut args: AddArgs, output: &OutputConfig) -> CliResult
         args.pathspec.extend(from_file);
     }
 
+    if (args.no_auto_advance || args.auto_advance) && !args.patch {
+        let option = if args.no_auto_advance {
+            "--no-auto-advance"
+        } else {
+            "--auto-advance"
+        };
+        return Err(CliError::fatal(format!(
+            "the option '{option}' requires '--interactive/--patch'"
+        ))
+        .with_exit_code(128)
+        .with_stable_code(StableErrorCode::CliInvalidArguments));
+    }
+    if args.patch && args.resolved {
+        return Err(CliError::command_usage(
+            "options '--resolved' and '-p/--patch' cannot be used together",
+        ));
+    }
+    if args.patch && (output.is_json() || args.dry_run) {
+        return Err(patch_machine_mode_error(output, args.dry_run));
+    }
+
     let result = run_add(&args).await?;
+
+    if args.patch {
+        if result.wrote_index() {
+            dispatch_current_repo_vcs_event_to_history(VCS_EVENT_POST_ADD).await;
+        }
+        return Ok(());
+    }
 
     // --- Render output ---
     render_add_output(&result, output, verbose, dry_run)?;
@@ -672,6 +723,381 @@ fn stage_resolved_path(
     }
 }
 
+fn patch_machine_mode_error(output: &OutputConfig, dry_run: bool) -> CliError {
+    if dry_run {
+        CliError::command_usage("options '--dry-run' and '-p/--patch' cannot be used together")
+    } else if output.is_json() {
+        CliError::command_usage(
+            "options '--json'/'--machine' and '-p/--patch' cannot be used together",
+        )
+    } else {
+        CliError::command_usage("patch mode cannot be used with machine-readable output")
+    }
+}
+
+struct PatchCandidate {
+    file: FileDiff,
+    old_bytes: Vec<u8>,
+}
+
+fn patch_bytes_are_binary(bytes: &[u8]) -> bool {
+    bytes.contains(&0)
+}
+
+fn abbrev7(hash: &ObjectHash) -> String {
+    let hex = hash.to_string();
+    hex.chars().take(7).collect()
+}
+
+fn worktree_index_mode(path: &Path) -> Option<u32> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() {
+        return Some(0o120000);
+    }
+    if !meta.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 != 0 {
+            Some(0o100755)
+        } else {
+            Some(0o100644)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        Some(0o100644)
+    }
+}
+
+fn load_index_blob_bytes(hash: &ObjectHash, path: &str) -> Result<Vec<u8>, AddError> {
+    let storage = util::objects_storage();
+    let data = storage.get(hash).map_err(|source| AddError::ObjectSave {
+        path: PathBuf::from(path),
+        source: io::Error::other(source.to_string()),
+    })?;
+    let blob = Blob::from_bytes(&data, *hash).map_err(|source| AddError::ObjectSave {
+        path: PathBuf::from(path),
+        source: io::Error::other(format!("{source:?}")),
+    })?;
+    Ok(blob.data)
+}
+
+fn build_patch_header(
+    path: &str,
+    old_hash: &ObjectHash,
+    new_hash: Option<&ObjectHash>,
+    old_mode: u32,
+    new_mode: Option<u32>,
+    deleted: bool,
+    binary: bool,
+) -> String {
+    let mut header = format!("diff --git a/{path} b/{path}\n");
+    if deleted {
+        header.push_str(&format!("deleted file mode {old_mode:06o}\n"));
+        header.push_str(&format!("index {}..0000000\n", abbrev7(old_hash)));
+        header.push_str(&format!("--- a/{path}\n+++ /dev/null\n"));
+        return header;
+    }
+    let new_mode = new_mode.unwrap_or(old_mode);
+    if old_mode != new_mode {
+        header.push_str(&format!("old mode {old_mode:06o}\n"));
+        header.push_str(&format!("new mode {new_mode:06o}\n"));
+        header.push_str(&format!(
+            "index {}..{}\n",
+            abbrev7(old_hash),
+            new_hash.map(abbrev7).unwrap_or_else(|| "0000000".into())
+        ));
+    } else {
+        header.push_str(&format!(
+            "index {}..{} {old_mode:06o}\n",
+            abbrev7(old_hash),
+            new_hash.map(abbrev7).unwrap_or_else(|| "0000000".into())
+        ));
+    }
+    if binary {
+        header.push_str(&format!("Binary files a/{path} and b/{path} differ\n"));
+    } else {
+        header.push_str(&format!("--- a/{path}\n+++ b/{path}\n"));
+    }
+    header
+}
+
+fn collect_patch_candidate(
+    rel: &Path,
+    index: &Index,
+    workdir: &Path,
+) -> Result<Option<PatchCandidate>, AddError> {
+    let path = rel.to_str().ok_or_else(|| AddError::InvalidPathEncoding {
+        path: rel.to_path_buf(),
+    })?;
+    let Some(entry) = index.get(path, 0) else {
+        return Ok(None);
+    };
+    let old_bytes = load_index_blob_bytes(&entry.hash, path)?;
+    let abs = workdir.join(rel);
+    let deleted = !abs.exists();
+    let new_bytes = if deleted {
+        Vec::new()
+    } else {
+        read_worktree_blob_bytes(&abs).map_err(|source| AddError::CreateIndexEntry {
+            path: rel.to_path_buf(),
+            source,
+        })?
+    };
+    let new_mode = if deleted {
+        None
+    } else {
+        worktree_index_mode(&abs)
+    };
+    let binary = patch_bytes_are_binary(&old_bytes) || patch_bytes_are_binary(&new_bytes);
+    let new_blob = if binary {
+        None
+    } else {
+        Some(Blob::from_content_bytes(new_bytes.clone()))
+    };
+    let header = build_patch_header(
+        path,
+        &entry.hash,
+        new_blob.as_ref().map(|blob| &blob.id),
+        entry.mode,
+        new_mode,
+        deleted,
+        binary,
+    );
+    if binary {
+        return Ok(Some(PatchCandidate {
+            file: FileDiff {
+                path: path.to_string(),
+                header,
+                old_mode: Some(entry.mode),
+                new_mode,
+                added: false,
+                deleted,
+                mode_change: new_mode.is_some_and(|mode| mode != entry.mode),
+                binary: true,
+                hunks: Vec::new(),
+            },
+            old_bytes,
+        }));
+    }
+    let old_text = String::from_utf8(old_bytes.clone()).ok();
+    let new_text = String::from_utf8(new_bytes).ok();
+    let (Some(old_text), Some(new_text)) = (old_text, new_text) else {
+        return Ok(Some(PatchCandidate {
+            file: FileDiff {
+                path: path.to_string(),
+                header,
+                old_mode: Some(entry.mode),
+                new_mode,
+                added: false,
+                deleted,
+                mode_change: new_mode.is_some_and(|mode| mode != entry.mode),
+                binary: true,
+                hunks: Vec::new(),
+            },
+            old_bytes,
+        }));
+    };
+    let hunk_body = if old_text == new_text {
+        String::new()
+    } else {
+        compute_unified_hunks(&old_text, &new_text, 3, &DiffAlgorithm::Myers)
+    };
+    if hunk_body.is_empty() && !deleted && new_mode.is_none_or(|mode| mode == entry.mode) {
+        return Ok(None);
+    }
+    let mut patch = header;
+    patch.push_str(&hunk_body);
+    let mut files = parse_unified_diff(&patch).map_err(|source| AddError::ObjectSave {
+        path: rel.to_path_buf(),
+        source: io::Error::other(source.to_string()),
+    })?;
+    let Some(file) = files.pop() else {
+        return Ok(None);
+    };
+    Ok(Some(PatchCandidate { file, old_bytes }))
+}
+
+async fn run_add_patch(
+    args: &AddArgs,
+    workdir: &Path,
+    index_path: &Path,
+    storage_path: &Path,
+    layer_scope: &crate::internal::worktree_scope::WorktreeScope,
+    pathspec_ctx: PathspecMatchContext<'_>,
+    mut index: Index,
+) -> CliResult<AddOutput> {
+    let (visible_changes, _ignored_changes) =
+        status::changes_to_be_staged_split_safe_with_ignore_case(pathspec_ctx.ignore_case)
+            .map_err(|source| AddError::Status { source })?;
+    let validated = validate_pathspecs(
+        &args.pathspec,
+        pathspec_ctx,
+        &visible_changes,
+        &Changes::default(),
+        &index,
+        false,
+        true,
+        false,
+    )?;
+    let mut files = visible_changes.modified;
+    files.extend(visible_changes.deleted);
+    let mut files = filter_candidates(&files, &validated.pathspecs);
+    for tracked in index.tracked_files() {
+        if !validated.pathspecs.matches_path(&tracked) || files.contains(&tracked) {
+            continue;
+        }
+        let Some(path) = tracked.to_str() else {
+            continue;
+        };
+        let Some(entry) = index.get(path, 0) else {
+            continue;
+        };
+        let Some(mode) = worktree_index_mode(&workdir.join(&tracked)) else {
+            continue;
+        };
+        if mode != entry.mode {
+            files.push(tracked);
+        }
+    }
+    filter_out_current_executable(&mut files);
+    files.sort();
+    files.dedup();
+
+    crate::internal::layer::verify_staging_context(workdir, layer_scope)?;
+    let owned: std::collections::HashSet<String> =
+        crate::internal::layer::LayerStore::owned_path_set_strict(layer_scope)
+            .await
+            .map_err(|e| {
+                CliError::fatal(format!(
+                    "cannot verify layer-owned paths before staging: {e}"
+                ))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+            })?
+            .into_iter()
+            .collect();
+    if !owned.is_empty() {
+        let blocked: Vec<String> = files
+            .iter()
+            .filter_map(|file| crate::internal::layer::normalize_key(file))
+            .filter(|key| owned.contains(key))
+            .collect();
+        if let Some(first) = blocked.first() {
+            return Err(CliError::from(AddError::LayerPath {
+                path: first.clone(),
+                count: blocked.len(),
+            }));
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for file in &files {
+        if util::is_sub_path(workdir.join(file), storage_path) {
+            continue;
+        }
+        if let Some(candidate) = collect_patch_candidate(file, &index, workdir)? {
+            candidates.push(candidate);
+        }
+    }
+    candidates.sort_by(|a, b| a.file.path.as_bytes().cmp(b.file.path.as_bytes()));
+
+    let mut session_files: Vec<FileDiff> = candidates.iter().map(|c| c.file.clone()).collect();
+    {
+        let stdin = io::stdin();
+        let mut input = stdin.lock();
+        let mut stdout = io::stdout();
+        let editor = crate::command::editor::resolve_editor().await;
+        let edit_path = storage_path.join("ADD_EDIT.patch");
+        let index_blobs = candidates.iter().map(|c| c.old_bytes.clone()).collect();
+        run_session_with(
+            &mut session_files,
+            &mut input,
+            &mut stdout,
+            SessionOptions {
+                auto_advance: !args.no_auto_advance,
+                editor,
+                edit_path: Some(edit_path.clone()),
+                index_blobs,
+                kind: crate::internal::patch_mode::PatchSessionKind::Stage,
+            },
+        )
+        .map_err(|source| {
+            CliError::fatal(format!("failed to read patch-mode input: {source}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+        let _ = std::fs::remove_file(&edit_path);
+    }
+
+    let mut add_output = AddOutput::empty(false);
+    let mut pending: Vec<(usize, crate::internal::patch_mode::AppliedIndexBlob)> = Vec::new();
+    for (i, file) in session_files.iter().enumerate() {
+        let decided = file
+            .hunks
+            .iter()
+            .any(|hunk| hunk.use_decision == HunkUse::Use)
+            || (file.mode_change
+                && file
+                    .hunks
+                    .iter()
+                    .any(|hunk| hunk.use_decision == HunkUse::Use));
+        if !decided {
+            continue;
+        }
+        let applied =
+            apply_selected_hunks_to_blob(&candidates[i].old_bytes, file, PatchApplyMode::Stage)
+                .map_err(|source| {
+                    CliError::fatal(source.to_string())
+                        .with_stable_code(StableErrorCode::RepoStateInvalid)
+                })?;
+        pending.push((i, applied));
+    }
+    if pending.is_empty() {
+        return Ok(add_output);
+    }
+
+    let lock_paths: Vec<String> = pending
+        .iter()
+        .map(|(i, _)| session_files[*i].path.clone())
+        .collect();
+    crate::command::lfs::enforce_lock_policy(&lock_paths)
+        .await
+        .map_err(AddError::LockPolicy)?;
+
+    for (i, applied) in pending {
+        let path = &session_files[i].path;
+        match applied.bytes {
+            None => {
+                index.remove(path, 0);
+                add_output.removed.push(path.clone());
+            }
+            Some(bytes) => {
+                let blob = Blob::from_content_bytes(bytes);
+                blob.try_save().map_err(|source| AddError::ObjectSave {
+                    path: PathBuf::from(path),
+                    source,
+                })?;
+                let mut entry =
+                    IndexEntry::new_from_blob(path.clone(), blob.id, blob.data.len() as u32);
+                if let Some(mode) = applied.mode {
+                    entry.mode = mode;
+                }
+                index.update(entry);
+                add_output.modified.push(path.clone());
+            }
+        }
+    }
+    index
+        .save(index_path)
+        .map_err(|source| AddError::IndexSave {
+            path: index_path.to_path_buf(),
+            source,
+        })?;
+    Ok(add_output)
+}
+
 async fn run_add_resolved(
     args: &AddArgs,
     workdir: &Path,
@@ -867,6 +1293,7 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         && !args.refresh
         && !args.renormalize
         && !args.resolved
+        && !args.patch
     {
         return Err(CliError::command_usage("nothing specified, nothing added")
             .with_stable_code(StableErrorCode::CliInvalidArguments)
@@ -888,6 +1315,19 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         current_dir: &current_dir,
         ignore_case,
     };
+
+    if args.patch {
+        return run_add_patch(
+            args,
+            &workdir,
+            &index_path,
+            &storage_path,
+            &layer_scope,
+            pathspec_ctx,
+            index,
+        )
+        .await;
+    }
 
     if args.resolved {
         return run_add_resolved(
@@ -1991,6 +2431,16 @@ mod test {
         assert!(with_u.resolved && with_u.update);
         let with_a = AddArgs::try_parse_from(["test", "--resolved", "-A"]).expect("parse");
         assert!(with_a.resolved && with_a.all);
+    }
+
+    #[test]
+    fn test_args_accepts_hidden_patch() {
+        let short = AddArgs::try_parse_from(["test", "-p"]).expect("parse -p");
+        assert!(short.patch);
+        let long = AddArgs::try_parse_from(["test", "--patch", "tracked.txt"]).expect("parse");
+        assert!(long.patch);
+        assert_eq!(long.pathspec, vec!["tracked.txt".to_string()]);
+        assert!(!long.resolved);
     }
 
     #[test]

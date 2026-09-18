@@ -38,6 +38,9 @@ async fn stage_file(path: &str, content: &str) {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 }

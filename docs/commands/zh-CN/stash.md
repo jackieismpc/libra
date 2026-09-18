@@ -415,6 +415,8 @@ Libra 保留 Git 的 `stash@{N}` 引用语法以保持熟悉度。从 Git 迁移
 
 注意：jj 没有 stash 命令。它基于变更的模型允许用 `jj new` 创建匿名变更，起到类似 stash 的作用。
 
+其余仍不支持的交互选项以 `LBR-UNSUPPORTED-001` 拒绝（`stash -p` / `stash push -p` 与 `--[no-]auto-advance`，D15）。请用 `libra stash push -m <message>` 或 `libra stash push -- <pathspec>`。`stash show -p` 仍是非交互 unified diff。
+
 ## 错误处理
 
 | 代码 | 条件 |
@@ -424,3 +426,7 @@ Libra 保留 Git 的 `stash@{N}` 引用语法以保持熟悉度。从 Git 迁移
 | `LBR-CLI-002` | stash 引用语法无效 |
 | `LBR-CLI-003` | stash 不存在 |
 | `LBR-CONFLICT-001` | 应用 stash 时发生合并冲突 |
+
+## Issue #477 notes
+
+仍不支持的交互入口返回 `LBR-UNSUPPORTED-001`

@@ -165,10 +165,11 @@ enum CherryPickError {
     #[error("an interrupted 'libra cherry-pick --{0}' has not finished")]
     ControlPending(ControlPhase),
 
-    /// #477 HF-01: the stopped commit was concluded by a later `reset`, so
-    /// `--continue` has nothing of it left to finalize.
-    #[error("the stopped commit was already concluded by a later reset")]
-    StopConcluded,
+    /// #477 HF-02 / M-CONT C4: `--continue` after an external conclusion
+    /// refuses when the index already has staged changes the next pick would
+    /// overwrite.
+    #[error("your local changes would be overwritten by cherry-pick")]
+    LocalChangesWouldBeOverwritten,
 
     /// #477 HF-01: the row claims an externally concluded stop but has no
     /// remaining commits, which no writer produces.
@@ -224,10 +225,10 @@ impl CherryPickError {
             Self::Conflict { .. } => StableErrorCode::ConflictUnresolved,
             Self::UnmergedIndex(_)
             | Self::NoCommitConflict { .. }
-            | Self::UntrackedOverwrite { .. } => StableErrorCode::ConflictUnresolved,
+            | Self::UntrackedOverwrite { .. }
+            | Self::LocalChangesWouldBeOverwritten => StableErrorCode::ConflictUnresolved,
             Self::InProgress => StableErrorCode::ConflictOperationBlocked,
             Self::NoCherryPickInProgress => StableErrorCode::RepoStateInvalid,
-            Self::StopConcluded => StableErrorCode::RepoStateInvalid,
             Self::CorruptState(_) => StableErrorCode::RepoCorrupt,
             Self::ControlPending(_) => StableErrorCode::RepoStateInvalid,
             Self::WrongBranch { .. } => StableErrorCode::RepoStateInvalid,
@@ -325,12 +326,10 @@ impl From<CherryPickError> for CliError {
                 .with_stable_code(stable_code)
                 .with_hint("cancel the sequence with 'libra cherry-pick --abort'")
                 .with_hint("or forget it with 'libra cherry-pick --quit'"),
-            CherryPickError::StopConcluded => CliError::failure(message)
+            CherryPickError::LocalChangesWouldBeOverwritten => CliError::failure(message)
                 .with_stable_code(stable_code)
-                .with_hint(
-                    "skip it with 'libra cherry-pick --skip' to apply the remaining commits",
-                )
-                .with_hint("or forget the sequence with 'libra cherry-pick --quit'"),
+                .with_hint("commit or stash the staged changes before continuing")
+                .with_hint("or skip the stopped commit with 'libra cherry-pick --skip'"),
             CherryPickError::ControlPending(phase) => CliError::failure(message)
                 .with_stable_code(stable_code)
                 .with_hint(format!("run 'libra cherry-pick --{phase}' again to finish it"))
@@ -990,6 +989,9 @@ async fn reset_hard(target: &str, output: &OutputConfig) -> Result<(), CherryPic
             pathspec_from_file: None,
             pathspec_file_nul: false,
             no_refresh: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         },
         &child,
     )
@@ -1617,6 +1619,20 @@ async fn resume_picks(
     Ok(())
 }
 
+/// #477 HF-02 / M-CONT C4: after an external conclusion the next pick applies
+/// onto the current index. Staged changes would be overwritten, so refuse
+/// before touching the sequence.
+async fn refuse_staged_changes_on_concluded_continue() -> Result<(), CherryPickError> {
+    let staged = crate::command::status::changes_to_be_committed_safe()
+        .await
+        .map_err(|e| CherryPickError::LoadObject(e.to_string()))?;
+    if staged.is_empty() {
+        Ok(())
+    } else {
+        Err(CherryPickError::LocalChangesWouldBeOverwritten)
+    }
+}
+
 async fn run_cherry_pick_continue(
     output: &OutputConfig,
 ) -> Result<CherryPickOutput, CherryPickError> {
@@ -1630,11 +1646,30 @@ async fn run_cherry_pick_continue(
         return Err(CherryPickError::ControlPending(phase));
     }
     if state.stop_concluded {
-        // #477 HF-01: a later `reset` concluded the stopped commit. Committing
-        // the current index as that commit would record someone else's work
-        // under its message; `--skip` drains the rest (HF-02 makes `--continue`
-        // do that directly).
-        return Err(CherryPickError::StopConcluded);
+        // #477 HF-02: a later reset/commit already concluded this stop. Do not
+        // record the current index as that commit; apply the remaining todo.
+        refuse_staged_changes_on_concluded_continue().await?;
+        let opts: CherryPickOpts = serde_json::from_str(&state.opts_json).map_err(|e| {
+            CherryPickError::LoadObject(format!("failed to read saved options: {e}"))
+        })?;
+        let opts_args = opts.into_args();
+        let mut acc = PickAccumulator::default();
+        resume_picks(
+            &state.head_name,
+            state.head_orig,
+            state.todo,
+            &opts_args,
+            &state.opts_json,
+            output,
+            &mut acc,
+        )
+        .await?;
+        return Ok(CherryPickOutput {
+            picked: acc.picked,
+            dropped: acc.dropped,
+            action: Some("continue".to_string()),
+            ..Default::default()
+        });
     }
 
     // The conflicted index must be fully resolved (no stage 1/2/3 left).
@@ -2192,14 +2227,15 @@ async fn cherry_pick_single_commit(
         // Sync the cleanly-applied stage-0 paths, then overlay conflict markers
         // onto each divergent path so the user can resolve them in the worktree.
         reset_workdir_tracked_only(&current_index, &index)?;
-        let short_src = short_display_hash(&commit_id.to_string()).to_string();
+        let labels =
+            super::merge::GitConflictLabels::for_cherry_pick(commit_id, &commit_to_pick.message);
         for (path, ours_hash, their_hash, base_hash, driver) in &conflicts {
             write_conflict_markers_file(
                 path,
                 ours_hash,
                 their_hash,
                 base_hash,
-                &short_src,
+                &labels,
                 conflict_style,
                 *driver,
             )?;
@@ -2643,7 +2679,7 @@ fn write_conflict_markers_file(
     ours_hash: &Option<ObjectHash>,
     their_hash: &Option<ObjectHash>,
     base_hash: &Option<ObjectHash>,
-    short_src: &str,
+    labels: &merge::GitConflictLabels,
     conflict_style: merge::ConflictStyle,
     driver: merge::BuiltinMergeDriver,
 ) -> Result<(), CherryPickSingleError> {
@@ -2679,19 +2715,19 @@ fn write_conflict_markers_file(
             .unwrap_or_default()
     } else {
         match (&ours_bytes, &theirs_bytes) {
-            (Some(ours), Some(theirs)) => super::merge::render_line_level_conflict(
+            (Some(ours), Some(theirs)) => super::merge::render_line_level_conflict_labeled(
                 base_bytes.as_deref(),
                 ours,
                 theirs,
-                short_src,
+                labels,
                 conflict_style,
             )
             .map_err(CherryPickSingleError::SaveFailed)?
-            .unwrap_or_else(|| whole_file_conflict(ours, theirs, short_src)),
+            .unwrap_or_else(|| whole_file_conflict(ours, theirs, &labels.theirs)),
             _ => whole_file_conflict(
                 ours_bytes.as_deref().unwrap_or(&[]),
                 theirs_bytes.as_deref().unwrap_or(&[]),
-                short_src,
+                &labels.theirs,
             ),
         }
     };
@@ -3152,8 +3188,8 @@ mod tests {
             "cherry-pick state is inconsistent: bad",
         );
         assert_eq!(
-            CherryPickError::StopConcluded.to_string(),
-            "the stopped commit was already concluded by a later reset",
+            CherryPickError::LocalChangesWouldBeOverwritten.to_string(),
+            "your local changes would be overwritten by cherry-pick",
         );
         assert_eq!(
             CherryPickError::ControlPending(ControlPhase::Skip).to_string(),
@@ -3278,8 +3314,8 @@ mod tests {
             StableErrorCode::RepoCorrupt,
         );
         assert_eq!(
-            CherryPickError::StopConcluded.stable_code(),
-            StableErrorCode::RepoStateInvalid,
+            CherryPickError::LocalChangesWouldBeOverwritten.stable_code(),
+            StableErrorCode::ConflictUnresolved,
         );
         assert_eq!(
             CherryPickError::ControlPending(ControlPhase::Skip).stable_code(),

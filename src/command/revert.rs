@@ -90,11 +90,6 @@ enum RevertError {
     )]
     RevertInProgress,
 
-    /// #477 HF-01: the stopped commit was concluded by a later `reset`, so
-    /// `--continue` has nothing of it left to finalize.
-    #[error("the stopped commit was already concluded by a later reset")]
-    StopConcluded,
-
     #[error("no revert in progress")]
     NoRevertInProgress,
 
@@ -247,9 +242,7 @@ impl RevertError {
             Self::Conflicts { .. } | Self::UnresolvedConflicts(_) | Self::UnmergedIndex(_) => {
                 StableErrorCode::ConflictUnresolved
             }
-            Self::RevertInProgress | Self::NoRevertInProgress | Self::StopConcluded => {
-                StableErrorCode::RepoStateInvalid
-            }
+            Self::RevertInProgress | Self::NoRevertInProgress => StableErrorCode::RepoStateInvalid,
             Self::StateIo(_) => StableErrorCode::IoWriteFailed,
             Self::EmptyMessage | Self::InvalidCleanup(_) | Self::Editor(_) => {
                 StableErrorCode::CliInvalidArguments
@@ -264,10 +257,6 @@ impl From<RevertError> for CliError {
         let message = error.to_string();
         match error {
             RevertError::NotInRepo => CliError::repo_not_found(),
-            RevertError::StopConcluded => CliError::failure(message)
-                .with_stable_code(stable_code)
-                .with_hint("skip it with 'libra revert --skip' to revert the remaining commits")
-                .with_hint("or use 'libra revert --abort' to restore the pre-revert state, discarding later tracked changes"),
             RevertError::DetachedHead => CliError::fatal(message)
                 .with_stable_code(stable_code)
                 .with_hint("switch to a branch first with 'libra switch <branch>'"),
@@ -607,11 +596,43 @@ async fn run_revert_continue() -> Result<RevertOutput, RevertError> {
     refuse_ambiguous_common_state()?;
     let state = RevertState::load_optional()?.ok_or(RevertError::NoRevertInProgress)?;
     if state.stop_concluded {
-        // #477 HF-01: a later `reset` concluded the stopped commit. Building a
-        // commit from the current index would record post-reset content under
-        // that commit's message; `--skip` drains the rest (HF-02 makes
-        // `--continue` do that directly).
-        return Err(RevertError::StopConcluded);
+        // #477 HF-02: a later reset/commit already concluded this stop. Do not
+        // record the current index as that revert; drain the remaining commits.
+        RevertState::cleanup()?;
+        if state.remaining.is_empty() {
+            let commit_str = state.reverted_commit.clone();
+            return Ok(RevertOutput {
+                reverted_commit: commit_str.clone(),
+                short_reverted: short_display_hash(&commit_str).to_string(),
+                new_commit: None,
+                short_new: None,
+                no_commit: false,
+                files_changed: 0,
+            });
+        }
+        let remaining = parse_remaining_ids(&state.remaining)?;
+        let params = RevertParams::for_sequence(
+            state.signoff,
+            state.edit,
+            state.cleanup.clone(),
+            state.strategy_option,
+        );
+        let outcome = revert_sequence(&remaining, &params, None, 0).await?;
+        let (commit_str, last_revert_commit, total_files_changed) = outcome.ok_or_else(|| {
+            RevertError::LoadObject(
+                "revert continuation lost the remaining sequence result".to_string(),
+            )
+        })?;
+        return Ok(RevertOutput {
+            reverted_commit: commit_str.clone(),
+            short_reverted: short_display_hash(&commit_str).to_string(),
+            new_commit: last_revert_commit.as_ref().map(|id| id.to_string()),
+            short_new: last_revert_commit
+                .as_ref()
+                .map(|id| short_display_hash(&id.to_string()).to_string()),
+            no_commit: false,
+            files_changed: total_files_changed,
+        });
     }
 
     // Refuse to finish while conflict markers remain in any *staged* file (the
@@ -1210,6 +1231,7 @@ enum SingleRevertOutcome {
 /// base = the reverted commit's blob (or empty when that commit deleted the
 /// path), ours = the current blob, and theirs = the parent's blob (the revert
 /// target). Returns the resulting blob hash and whether it remains conflicted.
+#[allow(clippy::too_many_arguments)]
 fn three_way_revert_blob(
     path: &Path,
     reverted_hash: Option<ObjectHash>,
@@ -1218,6 +1240,7 @@ fn three_way_revert_blob(
     favor: Option<MergeFavor>,
     default_driver: Option<&str>,
     conflict_style: merge::ConflictStyle,
+    labels: &merge::GitConflictLabels,
 ) -> Result<(ObjectHash, bool), RevertError> {
     let reverted_data = match reverted_hash {
         Some(reverted_hash) => {
@@ -1238,7 +1261,7 @@ fn three_way_revert_blob(
         None => Vec::new(),
     };
     let driver = merge::builtin_merge_driver_for_path(path, default_driver);
-    let (bytes, conflicted) = match merge::merge_bytes_with_refined_driver(
+    let (bytes, conflicted) = match merge::merge_bytes_with_refined_driver_labeled(
         driver,
         &reverted_data,
         &current.data,
@@ -1246,6 +1269,7 @@ fn three_way_revert_blob(
         favor,
         conflict_style,
         0,
+        labels.as_marker_labels(),
     )
     .map_err(RevertError::SaveObject)?
     {
@@ -1299,6 +1323,7 @@ async fn revert_single_commit(
 ) -> Result<SingleRevertOutcome, RevertError> {
     let reverted_commit: Commit =
         load_object(commit_id).map_err(|e| RevertError::LoadObject(e.to_string()))?;
+    let labels = merge::GitConflictLabels::for_revert(commit_id, &reverted_commit.message);
 
     // Select the baseline parent to diff against. A merge commit (>1 parent)
     // requires `-m <n>` to pick the mainline; a non-merge commit rejects `-m`.
@@ -1417,6 +1442,7 @@ async fn revert_single_commit(
                 params.strategy_option,
                 default_driver.as_deref(),
                 conflict_style,
+                &labels,
             )?;
             current_files.insert(path.clone(), merged_hash);
             files_changed += 1;
@@ -1451,6 +1477,7 @@ async fn revert_single_commit(
                         params.strategy_option,
                         default_driver.as_deref(),
                         conflict_style,
+                        &labels,
                     )?;
                     current_files.insert(path.clone(), merged_hash);
                     files_changed += 1;

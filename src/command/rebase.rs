@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     cli_error,
-    command::{load_object, merge, save_object, status, switch},
+    command::{editor, load_object, merge, rebase_todo, save_object, status, switch},
     common_utils::{format_commit_msg, parse_commit_msg},
     internal::{
         branch::Branch,
@@ -81,7 +81,7 @@ pub struct RebaseState {
 /// metadata. The sidecar is removed only after final ref updates and any held
 /// autostash have been resolved.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct RebaseAuxState {
+pub(crate) struct RebaseAuxState {
     #[serde(default)]
     exec_commands: Vec<String>,
     /// Index of the command that must be retried by `rebase --continue` after
@@ -110,6 +110,26 @@ struct RebaseAuxState {
     /// older sidecars inherit the current `rerere.autoUpdate` configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rerere_autoupdate: Option<bool>,
+    /// Remaining interactive instructions (HF-21 / ADR-HF-19). Additive so
+    /// older sidecars remain readable; empty when the rebase is not interactive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) todo_instructions: Vec<rebase_todo::TodoInstruction>,
+    /// Instructions already applied during an interactive rebase.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) done_instructions: Vec<rebase_todo::TodoInstruction>,
+    /// Set when the sequence editor produced an invalid todo (HF-28 / I9).
+    /// `--continue` refuses until HF-23 `--edit-todo` rewrites the list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) interactive_parse_error: Option<String>,
+    /// Edited todo text retained after an invalid-line halt (HF-23 `--edit-todo`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) interactive_todo_text: Option<String>,
+    /// Original replay-range commit ids for abbrev resolve after `--edit-todo`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    interactive_known: Vec<String>,
+    /// Why an interactive rebase is paused: `edit`, `break`, or `exec`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    interactive_stop: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,6 +181,25 @@ impl RebaseAuxState {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_todo_instructions(
+        todo_instructions: Vec<rebase_todo::TodoInstruction>,
+        done_instructions: Vec<rebase_todo::TodoInstruction>,
+    ) -> Self {
+        Self {
+            todo_instructions,
+            done_instructions,
+            ..Self::default()
+        }
+    }
+
+    fn marks_interactive(&self) -> bool {
+        !self.todo_instructions.is_empty()
+            || !self.done_instructions.is_empty()
+            || self.interactive_parse_error.is_some()
+            || self.interactive_todo_text.is_some()
+    }
+
     fn cleanup() -> Result<(), RebaseError> {
         let path = Self::path();
         match fs::remove_file(&path) {
@@ -208,6 +247,16 @@ pub(crate) fn rebase_aux_gc_oids(
     for (original, parent) in aux.rewrite_aliases {
         oids.push(("rewrite_aliases (original)", original));
         oids.push(("rewrite_aliases (parent)", parent));
+    }
+    for instruction in &aux.todo_instructions {
+        if let Some(oid) = instruction.commit_oid() {
+            oids.push(("todo_instructions", oid.to_string()));
+        }
+    }
+    for instruction in &aux.done_instructions {
+        if let Some(oid) = instruction.commit_oid() {
+            oids.push(("done_instructions", oid.to_string()));
+        }
     }
     Ok(Some(oids))
 }
@@ -566,7 +615,7 @@ impl RebaseState {
         state: &RebaseState,
     ) -> Result<(), String> {
         let todo = Self::format_hash_list(state.todo.iter().cloned());
-        let todo_actions = if state.todo_actions.len() == state.todo.len() {
+        let todo_actions_body = if state.todo_actions.len() == state.todo.len() {
             Self::format_action_list(state.todo_actions.iter().copied())
         } else {
             Self::format_action_list(
@@ -575,6 +624,7 @@ impl RebaseState {
                     .copied(),
             )
         };
+        let todo_actions = encode_todo_actions_blob(todo_actions_body, rebase_aux_is_interactive());
         let done = Self::format_hash_list(state.done.iter().cloned());
         let stopped_value = match &state.stopped_sha {
             Some(sha) => sha.to_string().into(),
@@ -747,11 +797,7 @@ impl RebaseState {
         autosquash: bool,
         todo: &VecDeque<ObjectHash>,
     ) -> Result<VecDeque<RebaseTodoAction>, String> {
-        let tokens: Vec<_> = content
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .collect();
+        let (_interactive, tokens) = decode_todo_actions_blob(content);
         if tokens.is_empty() {
             return Ok(Self::default_todo_actions(todo, autosquash));
         }
@@ -891,6 +937,9 @@ fn resolve_rebase_empty_mode(args: &RebaseArgs) -> CliResult<RebaseEmptyMode> {
 pub enum ReplayErrorKind {
     IndexLoad,
     CommitLoad,
+    /// Retained for Display/JSON pins. Parentless commits now replay via an
+    /// empty-base merge (`--root --onto`) or object reuse (`--root`).
+    #[allow(dead_code)]
     MissingParent,
     BaseTreeLoad,
     TheirTreeLoad,
@@ -995,6 +1044,9 @@ pub const REBASE_EXAMPLES: &str = "\
 EXAMPLES:
     libra rebase main             Replay current branch on top of main
     libra rebase --autosquash main Fold fixup!/squash! commits while replaying
+    libra rebase --no-autosquash main  Replay without folding fixup!/squash! commits
+    libra rebase --root               Replay every commit from the root commit
+    libra rebase --root --onto main   Replay the full history onto main
     libra rebase --reapply-cherry-picks main
     libra rebase --autostash main  Preserve tracked local changes around the rebase
     libra rebase --exec 'cargo test' main  Run a sandboxed command after each replay
@@ -1007,6 +1059,8 @@ EXAMPLES:
     libra rebase --continue       Resume an in-progress rebase after fixing conflicts
     libra rebase --skip           Skip a conflict, or the failed exec command, and continue
     libra rebase --abort          Restore the original branch and clear rebase state
+    libra rebase -i main          Interactive rebase (sequence editor)
+    libra rebase --edit-todo      Edit remaining commands of an in-progress interactive rebase
     libra rebase --json main      Structured JSON output for agents";
 
 /// Command-line arguments for the rebase operation
@@ -1015,7 +1069,7 @@ EXAMPLES:
 pub struct RebaseArgs {
     /// The upstream branch to rebase the current branch onto.
     /// This can be a branch name, commit hash, or other Git reference.
-    #[clap(required_unless_present_any = ["continue_rebase", "abort", "skip"])]
+    #[clap(required_unless_present_any = ["continue_rebase", "abort", "skip", "root", "edit_todo"])]
     pub upstream: Option<String>,
 
     /// Replay the <upstream>..HEAD range onto <newbase> instead of onto
@@ -1039,9 +1093,34 @@ pub struct RebaseArgs {
     #[clap(long, conflicts_with_all = ["continue_rebase", "abort", "upstream"])]
     pub skip: bool,
 
-    /// Move fixup!/squash! commits next to their targets and fold them while replaying
+    /// Replay every commit from the root commit. The optional positional is
+    /// `<branch>` (checked out first), not `<upstream>`. Combined with an
+    /// `<upstream>` positional it is a usage error. Without `--onto` the root
+    /// is replayed as a parentless commit; unchanged picks keep their hashes.
     #[clap(long, conflicts_with_all = ["continue_rebase", "abort", "skip"])]
+    pub root: bool,
+
+    /// Move fixup!/squash! commits next to their targets and fold them while
+    /// replaying. Explicit `--autosquash` also skips the already-up-to-date
+    /// shortcut so a linear history still folds. Last one wins against
+    /// `--no-autosquash`. The `rebase.autosquash` config is ignored for
+    /// non-interactive rebase (Git `t3415`).
+    #[clap(
+        long,
+        overrides_with = "no_autosquash",
+        conflicts_with_all = ["continue_rebase", "abort", "skip"]
+    )]
     pub autosquash: bool,
+
+    /// Disable autosquash. Last one wins when combined with `--autosquash`.
+    /// Alone this is a no-op: non-interactive rebase does not read
+    /// `rebase.autosquash`.
+    #[clap(
+        long = "no-autosquash",
+        overrides_with = "autosquash",
+        conflicts_with_all = ["continue_rebase", "abort", "skip"]
+    )]
+    pub no_autosquash: bool,
 
     /// Explicitly replay clean cherry-pick commits instead of dropping them
     #[clap(long = "reapply-cherry-picks", conflicts_with_all = ["continue_rebase", "abort", "skip"])]
@@ -1118,6 +1197,18 @@ pub struct RebaseArgs {
     /// has no halt-on-empty resume flow.
     #[clap(long = "empty", value_name = "mode")]
     pub empty: Option<String>,
+
+    /// Interactive rebase: generate a todo, run the sequence editor, and
+    /// replay the resulting commands.
+    #[clap(short = 'i', long = "interactive")]
+    pub interactive: bool,
+
+    /// Rewrite remaining commands of an in-progress interactive rebase.
+    #[clap(
+        long = "edit-todo",
+        conflicts_with_all = ["continue_rebase", "abort", "skip"]
+    )]
+    pub edit_todo: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -1267,6 +1358,12 @@ pub(crate) enum RebaseError {
     Finalize(String),
     #[error("pre-rebase hook failed: {0}")]
     RepositoryHook(String),
+    /// Interactive todo is halted on an invalid line (HF-28 / I9).
+    #[error("{0}")]
+    InteractiveTodoHalted(String),
+    /// Interactive `exec` failed (HF-23 / I12). Remaining commands wait for `--continue`.
+    #[error("execution failed: {command}{detail}")]
+    InteractiveExecFailed { command: String, detail: String },
 }
 
 impl From<RebaseError> for CliError {
@@ -1314,6 +1411,17 @@ impl From<RebaseError> for CliError {
             RebaseError::RepositoryHook(..) => CliError::failure(error.to_string())
                 .with_stable_code(StableErrorCode::RepoStateInvalid)
                 .with_hint("set LIBRA_NO_HOOKS=1 to bypass repository hooks"),
+            RebaseError::InteractiveTodoHalted(..) => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("fix the todo with 'libra rebase --edit-todo' then '--continue'")
+                .with_hint("or run 'libra rebase --abort' to return to the original branch"),
+            RebaseError::InteractiveExecFailed { command, .. } => {
+                CliError::failure(error.to_string())
+                    .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                    .with_hint("fix the command or repository state, then run 'libra rebase --continue'")
+                    .with_hint("or run 'libra rebase --abort' to return to the original branch")
+                    .with_detail("command", command.clone())
+            }
             RebaseError::ExecFailed {
                 commit,
                 command,
@@ -1453,6 +1561,39 @@ pub async fn execute(args: RebaseArgs) {
 }
 
 /// Safe CLI entry point with preflight validation for argument and state errors.
+/// Resolved start targets after `--root` remaps the optional positional to
+/// `<branch>` (Git 2.54). `--root` plus two positionals is `<upstream>`+
+/// `<branch>` and is a usage error.
+#[derive(Debug)]
+struct RebaseStartSpec {
+    root: bool,
+    upstream: Option<String>,
+    onto: Option<String>,
+    branch: Option<String>,
+}
+
+fn rebase_start_spec(args: &RebaseArgs) -> Result<RebaseStartSpec, CliError> {
+    if args.root {
+        if args.upstream.is_some() && args.branch.is_some() {
+            return Err(CliError::command_usage(
+                "--root cannot be used together with <upstream>",
+            ));
+        }
+        return Ok(RebaseStartSpec {
+            root: true,
+            upstream: None,
+            onto: args.onto.clone(),
+            branch: args.branch.clone().or_else(|| args.upstream.clone()),
+        });
+    }
+    Ok(RebaseStartSpec {
+        root: false,
+        upstream: args.upstream.clone(),
+        onto: args.onto.clone(),
+        branch: args.branch.clone(),
+    })
+}
+
 pub async fn execute_safe(args: RebaseArgs, output: &OutputConfig) -> CliResult<()> {
     // Part C W1 (§C.4.2): rebase is now safe in a LINKED worktree — its state
     // row is keyed by `worktree_id` (migration 2026072101), its aux sidecar
@@ -1469,7 +1610,7 @@ pub async fn execute_safe(args: RebaseArgs, output: &OutputConfig) -> CliResult<
     // Refuse to start a NEW rebase while a cherry-pick sequence is in progress
     // (rebase's own --continue/--abort/--skip operate on rebase state, not
     // cherry-pick, so they are exempt from this guard).
-    if !(args.continue_rebase || args.abort || args.skip) {
+    if !(args.continue_rebase || args.abort || args.skip || args.edit_todo) {
         crate::internal::sequencer::ensure_none_in_progress(
             crate::internal::sequencer::SequenceKind::Rebase,
         )
@@ -1480,7 +1621,7 @@ pub async fn execute_safe(args: RebaseArgs, output: &OutputConfig) -> CliResult<
     // progress before delegating to typed runners.  This ensures
     // a non-zero exit code (128) is returned when there is nothing to do,
     // matching the behaviour of `git rebase --abort` / `--continue` / `--skip`.
-    if args.continue_rebase || args.abort || args.skip {
+    if args.continue_rebase || args.abort || args.skip || args.edit_todo {
         match RebaseState::is_in_progress().await {
             Ok(true) => { /* rebase in progress – proceed */ }
             Ok(false) => {
@@ -1488,6 +1629,8 @@ pub async fn execute_safe(args: RebaseArgs, output: &OutputConfig) -> CliResult<
                     "abort"
                 } else if args.skip {
                     "skip"
+                } else if args.edit_todo {
+                    "edit-todo"
                 } else {
                     "continue"
                 };
@@ -1510,7 +1653,7 @@ pub async fn execute_safe(args: RebaseArgs, output: &OutputConfig) -> CliResult<
     // an EXPLICIT act, and this is the only place it happens — the user has
     // asked to continue, skip or abort THIS rebase, which is the statement of
     // ownership a read cannot make. Reads above only reported that it exists.
-    if args.continue_rebase || args.abort || args.skip {
+    if args.continue_rebase || args.abort || args.skip || args.edit_todo {
         // A bare repository has no working tree to rebase, and the
         // control-action path does not reach the start-path preflight — so it is
         // rejected HERE, before adoption. Otherwise a bare repo holding legacy
@@ -1523,7 +1666,8 @@ pub async fn execute_safe(args: RebaseArgs, output: &OutputConfig) -> CliResult<
         })?;
     }
 
-    preflight_rebase(&args).await?;
+    let start_spec = rebase_start_spec(&args)?;
+    preflight_rebase(&args, &start_spec).await?;
     // Validate `--empty` before any dispatch (start or sequencer control) so a bad
     // mode fails fast (exit 129) rather than slipping through.
     let empty_mode = resolve_rebase_empty_mode(&args)?;
@@ -1539,37 +1683,56 @@ pub async fn execute_safe(args: RebaseArgs, output: &OutputConfig) -> CliResult<
         let result = run_rebase_skip(output).await.map_err(CliError::from)?;
         return render_rebase_output(&result, output);
     }
-    if let Some(upstream) = args.upstream.as_deref() {
-        run_pre_rebase_hook(upstream, args.branch.as_deref(), output)
+    if args.edit_todo {
+        return run_rebase_edit_todo(output).await;
+    }
+    if args.interactive && args.update_refs {
+        return Err(CliError::command_usage(
+            "the option '--update-refs' cannot be used with '--interactive'",
+        )
+        .with_stable_code(StableErrorCode::CliInvalidArguments)
+        .with_hint(
+            "interactive `update-ref` todo lines are deferred (DEFER-02); rebase without `--update-refs`",
+        ));
+    }
+    if args.interactive {
+        return run_rebase_interactive_hidden(&start_spec, &args, output).await;
+    }
+    if start_spec.root || start_spec.upstream.is_some() {
+        let hook_upstream = start_spec.upstream.as_deref().unwrap_or("--root");
+        run_pre_rebase_hook(hook_upstream, start_spec.branch.as_deref(), output)
             .await
             .map_err(CliError::from)?;
         // ADR-MG-01: refuse a submodule-arbitrating replay before
         // `prepare_rebase_aux` writes the autostash / aux sidecar and resets
         // the working tree.
         preflight_rebase_gitlinks(
-            upstream,
-            args.onto.as_deref(),
-            args.branch.as_deref(),
+            start_spec.upstream.as_deref(),
+            start_spec.onto.as_deref(),
+            start_spec.branch.as_deref(),
             args.fork_point,
             args.no_keep_empty,
+            start_spec.root,
         )
         .await
         .map_err(CliError::from)?;
         prepare_rebase_aux(&args).await.map_err(CliError::from)?;
         // `git rebase --onto <newbase> <upstream> <branch>` form: check out the
         // named branch first (no-op when it is already current), so the rest of
-        // the start path rebases it as "the current branch".
+        // the start path rebases it as "the current branch". `--root <branch>`
+        // uses the same switch-then-replay path (ADR-HF-13 / M-ROOT R4).
         let start_result = async {
-            if let Some(branch) = args.branch.as_deref() {
+            if let Some(branch) = start_spec.branch.as_deref() {
                 switch_to_rebase_branch(branch, output).await?;
             }
             run_rebase_start(
-                upstream,
-                args.onto.as_deref(),
+                start_spec.upstream.as_deref(),
+                start_spec.onto.as_deref(),
                 args.autosquash,
                 args.no_keep_empty,
                 empty_mode,
                 args.fork_point,
+                start_spec.root,
                 output,
             )
             .await
@@ -1588,6 +1751,1314 @@ pub async fn execute_safe(args: RebaseArgs, output: &OutputConfig) -> CliResult<
         return render_rebase_output(&result, output);
     }
     Ok(())
+}
+
+/// HF-28: generate / edit / parse a todo, then replay `pick`/`drop`/reorder.
+async fn run_rebase_interactive_hidden(
+    spec: &RebaseStartSpec,
+    args: &RebaseArgs,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    let Some(editor_cmd) = editor::resolve_sequence_editor().await else {
+        return Err(CliError::failure("no sequence editor configured")
+            .with_stable_code(StableErrorCode::RepoStateInvalid)
+            .with_hint(
+                "set GIT_SEQUENCE_EDITOR, sequence.editor, GIT_EDITOR, core.editor, VISUAL, or EDITOR",
+            ));
+    };
+
+    let plan = collect_interactive_todo_plan(spec)
+        .await
+        .map_err(CliError::from)?;
+    let text = generate_interactive_todo_text(&plan, args)
+        .await
+        .map_err(CliError::from)?;
+
+    let path = interactive_todo_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            CliError::fatal(format!(
+                "failed to create the interactive rebase todo directory '{}': {error}",
+                parent.display()
+            ))
+            .with_stable_code(StableErrorCode::IoWriteFailed)
+        })?;
+    }
+    let _cleanup = InteractiveTodoBufferGuard { path: path.clone() };
+
+    let edited = match editor::edit_message(&path, &text, &editor_cmd, true).await {
+        Ok(body) => body,
+        Err(error) => return Err(editor_error_to_cli(error)),
+    };
+    let parsed = match rebase_todo::parse_todo(&edited) {
+        Ok(instructions) => instructions,
+        Err(error) => {
+            persist_interactive_parse_failure(&plan, spec, &error, &edited)
+                .await
+                .map_err(CliError::from)?;
+            return Err(todo_parse_error_to_cli(error));
+        }
+    };
+    if parsed.is_empty() {
+        return Err(
+            CliError::failure("nothing to do").with_stable_code(StableErrorCode::RepoStateInvalid)
+        );
+    }
+
+    let picks = match interactive_replay_items(&parsed, &plan.commits) {
+        Ok(picks) => picks,
+        Err(error) => return Err(interactive_replay_error_to_cli(error)),
+    };
+
+    let hook_upstream = spec.upstream.as_deref().unwrap_or("--root");
+    run_pre_rebase_hook(hook_upstream, spec.branch.as_deref(), output)
+        .await
+        .map_err(CliError::from)?;
+    preflight_rebase_gitlinks(
+        spec.upstream.as_deref(),
+        spec.onto.as_deref(),
+        spec.branch.as_deref(),
+        args.fork_point,
+        args.no_keep_empty,
+        spec.root,
+    )
+    .await
+    .map_err(CliError::from)?;
+
+    prepare_interactive_start_aux(args)
+        .await
+        .map_err(CliError::from)?;
+    persist_interactive_aux(parsed, None, None, Some(interactive_known_from_plan(&plan)))
+        .map_err(CliError::from)?;
+    let _picks = picks;
+
+    let start_result = async {
+        if let Some(branch) = spec.branch.as_deref() {
+            switch_to_rebase_branch(branch, output).await?;
+        }
+        run_interactive_replay(&plan, spec, output)
+            .await
+            .map_err(CliError::from)
+    }
+    .await;
+
+    let in_progress = RebaseState::is_in_progress()
+        .await
+        .map_err(|detail| CliError::from(RebaseError::StateCheck(detail)))?;
+    if !in_progress {
+        resolve_rebase_autostash().await.map_err(CliError::from)?;
+        RebaseAuxState::cleanup().map_err(CliError::from)?;
+    }
+    let result = start_result?;
+    render_rebase_output(&result, output)
+}
+
+async fn run_rebase_edit_todo(output: &OutputConfig) -> CliResult<()> {
+    ensure_rebase_in_progress().await.map_err(CliError::from)?;
+    let mut state = RebaseState::load()
+        .await
+        .map_err(|error| CliError::from(RebaseError::StateLoad(error)))?;
+    let Some(aux) = RebaseAuxState::load_optional().map_err(CliError::from)? else {
+        return Err(CliError::failure(
+            "The --edit-todo action can only be used during an interactive rebase",
+        )
+        .with_stable_code(StableErrorCode::RepoStateInvalid));
+    };
+    if !aux.marks_interactive() {
+        return Err(CliError::failure(
+            "The --edit-todo action can only be used during an interactive rebase",
+        )
+        .with_stable_code(StableErrorCode::RepoStateInvalid));
+    }
+
+    let Some(editor_cmd) = editor::resolve_sequence_editor().await else {
+        return Err(CliError::failure("no sequence editor configured")
+            .with_stable_code(StableErrorCode::RepoStateInvalid)
+            .with_hint(
+                "set GIT_SEQUENCE_EDITOR, sequence.editor, GIT_EDITOR, core.editor, VISUAL, or EDITOR",
+            ));
+    };
+
+    let onto_abbrev = short_object_id(&state.onto);
+    let head_abbrev = short_object_id(&state.orig_head);
+    let text = if let Some(raw) = aux.interactive_todo_text.as_deref() {
+        if raw.contains("You are editing the todo file of an ongoing interactive rebase") {
+            raw.to_string()
+        } else {
+            format!(
+                "{}{}{}",
+                raw.trim_end(),
+                if raw.ends_with('\n') { "" } else { "\n" },
+                rebase_todo::ONGOING_REBASE_TODO_HINT
+            )
+        }
+    } else {
+        rebase_todo::render_remaining_todo(&aux.todo_instructions, &onto_abbrev, &head_abbrev)
+    };
+
+    let path = interactive_todo_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            CliError::fatal(format!(
+                "failed to create the interactive rebase todo directory '{}': {error}",
+                parent.display()
+            ))
+            .with_stable_code(StableErrorCode::IoWriteFailed)
+        })?;
+    }
+    let _cleanup = InteractiveTodoBufferGuard { path: path.clone() };
+    let edited = match editor::edit_message(&path, &text, &editor_cmd, true).await {
+        Ok(body) => body,
+        Err(error) => return Err(editor_error_to_cli(error)),
+    };
+    match rebase_todo::parse_todo(&edited) {
+        Ok(instructions) => {
+            persist_interactive_aux(instructions, None, None, None).map_err(CliError::from)?;
+            clear_interactive_stop().map_err(CliError::from)?;
+            if state.stopped_sha.is_some() {
+                restore_current_head_tree(&state).map_err(CliError::from)?;
+            }
+            state.todo.clear();
+            state.todo_actions.clear();
+            state.stopped_sha = None;
+            state
+                .save()
+                .await
+                .map_err(|error| CliError::from(RebaseError::StateSave(error)))?;
+            if !output.quiet && !output.is_json() {
+                println!("Rewrote the remaining interactive rebase todo.");
+            }
+            Ok(())
+        }
+        Err(error) => {
+            persist_interactive_aux(Vec::new(), Some(error.to_string()), Some(edited), None)
+                .map_err(CliError::from)?;
+            Err(todo_parse_error_to_cli(error))
+        }
+    }
+}
+
+fn restore_current_head_tree(state: &RebaseState) -> Result<(), RebaseError> {
+    let current_commit: Commit =
+        load_object(&state.current_head).map_err(|error| RebaseError::CommitLoad {
+            commit: state.current_head.to_string(),
+            detail: error.to_string(),
+        })?;
+    let current_tree: Tree =
+        load_object(&current_commit.tree_id).map_err(|error| RebaseError::OriginalTreeLoad {
+            tree: current_commit.tree_id.to_string(),
+            detail: error.to_string(),
+        })?;
+    let index_file = path::index();
+    let current_index = git_internal::internal::index::Index::load(&index_file)
+        .map_err(|error| RebaseError::IndexLoad(error.to_string()))?;
+    let mut index = git_internal::internal::index::Index::new();
+    rebuild_index_from_tree(&current_tree, &mut index, "")
+        .map_err(|error| RebaseError::IndexRebuild(error.to_string()))?;
+    index
+        .save(&index_file)
+        .map_err(|error| RebaseError::IndexSave(error.to_string()))?;
+    reset_workdir_tracked_only(&current_index, &index)
+        .map_err(|error| RebaseError::WorkdirReset(error.to_string()))
+}
+
+fn editor_error_to_cli(error: editor::EditorError) -> CliError {
+    match error {
+        editor::EditorError::WriteBuffer { .. } => {
+            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
+        }
+        editor::EditorError::ReadBuffer { .. } => {
+            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+        }
+        editor::EditorError::Aborted { .. } => CliError::failure(error.to_string())
+            .with_stable_code(StableErrorCode::RepoStateInvalid)
+            .with_hint("the sequence editor exited without saving a todo list"),
+    }
+}
+
+fn interactive_todo_path() -> PathBuf {
+    util::request_worktree_gitdir_strict()
+        .join("rebase-merge")
+        .join("git-rebase-todo")
+}
+
+struct InteractiveTodoBufferGuard {
+    path: PathBuf,
+}
+
+impl Drop for InteractiveTodoBufferGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+        if let Some(parent) = self.path.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+    }
+}
+
+struct InteractiveTodoPlan {
+    onto_id: ObjectHash,
+    head_id: ObjectHash,
+    onto_abbrev: String,
+    head_abbrev: String,
+    picks: Vec<rebase_todo::TodoRenderCommit>,
+    commits: Vec<ObjectHash>,
+}
+
+const INTERACTIVE_TODO_MARKER: &str = "interactive";
+
+fn rebase_aux_is_interactive() -> bool {
+    RebaseAuxState::load_optional()
+        .ok()
+        .flatten()
+        .is_some_and(|aux| aux.marks_interactive())
+}
+
+fn encode_todo_actions_blob(body: String, interactive: bool) -> String {
+    if !interactive {
+        return body;
+    }
+    if body.is_empty() {
+        INTERACTIVE_TODO_MARKER.to_string()
+    } else {
+        format!("{INTERACTIVE_TODO_MARKER}\n{body}")
+    }
+}
+
+fn decode_todo_actions_blob(content: &str) -> (bool, Vec<&str>) {
+    let mut tokens: Vec<_> = content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let interactive = tokens
+        .first()
+        .is_some_and(|token| *token == INTERACTIVE_TODO_MARKER);
+    if interactive {
+        tokens.remove(0);
+    }
+    (interactive, tokens)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InteractiveReplayError {
+    Unresolved(String),
+    Ambiguous(String),
+    LeadingFold(&'static str),
+}
+
+fn interactive_replay_items(
+    instructions: &[rebase_todo::TodoInstruction],
+    known: &[ObjectHash],
+) -> Result<Vec<(ObjectHash, RebaseTodoAction)>, InteractiveReplayError> {
+    let mut out = Vec::new();
+    for instruction in instructions {
+        match instruction {
+            rebase_todo::TodoInstruction::Pick { commit } => {
+                out.push((resolve_todo_commit(commit, known)?, RebaseTodoAction::Pick));
+            }
+            rebase_todo::TodoInstruction::Reword { commit } => {
+                out.push((
+                    resolve_todo_commit(commit, known)?,
+                    RebaseTodoAction::Reword,
+                ));
+            }
+            rebase_todo::TodoInstruction::Squash { commit } => {
+                out.push((
+                    resolve_todo_commit(commit, known)?,
+                    RebaseTodoAction::Squash,
+                ));
+            }
+            rebase_todo::TodoInstruction::Fixup { commit, flag } => {
+                let action = match flag {
+                    None => RebaseTodoAction::Fixup,
+                    Some(rebase_todo::FixupFlag::KeepThis) => RebaseTodoAction::FixupKeep,
+                    Some(rebase_todo::FixupFlag::Reword) => RebaseTodoAction::FixupKeepEdit,
+                };
+                out.push((resolve_todo_commit(commit, known)?, action));
+            }
+            rebase_todo::TodoInstruction::Drop { .. }
+            | rebase_todo::TodoInstruction::Exec { .. }
+            | rebase_todo::TodoInstruction::Break => {}
+            rebase_todo::TodoInstruction::Edit { commit } => {
+                out.push((resolve_todo_commit(commit, known)?, RebaseTodoAction::Edit));
+            }
+        }
+    }
+    if let Some((_, action)) = out.first()
+        && action.folds_into_previous()
+    {
+        let op = match action {
+            RebaseTodoAction::Squash => "squash",
+            _ => "fixup",
+        };
+        return Err(InteractiveReplayError::LeadingFold(op));
+    }
+    Ok(out)
+}
+
+fn resolve_todo_commit(
+    abbrev: &str,
+    known: &[ObjectHash],
+) -> Result<ObjectHash, InteractiveReplayError> {
+    let needle = abbrev.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return Err(InteractiveReplayError::Unresolved(abbrev.to_string()));
+    }
+    let mut found = None;
+    for id in known {
+        let hex = id.to_string();
+        if hex == needle || hex.starts_with(&needle) {
+            if found.is_some_and(|existing| existing != *id) {
+                return Err(InteractiveReplayError::Ambiguous(abbrev.to_string()));
+            }
+            found = Some(*id);
+        }
+    }
+    found.ok_or_else(|| InteractiveReplayError::Unresolved(abbrev.to_string()))
+}
+
+fn todo_parse_error_to_cli(error: rebase_todo::TodoParseError) -> CliError {
+    match &error {
+        rebase_todo::TodoParseError::InvalidCommand {
+            command,
+            number,
+            line,
+        } => CliError::failure(format!("invalid command '{command}'"))
+            .with_stable_code(StableErrorCode::RepoStateInvalid)
+            .with_hint(format!("invalid line {number}: {line}"))
+            .with_hint(
+                "fix the todo with 'libra rebase --edit-todo' then '--continue', or run 'libra rebase --abort'",
+            ),
+        rebase_todo::TodoParseError::InvalidLine { number, line } => {
+            CliError::failure(format!("invalid line {number}: {line}"))
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("fix the todo with 'libra rebase --edit-todo' then '--continue'")
+                .with_hint("or run 'libra rebase --abort' to return to the original branch")
+        }
+    }
+}
+
+fn interactive_replay_error_to_cli(error: InteractiveReplayError) -> CliError {
+    match error {
+        InteractiveReplayError::Unresolved(commit) => CliError::failure(format!(
+            "could not resolve '{commit}' in the interactive todo"
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidTarget)
+        .with_hint("HEAD, the index, refs, and sequencer state were left unchanged"),
+        InteractiveReplayError::Ambiguous(commit) => CliError::failure(format!(
+            "commit '{commit}' is ambiguous in the interactive todo"
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidTarget)
+        .with_hint("HEAD, the index, refs, and sequencer state were left unchanged"),
+        InteractiveReplayError::LeadingFold(op) => {
+            CliError::failure(format!("cannot '{op}' without a previous commit"))
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("HEAD, the index, refs, and sequencer state were left unchanged")
+        }
+    }
+}
+
+async fn edit_interactive_commit_message(commit_id: ObjectHash) -> Result<ObjectHash, RebaseError> {
+    let commit: Commit = load_object(&commit_id).map_err(|error| RebaseError::CommitLoad {
+        commit: commit_id.to_string(),
+        detail: error.to_string(),
+    })?;
+    let Some(editor_cmd) = editor::resolve_editor().await else {
+        return Ok(commit_id);
+    };
+    let path = util::request_worktree_gitdir_strict().join("COMMIT_EDITMSG");
+    let (clean, _) = parse_commit_msg(&commit.message);
+    let edited = match editor::edit_message(&path, clean, &editor_cmd, true).await {
+        Ok(body) => body,
+        Err(editor::EditorError::Aborted { .. }) => {
+            return Err(RebaseError::InteractiveTodoHalted(
+                "commit message editor exited without saving".to_string(),
+            ));
+        }
+        Err(error) => return Err(RebaseError::Finalize(error.to_string())),
+    };
+    let trimmed = edited.trim();
+    if trimmed.is_empty() {
+        return Err(RebaseError::InteractiveTodoHalted(
+            "empty commit message after reword".to_string(),
+        ));
+    }
+    if trimmed == clean.trim() {
+        return Ok(commit_id);
+    }
+    let (committer, _) = crate::command::commit::create_committer_signature()
+        .await
+        .map_err(|error| RebaseError::IdentityMissing(error.to_string()))?;
+    let new_commit = Commit::new(
+        commit.author.clone(),
+        committer,
+        commit.tree_id,
+        commit.parent_commit_ids.clone(),
+        trimmed,
+    );
+    save_object(&new_commit, &new_commit.id)
+        .map_err(|error| RebaseError::CommitSave(error.to_string()))?;
+    Ok(new_commit.id)
+}
+
+fn persist_interactive_aux(
+    todo_instructions: Vec<rebase_todo::TodoInstruction>,
+    parse_error: Option<String>,
+    todo_text: Option<String>,
+    known: Option<Vec<String>>,
+) -> Result<(), RebaseError> {
+    let mut aux = RebaseAuxState::load_optional()?.unwrap_or_default();
+    aux.todo_instructions = todo_instructions;
+    aux.interactive_parse_error = parse_error;
+    aux.interactive_todo_text = todo_text;
+    if let Some(known) = known {
+        aux.interactive_known = known;
+    }
+    aux.save()
+}
+
+fn interactive_known_from_plan(plan: &InteractiveTodoPlan) -> Vec<String> {
+    plan.commits.iter().map(ToString::to_string).collect()
+}
+
+async fn interactive_autosquash_enabled(args: &RebaseArgs) -> Result<bool, RebaseError> {
+    if args.no_autosquash {
+        return Ok(false);
+    }
+    if args.autosquash {
+        return Ok(true);
+    }
+    match crate::internal::config::read_cascaded_config_value_strict(
+        crate::internal::config::LocalIdentityTarget::CurrentRepo,
+        "rebase.autosquash",
+    )
+    .await
+    {
+        Ok(None) => Ok(false),
+        Ok(Some(value)) => {
+            crate::internal::config::parse_git_config_bool(&value).ok_or_else(|| {
+                RebaseError::StateLoad(format!("invalid rebase.autosquash value '{value}'"))
+            })
+        }
+        Err(error) => Err(RebaseError::StateLoad(error.to_string())),
+    }
+}
+
+fn generated_todo_action_token(action: RebaseTodoAction) -> &'static str {
+    match action {
+        RebaseTodoAction::Squash => "squash",
+        RebaseTodoAction::Fixup => "fixup",
+        RebaseTodoAction::FixupKeep | RebaseTodoAction::Amend => "fixup -C",
+        RebaseTodoAction::FixupKeepEdit => "fixup -c",
+        RebaseTodoAction::Pick | RebaseTodoAction::Reword | RebaseTodoAction::Edit => "pick",
+    }
+}
+
+async fn generate_interactive_todo_text(
+    plan: &InteractiveTodoPlan,
+    args: &RebaseArgs,
+) -> Result<String, RebaseError> {
+    let autosquash = interactive_autosquash_enabled(args).await?;
+    if !autosquash && args.exec.is_empty() {
+        return Ok(rebase_todo::render_todo(
+            &plan.picks,
+            &plan.onto_abbrev,
+            &plan.head_abbrev,
+        ));
+    }
+    let items = if autosquash {
+        autosquash_commits(plan.commits.clone())?
+    } else {
+        plan.commits
+            .iter()
+            .copied()
+            .map(|commit| RebaseTodoItem {
+                commit,
+                action: RebaseTodoAction::Pick,
+            })
+            .collect()
+    };
+    let mut commands = Vec::new();
+    for item in items {
+        commands.push(format!(
+            "{} {} # {}",
+            generated_todo_action_token(item.action),
+            short_object_id(&item.commit),
+            commit_subject_lossy(&item.commit, false)
+        ));
+        for command in &args.exec {
+            commands.push(format!("exec {command}"));
+        }
+    }
+    Ok(rebase_todo::render_todo_with_commands(
+        &commands,
+        &plan.onto_abbrev,
+        &plan.head_abbrev,
+    ))
+}
+
+async fn prepare_interactive_start_aux(args: &RebaseArgs) -> Result<(), RebaseError> {
+    recover_stale_rebase_aux().await?;
+    let mut aux = RebaseAuxState {
+        rerere_autoupdate: rerere_autoupdate_override(args),
+        ..Default::default()
+    };
+    if args.autostash {
+        match crate::command::stash::create_held_stash_commit("autostash").await {
+            Ok(Some(stash)) => {
+                aux.autostash = Some(stash.to_string());
+                aux.save()?;
+                crate::command::stash::reset_to_head_for_held_stash()
+                    .await
+                    .map_err(|error| {
+                        RebaseError::Autostash(format!(
+                            "created stash {stash} but failed to clean the worktree: {error}; rebase-aux.json still references it"
+                        ))
+                    })?;
+            }
+            Ok(None) => {}
+            Err(error) => return Err(RebaseError::Autostash(error.to_string())),
+        }
+    }
+    aux.save()
+}
+
+async fn persist_interactive_parse_failure(
+    plan: &InteractiveTodoPlan,
+    spec: &RebaseStartSpec,
+    error: &rebase_todo::TodoParseError,
+    edited: &str,
+) -> Result<(), RebaseError> {
+    persist_interactive_aux(
+        Vec::new(),
+        Some(error.to_string()),
+        Some(edited.to_string()),
+        Some(interactive_known_from_plan(plan)),
+    )?;
+    claim_interactive_onto(plan, spec, Vec::new()).await?;
+    Ok(())
+}
+
+async fn run_interactive_replay(
+    plan: &InteractiveTodoPlan,
+    spec: &RebaseStartSpec,
+    output: &OutputConfig,
+) -> Result<RebaseOutput, RebaseError> {
+    let mut state = claim_interactive_onto(plan, spec, Vec::new()).await?;
+    let landing_display = spec
+        .onto
+        .as_deref()
+        .or(spec.upstream.as_deref())
+        .unwrap_or(plan.onto_abbrev.as_str());
+    let branch_name = state.head_name.clone();
+    let replay_count = interactive_remaining_count();
+    let outcome = drive_interactive(&mut state, &branch_name, landing_display, output).await?;
+    Ok(interactive_drive_output(
+        "start",
+        spec.upstream.clone(),
+        Some(plan.onto_id.to_string()),
+        Some(replay_count),
+        Some(plan.head_id.to_string()),
+        branch_name,
+        &state,
+        outcome,
+    ))
+}
+
+#[derive(Debug)]
+enum InteractiveDriveOutcome {
+    Completed(RebaseReplaySummary),
+    Stopped {
+        summary: RebaseReplaySummary,
+        kind: InteractiveStopKind,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum InteractiveStopKind {
+    Edit { abbrev: String, subject: String },
+    Break { abbrev: String, subject: String },
+}
+
+fn format_stopped_at_edit(abbrev: &str, subject: &str) -> String {
+    format!(
+        "Stopped at {abbrev}...  {subject}\n\
+You can amend the commit now with\n\
+\n\
+\tlibra commit --amend\n\
+\n\
+Once you are satisfied with your changes, run\n\
+\n\
+\tlibra rebase --continue"
+    )
+}
+
+fn format_stopped_at_break(abbrev: &str, subject: &str) -> String {
+    format!("Stopped at {abbrev} ({subject})")
+}
+
+fn print_interactive_stop(kind: &InteractiveStopKind) {
+    match kind {
+        InteractiveStopKind::Edit { abbrev, subject } => {
+            eprintln!("{}", format_stopped_at_edit(abbrev, subject));
+        }
+        InteractiveStopKind::Break { abbrev, subject } => {
+            eprintln!("{}", format_stopped_at_break(abbrev, subject));
+        }
+    }
+}
+
+fn interactive_remaining_count() -> usize {
+    RebaseAuxState::load_optional()
+        .ok()
+        .flatten()
+        .map(|aux| aux.todo_instructions.len())
+        .unwrap_or(0)
+}
+
+fn interactive_has_remaining_work() -> bool {
+    RebaseAuxState::load_optional()
+        .ok()
+        .flatten()
+        .is_some_and(|aux| {
+            aux.todo_instructions.iter().any(|instruction| {
+                !matches!(instruction, rebase_todo::TodoInstruction::Drop { .. })
+            })
+        })
+}
+
+fn interactive_known_hashes(aux: &RebaseAuxState) -> Vec<ObjectHash> {
+    aux.interactive_known
+        .iter()
+        .filter_map(|oid| ObjectHash::from_str(oid).ok())
+        .collect()
+}
+
+fn consume_leading_interactive_drops() -> Result<(), RebaseError> {
+    let Some(mut aux) = RebaseAuxState::load_optional()? else {
+        return Ok(());
+    };
+    let mut changed = false;
+    while matches!(
+        aux.todo_instructions.first(),
+        Some(rebase_todo::TodoInstruction::Drop { .. })
+    ) {
+        let dropped = aux.todo_instructions.remove(0);
+        aux.done_instructions.push(dropped);
+        changed = true;
+    }
+    if changed {
+        aux.save()?;
+    }
+    Ok(())
+}
+
+fn consume_applied_interactive_instruction() -> Result<(), RebaseError> {
+    consume_leading_interactive_drops()?;
+    let Some(mut aux) = RebaseAuxState::load_optional()? else {
+        return Ok(());
+    };
+    if aux.todo_instructions.is_empty() {
+        return Ok(());
+    }
+    let done = aux.todo_instructions.remove(0);
+    aux.done_instructions.push(done);
+    aux.save()
+}
+
+fn consume_front_interactive_instruction()
+-> Result<Option<rebase_todo::TodoInstruction>, RebaseError> {
+    consume_leading_interactive_drops()?;
+    let Some(mut aux) = RebaseAuxState::load_optional()? else {
+        return Ok(None);
+    };
+    if aux.todo_instructions.is_empty() {
+        return Ok(None);
+    }
+    let done = aux.todo_instructions.remove(0);
+    aux.done_instructions.push(done.clone());
+    aux.save()?;
+    Ok(Some(done))
+}
+
+fn peek_front_interactive_instruction() -> Result<Option<rebase_todo::TodoInstruction>, RebaseError>
+{
+    consume_leading_interactive_drops()?;
+    Ok(RebaseAuxState::load_optional()?.and_then(|aux| aux.todo_instructions.first().cloned()))
+}
+
+fn set_interactive_stop(reason: &str) -> Result<(), RebaseError> {
+    let Some(mut aux) = RebaseAuxState::load_optional()? else {
+        return Ok(());
+    };
+    aux.interactive_stop = Some(reason.to_string());
+    aux.save()
+}
+
+fn clear_interactive_stop() -> Result<(), RebaseError> {
+    let Some(mut aux) = RebaseAuxState::load_optional()? else {
+        return Ok(());
+    };
+    aux.interactive_stop = None;
+    aux.save()
+}
+
+fn stopped_at_from_original(state: &RebaseState) -> (String, String) {
+    let id = state.done.last().copied().unwrap_or(state.current_head);
+    (short_object_id(&id), commit_subject_lossy(&id, false))
+}
+
+fn instruction_to_replay_item(
+    instruction: &rebase_todo::TodoInstruction,
+    known: &[ObjectHash],
+) -> Result<Option<(ObjectHash, RebaseTodoAction)>, InteractiveReplayError> {
+    match instruction {
+        rebase_todo::TodoInstruction::Pick { commit } => Ok(Some((
+            resolve_todo_commit(commit, known)?,
+            RebaseTodoAction::Pick,
+        ))),
+        rebase_todo::TodoInstruction::Reword { commit } => Ok(Some((
+            resolve_todo_commit(commit, known)?,
+            RebaseTodoAction::Reword,
+        ))),
+        rebase_todo::TodoInstruction::Edit { commit } => Ok(Some((
+            resolve_todo_commit(commit, known)?,
+            RebaseTodoAction::Edit,
+        ))),
+        rebase_todo::TodoInstruction::Squash { commit } => Ok(Some((
+            resolve_todo_commit(commit, known)?,
+            RebaseTodoAction::Squash,
+        ))),
+        rebase_todo::TodoInstruction::Fixup { commit, flag } => {
+            let action = match flag {
+                None => RebaseTodoAction::Fixup,
+                Some(rebase_todo::FixupFlag::KeepThis) => RebaseTodoAction::FixupKeep,
+                Some(rebase_todo::FixupFlag::Reword) => RebaseTodoAction::FixupKeepEdit,
+            };
+            Ok(Some((resolve_todo_commit(commit, known)?, action)))
+        }
+        rebase_todo::TodoInstruction::Drop { .. }
+        | rebase_todo::TodoInstruction::Exec { .. }
+        | rebase_todo::TodoInstruction::Break => Ok(None),
+    }
+}
+
+async fn load_next_replay_segment(state: &mut RebaseState) -> Result<bool, RebaseError> {
+    consume_leading_interactive_drops()?;
+    let Some(aux) = RebaseAuxState::load_optional()? else {
+        return Ok(false);
+    };
+    let known = interactive_known_hashes(&aux);
+    let mut items = Vec::new();
+    let mut ends_with_edit = false;
+    for instruction in &aux.todo_instructions {
+        match instruction {
+            rebase_todo::TodoInstruction::Drop { .. } => {}
+            rebase_todo::TodoInstruction::Break | rebase_todo::TodoInstruction::Exec { .. } => {
+                break;
+            }
+            other => {
+                let item = instruction_to_replay_item(other, &known).map_err(|error| {
+                    RebaseError::InteractiveTodoHalted(match error {
+                        InteractiveReplayError::Unresolved(commit) => {
+                            format!("could not resolve '{commit}' in the interactive todo")
+                        }
+                        InteractiveReplayError::Ambiguous(commit) => {
+                            format!("commit '{commit}' is ambiguous in the interactive todo")
+                        }
+                        InteractiveReplayError::LeadingFold(op) => {
+                            format!("cannot '{op}' without a previous commit")
+                        }
+                    })
+                })?;
+                if let Some(item) = item {
+                    ends_with_edit = item.1 == RebaseTodoAction::Edit;
+                    items.push(item);
+                    if ends_with_edit {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if items.is_empty() {
+        return Ok(false);
+    }
+    if state.done.is_empty()
+        && items
+            .first()
+            .is_some_and(|(_, action)| action.folds_into_previous())
+    {
+        let op = match items[0].1 {
+            RebaseTodoAction::Squash => "squash",
+            _ => "fixup",
+        };
+        return Err(RebaseError::InteractiveTodoHalted(format!(
+            "cannot '{op}' without a previous commit"
+        )));
+    }
+    let (commits, actions): (Vec<ObjectHash>, Vec<RebaseTodoAction>) = items.into_iter().unzip();
+    state.todo = VecDeque::from(commits);
+    state.todo_actions = VecDeque::from(actions);
+    state.save().await.map_err(RebaseError::StateSave)?;
+    Ok(ends_with_edit)
+}
+
+async fn run_interactive_exec(state: &mut RebaseState, command: &str) -> Result<(), RebaseError> {
+    println!("Executing: {command}");
+    let result = run_sandboxed_rebase_exec(command).await.map_err(|detail| {
+        RebaseError::InteractiveExecFailed {
+            command: command.to_string(),
+            detail: format!(": {detail}"),
+        }
+    })?;
+    if !result.stdout.is_empty() {
+        print!("{}", result.stdout);
+        if !result.stdout.ends_with('\n') {
+            println!();
+        }
+    }
+    if !result.stderr.is_empty() {
+        eprint!("{}", result.stderr);
+        if !result.stderr.ends_with('\n') {
+            eprintln!();
+        }
+    }
+    if let Some(mut aux) = RebaseAuxState::load_optional()? {
+        reconcile_rebase_exec_head(state, &mut aux).await?;
+    }
+    if result.exit_code != 0 || result.timed_out {
+        let detail = if result.timed_out {
+            ": command timed out after 900 seconds".to_string()
+        } else {
+            String::new()
+        };
+        eprintln!("warning: execution failed: {command}");
+        return Err(RebaseError::InteractiveExecFailed {
+            command: command.to_string(),
+            detail,
+        });
+    }
+    let quiet_output = OutputConfig {
+        quiet: true,
+        ..Default::default()
+    };
+    if let Err(error) = switch::ensure_clean_status(&quiet_output).await {
+        eprintln!("warning: execution failed: {command}");
+        return Err(RebaseError::InteractiveExecFailed {
+            command: command.to_string(),
+            detail: format!(": command left tracked changes: {error}"),
+        });
+    }
+    Ok(())
+}
+
+async fn drive_interactive(
+    state: &mut RebaseState,
+    branch_name: &str,
+    onto_display: &str,
+    output: &OutputConfig,
+) -> Result<InteractiveDriveOutcome, RebaseError> {
+    let mut summary = RebaseReplaySummary::default();
+    loop {
+        consume_leading_interactive_drops()?;
+        if !state.todo.is_empty() {
+            let ends_with_edit = state
+                .todo_actions
+                .back()
+                .copied()
+                .is_some_and(|action| action == RebaseTodoAction::Edit);
+            let replay = continue_replay(state, branch_name, onto_display, false, output).await?;
+            summary.applied_commits.extend(replay.applied_commits);
+            summary.dropped_commits.extend(replay.dropped_commits);
+            if !RebaseState::is_in_progress()
+                .await
+                .map_err(RebaseError::StateCheck)?
+            {
+                return Ok(InteractiveDriveOutcome::Completed(summary));
+            }
+            if ends_with_edit && state.todo.is_empty() && state.stopped_sha.is_none() {
+                let (abbrev, subject) = stopped_at_from_original(state);
+                set_interactive_stop("edit")?;
+                let kind = InteractiveStopKind::Edit { abbrev, subject };
+                print_interactive_stop(&kind);
+                return Ok(InteractiveDriveOutcome::Stopped { summary, kind });
+            }
+            continue;
+        }
+
+        match peek_front_interactive_instruction()? {
+            None => {
+                if RebaseState::is_in_progress()
+                    .await
+                    .map_err(RebaseError::StateCheck)?
+                {
+                    finalize_rebase(state, false, output)
+                        .await
+                        .map_err(|error| RebaseError::Finalize(error.to_string()))?;
+                }
+                return Ok(InteractiveDriveOutcome::Completed(summary));
+            }
+            Some(rebase_todo::TodoInstruction::Break) => {
+                consume_front_interactive_instruction()?;
+                let (abbrev, subject) = stopped_at_from_original(state);
+                set_interactive_stop("break")?;
+                let kind = InteractiveStopKind::Break { abbrev, subject };
+                print_interactive_stop(&kind);
+                return Ok(InteractiveDriveOutcome::Stopped { summary, kind });
+            }
+            Some(rebase_todo::TodoInstruction::Exec { cmd }) => {
+                match run_interactive_exec(state, &cmd).await {
+                    Ok(()) => {
+                        consume_front_interactive_instruction()?;
+                    }
+                    Err(error) => {
+                        consume_front_interactive_instruction()?;
+                        set_interactive_stop("exec")?;
+                        return Err(error);
+                    }
+                }
+            }
+            Some(_) => {
+                let _ = load_next_replay_segment(state).await?;
+                if state.todo.is_empty() {
+                    return Err(RebaseError::InteractiveTodoHalted(
+                        "interactive todo has a commit command that could not be scheduled"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn interactive_drive_output(
+    action: &str,
+    upstream: Option<String>,
+    onto: Option<String>,
+    replay_count: Option<usize>,
+    previous_commit: Option<String>,
+    branch: String,
+    state: &RebaseState,
+    outcome: InteractiveDriveOutcome,
+) -> RebaseOutput {
+    let (status, applied_commits, dropped_commits) = match outcome {
+        InteractiveDriveOutcome::Completed(summary) => (
+            "completed".to_string(),
+            summary.applied_commits,
+            summary.dropped_commits,
+        ),
+        InteractiveDriveOutcome::Stopped { summary, kind } => {
+            let status = match kind {
+                InteractiveStopKind::Edit { .. } => "stopped-edit",
+                InteractiveStopKind::Break { .. } => "stopped-break",
+            };
+            (
+                status.to_string(),
+                summary.applied_commits,
+                summary.dropped_commits,
+            )
+        }
+    };
+    RebaseOutput {
+        action: action.to_string(),
+        status,
+        branch,
+        commit: state.current_head.to_string(),
+        upstream,
+        onto,
+        common_ancestor: None,
+        replay_count,
+        previous_commit,
+        restored: None,
+        applied_commits,
+        dropped_commits,
+        skipped_commit: None,
+        skipped_subject: None,
+        remaining: Some(state.todo.len()),
+    }
+}
+
+async fn amend_head_from_index_if_staged(state: &mut RebaseState) -> Result<(), RebaseError> {
+    let index_file = path::index();
+    let index = git_internal::internal::index::Index::load(&index_file)
+        .map_err(|error| RebaseError::IndexLoad(error.to_string()))?;
+    crate::internal::layer::reject_layer_owned_entries(&index, "to continue the rebase")
+        .await
+        .map_err(RebaseError::IndexLoad)?;
+    if has_unmerged_entries(&index) {
+        return Err(RebaseError::UnresolvedConflicts);
+    }
+    let new_tree_id = create_tree_from_index(&index)
+        .map_err(|error| RebaseError::TreeCreate(error.to_string()))?;
+    let head_commit: Commit =
+        load_object(&state.current_head).map_err(|error| RebaseError::CommitLoad {
+            commit: state.current_head.to_string(),
+            detail: error.to_string(),
+        })?;
+    if new_tree_id == head_commit.tree_id {
+        return Ok(());
+    }
+    let (committer, _) = crate::command::commit::create_committer_signature()
+        .await
+        .map_err(|error| RebaseError::IdentityMissing(error.to_string()))?;
+    let (clean, _) = parse_commit_msg(&head_commit.message);
+    let new_commit = Commit::new(
+        head_commit.author.clone(),
+        committer,
+        new_tree_id,
+        head_commit.parent_commit_ids.clone(),
+        clean.trim(),
+    );
+    save_object(&new_commit, &new_commit.id)
+        .map_err(|error| RebaseError::CommitSave(error.to_string()))?;
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(RebaseError::StateSave)?;
+    Head::update_result_with_conn(&db, Head::Detached(new_commit.id), None)
+        .await
+        .map_err(|error| RebaseError::HeadUpdate(error.to_string()))?;
+    state.current_head = new_commit.id;
+    state.save().await.map_err(RebaseError::StateSave)
+}
+
+async fn reconcile_interactive_edit_continue(state: &mut RebaseState) -> Result<(), RebaseError> {
+    if let Some(actual) = Head::current_commit().await
+        && actual != state.current_head
+    {
+        state.current_head = actual;
+        state.save().await.map_err(RebaseError::StateSave)?;
+    }
+    amend_head_from_index_if_staged(state).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_replay_or_drive(
+    state: &mut RebaseState,
+    branch: &str,
+    onto_display: &str,
+    action: &str,
+    previous_commit: Option<String>,
+    mut applied_commits: Vec<RebaseAppliedCommitOutput>,
+    mut dropped_commits: Vec<RebaseDroppedCommitOutput>,
+    skipped_commit: Option<String>,
+    skipped_subject: Option<String>,
+    output: &OutputConfig,
+) -> Result<RebaseOutput, RebaseError> {
+    if rebase_aux_is_interactive() {
+        let outcome = drive_interactive(state, branch, onto_display, output).await?;
+        let mut result = interactive_drive_output(
+            action,
+            None,
+            Some(state.onto.to_string()),
+            None,
+            previous_commit,
+            branch.to_string(),
+            state,
+            outcome,
+        );
+        result.applied_commits.splice(0..0, applied_commits);
+        result.dropped_commits.splice(0..0, dropped_commits);
+        result.skipped_commit = skipped_commit;
+        result.skipped_subject = skipped_subject;
+        return Ok(result);
+    }
+    if state.todo.is_empty() {
+        finalize_rebase(state, false, output)
+            .await
+            .map_err(|error| RebaseError::Finalize(error.to_string()))?;
+    } else {
+        state.save().await.map_err(RebaseError::StateSave)?;
+        let replay = continue_replay(state, branch, onto_display, false, output).await?;
+        applied_commits.extend(replay.applied_commits);
+        dropped_commits.extend(replay.dropped_commits);
+    }
+    Ok(RebaseOutput {
+        action: action.to_string(),
+        status: "completed".to_string(),
+        branch: branch.to_string(),
+        commit: state.current_head.to_string(),
+        upstream: None,
+        onto: Some(state.onto.to_string()),
+        common_ancestor: None,
+        replay_count: None,
+        previous_commit,
+        restored: None,
+        applied_commits,
+        dropped_commits,
+        skipped_commit,
+        skipped_subject,
+        remaining: Some(state.todo.len()),
+    })
+}
+
+async fn claim_interactive_onto(
+    plan: &InteractiveTodoPlan,
+    spec: &RebaseStartSpec,
+    items: Vec<(ObjectHash, RebaseTodoAction)>,
+) -> Result<RebaseState, RebaseError> {
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(RebaseError::StateSave)?;
+
+    let current_branch_name = match Head::current().await {
+        Head::Branch(name) if !name.is_empty() => name,
+        _ => return Err(RebaseError::NotOnBranch),
+    };
+    let head_to_rebase_id = plan.head_id;
+    let newbase_id = plan.onto_id;
+
+    let newbase_commit: Commit = load_object(&newbase_id).map_err(|e| RebaseError::CommitLoad {
+        commit: newbase_id.to_string(),
+        detail: e.to_string(),
+    })?;
+    let newbase_tree: Tree =
+        load_object(&newbase_commit.tree_id).map_err(|e| RebaseError::OriginalTreeLoad {
+            tree: newbase_commit.tree_id.to_string(),
+            detail: e.to_string(),
+        })?;
+    let mut guard_index = git_internal::internal::index::Index::new();
+    rebuild_index_from_tree(&newbase_tree, &mut guard_index, "")
+        .map_err(RebaseError::IndexRebuild)?;
+    rebase_worktree_guard_structured(&guard_index, "rebase").await?;
+
+    let landing_display = spec
+        .onto
+        .as_deref()
+        .or(spec.upstream.as_deref())
+        .unwrap_or(plan.onto_abbrev.as_str());
+    let start_action = ReflogAction::Rebase {
+        state: "start".to_string(),
+        details: format!("checkout {landing_display}"),
+    };
+    let start_context = ReflogContext {
+        old_oid: head_to_rebase_id.to_string(),
+        new_oid: newbase_id.to_string(),
+        action: start_action,
+    };
+    crate::internal::db::write_transaction(&db, |txn| {
+        Box::pin(async move {
+            reflog::Reflog::insert_single_entry(txn, &start_context, "HEAD").await?;
+            Head::update_result_with_conn(txn, Head::Detached(newbase_id), None)
+                .await
+                .map_err(|error| ReflogError::from(sea_orm::DbErr::Custom(error.to_string())))?;
+            Ok::<_, ReflogError>(())
+        })
+    })
+    .await
+    .map_err(|e| RebaseError::Finalize(format!("failed to start rebase: {e}")))?;
+
+    let (commits, actions): (Vec<ObjectHash>, Vec<RebaseTodoAction>) = items.into_iter().unzip();
+    let todo_actions = VecDeque::from(actions);
+    let state = RebaseState {
+        head_name: current_branch_name,
+        onto: newbase_id,
+        orig_head: head_to_rebase_id,
+        todo: VecDeque::from(commits),
+        todo_actions,
+        done: Vec::new(),
+        stopped_sha: None,
+        current_head: newbase_id,
+        autosquash: false,
+        empty_mode: RebaseEmptyMode::Keep,
+    };
+    state.claim_start().await.map_err(RebaseError::StateSave)?;
+    Head::update_result_with_conn(&db, Head::Detached(newbase_id), None)
+        .await
+        .map_err(|error| RebaseError::HeadUpdate(error.to_string()))?;
+    Ok(state)
+}
+
+async fn collect_interactive_todo_plan(
+    spec: &RebaseStartSpec,
+) -> Result<InteractiveTodoPlan, RebaseError> {
+    let current_branch_name = match Head::current().await {
+        Head::Branch(name) if !name.is_empty() => name,
+        _ => return Err(RebaseError::NotOnBranch),
+    };
+    let head_id = Head::current_commit()
+        .await
+        .ok_or_else(|| RebaseError::BranchHasNoCommits {
+            branch: current_branch_name.clone(),
+        })?;
+
+    let (onto_id, commits) =
+        if spec.root {
+            let commits = collect_commits_from_root(&head_id)
+                .await
+                .map_err(|detail| RebaseError::CommitLoad {
+                    commit: head_id.to_string(),
+                    detail,
+                })?;
+            let root_id = *commits
+                .first()
+                .ok_or_else(|| RebaseError::BranchHasNoCommits {
+                    branch: current_branch_name.clone(),
+                })?;
+            let onto_id = match spec.onto.as_deref() {
+                Some(onto) => resolve_branch_or_commit(onto).await.map_err(|detail| {
+                    RebaseError::OntoResolve {
+                        onto: onto.to_string(),
+                        detail,
+                    }
+                })?,
+                None => root_id,
+            };
+            (onto_id, commits)
+        } else {
+            let upstream =
+                spec.upstream
+                    .as_deref()
+                    .ok_or_else(|| RebaseError::UpstreamResolve {
+                        upstream: String::new(),
+                        detail: "no upstream specified".to_string(),
+                    })?;
+            let upstream_id = resolve_branch_or_commit(upstream).await.map_err(|detail| {
+                RebaseError::UpstreamResolve {
+                    upstream: upstream.to_string(),
+                    detail,
+                }
+            })?;
+            let onto_id = match spec.onto.as_deref() {
+                Some(onto) => resolve_branch_or_commit(onto).await.map_err(|detail| {
+                    RebaseError::OntoResolve {
+                        onto: onto.to_string(),
+                        detail,
+                    }
+                })?,
+                None => upstream_id,
+            };
+            let base_id = crate::internal::merge_base::merge_base(&head_id, &upstream_id)
+                .map_err(|error| RebaseError::CommitLoad {
+                    commit: head_id.to_string(),
+                    detail: format!("computing merge base with {upstream_id}: {error}"),
+                })?
+                .ok_or(RebaseError::NoCommonAncestor)?;
+            let commits = collect_commits_to_replay(&base_id, &head_id)
+                .await
+                .map_err(|detail| RebaseError::CommitLoad {
+                    commit: head_id.to_string(),
+                    detail,
+                })?;
+            (onto_id, commits)
+        };
+
+    let picks = commits
+        .iter()
+        .map(|id| rebase_todo::TodoRenderCommit {
+            abbrev: short_object_id(id),
+            subject: commit_subject_lossy(id, false),
+        })
+        .collect();
+    Ok(InteractiveTodoPlan {
+        onto_id,
+        head_id,
+        onto_abbrev: short_object_id(&onto_id),
+        head_abbrev: short_object_id(&head_id),
+        picks,
+        commits,
+    })
 }
 
 async fn run_pre_rebase_hook(
@@ -1719,6 +3190,7 @@ fn render_rebase_start_output(result: &RebaseOutput) {
                 result.branch, upstream
             );
         }
+        "stopped-edit" | "stopped-break" => {}
         "already-up-to-date" => {
             println!("Current branch is ahead of upstream. No rebase needed.");
         }
@@ -1800,6 +3272,14 @@ pub enum RebaseTodoAction {
     Fixup,
     Squash,
     Amend,
+    /// Interactive `reword`: pick, then open the commit-message editor.
+    Reword,
+    /// Interactive `fixup -C`: fold and keep this commit's message.
+    FixupKeep,
+    /// Interactive `fixup -c`: fold, keep this commit's message, then edit.
+    FixupKeepEdit,
+    /// Interactive `edit`: pick, then stop for amend.
+    Edit,
 }
 
 impl RebaseTodoAction {
@@ -1822,6 +3302,10 @@ impl RebaseTodoAction {
             "fixup" => Ok(Self::Fixup),
             "squash" => Ok(Self::Squash),
             "amend" => Ok(Self::Amend),
+            "reword" => Ok(Self::Reword),
+            "fixup_c" => Ok(Self::FixupKeep),
+            "fixup_c_edit" => Ok(Self::FixupKeepEdit),
+            "edit" => Ok(Self::Edit),
             other => Err(format!("invalid rebase todo action '{other}'")),
         }
     }
@@ -1832,11 +3316,18 @@ impl RebaseTodoAction {
             Self::Fixup => "fixup",
             Self::Squash => "squash",
             Self::Amend => "amend",
+            Self::Reword => "reword",
+            Self::FixupKeep => "fixup_c",
+            Self::FixupKeepEdit => "fixup_c_edit",
+            Self::Edit => "edit",
         }
     }
 
     fn folds_into_previous(self) -> bool {
-        matches!(self, Self::Fixup | Self::Squash | Self::Amend)
+        matches!(
+            self,
+            Self::Fixup | Self::Squash | Self::Amend | Self::FixupKeep | Self::FixupKeepEdit
+        )
     }
 }
 
@@ -1846,7 +3337,10 @@ fn replay_genealogy_predecessors(
     action: RebaseTodoAction,
 ) -> Vec<(String, RelationKind)> {
     match action {
-        RebaseTodoAction::Fixup | RebaseTodoAction::Squash => vec![
+        RebaseTodoAction::Fixup
+        | RebaseTodoAction::Squash
+        | RebaseTodoAction::FixupKeep
+        | RebaseTodoAction::FixupKeepEdit => vec![
             (previous_commit.to_string(), RelationKind::Squash),
             (original_commit.id.to_string(), RelationKind::Squash),
         ],
@@ -1854,7 +3348,7 @@ fn replay_genealogy_predecessors(
             (previous_commit.to_string(), RelationKind::Amend),
             (original_commit.id.to_string(), RelationKind::Amend),
         ],
-        RebaseTodoAction::Pick => {
+        RebaseTodoAction::Pick | RebaseTodoAction::Reword | RebaseTodoAction::Edit => {
             vec![(original_commit.id.to_string(), RelationKind::Rebase)]
         }
     }
@@ -2030,15 +3524,10 @@ fn autosquash_target_match_kind(
         .unwrap_or(None)
 }
 
-async fn preflight_rebase(args: &RebaseArgs) -> CliResult<()> {
-    if args.continue_rebase || args.abort || args.skip {
+async fn preflight_rebase(args: &RebaseArgs, spec: &RebaseStartSpec) -> CliResult<()> {
+    if args.continue_rebase || args.abort || args.skip || args.edit_todo {
         return Ok(());
     }
-
-    let upstream = args
-        .upstream
-        .as_deref()
-        .ok_or_else(|| CliError::fatal("no upstream specified"))?;
 
     match RebaseState::is_in_progress().await {
         Ok(true) => {
@@ -2060,14 +3549,23 @@ async fn preflight_rebase(args: &RebaseArgs) -> CliResult<()> {
 
     // `resolve_branch_or_commit` returns legacy `"fatal: ..."` prefixed strings,
     // so `from_legacy_string` strips the prefix to avoid double-prefix rendering.
-    resolve_branch_or_commit(upstream)
-        .await
-        .map_err(CliError::from_legacy_string)?;
+    if let Some(upstream) = spec.upstream.as_deref() {
+        resolve_branch_or_commit(upstream)
+            .await
+            .map_err(CliError::from_legacy_string)?;
+    } else if !spec.root {
+        return Err(CliError::fatal("no upstream specified"));
+    }
+    if let Some(branch) = spec.branch.as_deref() {
+        resolve_branch_or_commit(branch)
+            .await
+            .map_err(CliError::from_legacy_string)?;
+    }
 
     // Pre-resolve the --onto target so an unresolvable newbase fails fast,
     // before any worktree/state mutation (run_rebase_start re-resolves it for
     // the typed `OntoResolve` error).
-    if let Some(onto) = args.onto.as_deref() {
+    if let Some(onto) = spec.onto.as_deref() {
         resolve_branch_or_commit(onto)
             .await
             .map_err(CliError::from_legacy_string)?;
@@ -2585,15 +4083,16 @@ async fn reflog_fork_point(
 /// owns those error messages, and a preflight that fails first would change
 /// them. Only a gitlink refusal escapes.
 pub(crate) async fn preflight_gitlinks_for_pull(upstream: &str) -> Result<(), RebaseError> {
-    preflight_rebase_gitlinks(upstream, None, None, false, false).await
+    preflight_rebase_gitlinks(Some(upstream), None, None, false, false, false).await
 }
 
 async fn preflight_rebase_gitlinks(
-    upstream: &str,
+    upstream: Option<&str>,
     onto: Option<&str>,
     branch: Option<&str>,
     fork_point: bool,
     no_keep_empty: bool,
+    root: bool,
 ) -> Result<(), RebaseError> {
     let head_id = match branch {
         // `rebase --onto <newbase> <upstream> <branch>` checks `<branch>` out
@@ -2607,38 +4106,60 @@ async fn preflight_rebase_gitlinks(
             None => return Ok(()),
         },
     };
-    let Ok(upstream_id) = resolve_branch_or_commit(upstream).await else {
-        return Ok(());
-    };
-    let newbase_id = match onto {
-        Some(target) => match resolve_branch_or_commit(target).await {
-            Ok(id) => id,
-            Err(_) => return Ok(()),
-        },
-        None => upstream_id,
-    };
-    let Ok(Some(ordinary_base)) = crate::internal::merge_base::merge_base(&head_id, &upstream_id)
-    else {
-        return Ok(());
-    };
-    let base_id = if fork_point {
-        match reflog_fork_point(upstream, upstream_id, head_id).await {
-            Ok(found) => found.unwrap_or(ordinary_base),
-            Err(_) => return Ok(()),
-        }
+    let (newbase_id, mut commits) = if root {
+        let Ok(commits) = collect_commits_from_root(&head_id).await else {
+            return Ok(());
+        };
+        let Some(root_id) = commits.first().copied() else {
+            return Ok(());
+        };
+        let newbase_id = match onto {
+            Some(target) => match resolve_branch_or_commit(target).await {
+                Ok(id) => id,
+                Err(_) => return Ok(()),
+            },
+            None => root_id,
+        };
+        (newbase_id, commits)
     } else {
-        ordinary_base
-    };
-    // Both of `run_rebase_start`'s short-circuits decide nothing, so neither may
-    // be pre-empted by a gitlink refusal: `base_id == head_id` fast-forwards
-    // onto the upstream tree wholesale, and `base_id == upstream_id` means the
-    // upstream is already an ancestor (already up to date) — with no `--onto`
-    // there is nothing to move.
-    if onto.is_none() && (base_id == head_id || base_id == upstream_id) {
-        return Ok(());
-    }
-    let Ok(mut commits) = collect_commits_to_replay(&base_id, &head_id).await else {
-        return Ok(());
+        let Some(upstream) = upstream else {
+            return Ok(());
+        };
+        let Ok(upstream_id) = resolve_branch_or_commit(upstream).await else {
+            return Ok(());
+        };
+        let newbase_id = match onto {
+            Some(target) => match resolve_branch_or_commit(target).await {
+                Ok(id) => id,
+                Err(_) => return Ok(()),
+            },
+            None => upstream_id,
+        };
+        let Ok(Some(ordinary_base)) =
+            crate::internal::merge_base::merge_base(&head_id, &upstream_id)
+        else {
+            return Ok(());
+        };
+        let base_id = if fork_point {
+            match reflog_fork_point(upstream, upstream_id, head_id).await {
+                Ok(found) => found.unwrap_or(ordinary_base),
+                Err(_) => return Ok(()),
+            }
+        } else {
+            ordinary_base
+        };
+        // Both of `run_rebase_start`'s short-circuits decide nothing, so neither may
+        // be pre-empted by a gitlink refusal: `base_id == head_id` fast-forwards
+        // onto the upstream tree wholesale, and `base_id == upstream_id` means the
+        // upstream is already an ancestor (already up to date) — with no `--onto`
+        // there is nothing to move.
+        if onto.is_none() && (base_id == head_id || base_id == upstream_id) {
+            return Ok(());
+        }
+        let Ok(commits) = collect_commits_to_replay(&base_id, &head_id).await else {
+            return Ok(());
+        };
+        (newbase_id, commits)
     };
     if no_keep_empty {
         // `--no-keep-empty` prunes already-empty commits from the replay list
@@ -2676,9 +4197,9 @@ async fn preflight_rebase_gitlinks(
             Err(_) => return Ok(()),
         }
         if commit.parent_commit_ids.is_empty() {
-            // A root commit has no base tree to diff against; the replay
-            // refuses it separately (`ReplayErrorKind::MissingParent`).
-            return Ok(());
+            // `--root` replays a parentless commit against an empty base; there
+            // is no parent gitlink to include.
+            continue;
         }
         for parent_id in &commit.parent_commit_ids {
             match commit_gitlinks(parent_id) {
@@ -2697,13 +4218,15 @@ fn commit_gitlinks(commit_id: &ObjectHash) -> Result<merge::GitlinkEntries, Stri
     merge::commit_gitlink_entries(&commit).map_err(|error| error.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_rebase_start(
-    upstream: &str,
+    upstream: Option<&str>,
     onto: Option<&str>,
     autosquash: bool,
     no_keep_empty: bool,
     empty_mode: RebaseEmptyMode,
     fork_point: bool,
+    root: bool,
     output: &OutputConfig,
 ) -> Result<RebaseOutput, RebaseError> {
     let db = crate::internal::sequencer::request_db_checked()
@@ -2722,42 +4245,63 @@ async fn run_rebase_start(
                 branch: current_branch_name.clone(),
             })?;
 
-    let upstream_id = resolve_branch_or_commit(upstream).await.map_err(|detail| {
-        RebaseError::UpstreamResolve {
-            upstream: upstream.to_string(),
-            detail,
-        }
-    })?;
+    let onto_id = match onto {
+        Some(target) => Some(resolve_branch_or_commit(target).await.map_err(|detail| {
+            RebaseError::OntoResolve {
+                onto: target.to_string(),
+                detail,
+            }
+        })?),
+        None => None,
+    };
 
-    // The landing point ("onto") defaults to the upstream when --onto is absent,
-    // so existing behaviour is unchanged. With --onto, the replayed range stays
-    // <upstream>..HEAD (computed from `upstream_id`) but the commits land on
-    // `newbase_id` instead.
-    let newbase_id =
-        match onto {
-            Some(target) => resolve_branch_or_commit(target).await.map_err(|detail| {
-                RebaseError::OntoResolve {
-                    onto: target.to_string(),
-                    detail,
-                }
-            })?,
-            None => upstream_id,
-        };
-
-    // The true lowest common ancestor (shared with `merge-base` / `diff A...B`),
-    // not a first-meet BFS — correct for criss-cross histories.
-    let ordinary_base = crate::internal::merge_base::merge_base(&head_to_rebase_id, &upstream_id)
-        .map_err(|error| RebaseError::CommitLoad {
-            commit: head_to_rebase_id.to_string(),
-            detail: format!("computing merge base with {upstream_id}: {error}"),
-        })?
-        .ok_or(RebaseError::NoCommonAncestor)?;
-    let base_id = if fork_point {
-        reflog_fork_point(upstream, upstream_id, head_to_rebase_id)
-            .await?
-            .unwrap_or(ordinary_base)
+    let (newbase_id, base_id, upstream_id, mut commits_to_replay, upstream_label) = if root {
+        let commits = collect_commits_from_root(&head_to_rebase_id)
+            .await
+            .map_err(|detail| RebaseError::CommitLoad {
+                commit: head_to_rebase_id.to_string(),
+                detail,
+            })?;
+        let root_id = *commits
+            .first()
+            .ok_or_else(|| RebaseError::BranchHasNoCommits {
+                branch: current_branch_name.clone(),
+            })?;
+        let newbase_id = onto_id.unwrap_or(root_id);
+        (newbase_id, root_id, root_id, commits, "--root".to_string())
     } else {
-        ordinary_base
+        let upstream = upstream.ok_or_else(|| RebaseError::UpstreamResolve {
+            upstream: String::new(),
+            detail: "no upstream specified".to_string(),
+        })?;
+        let upstream_id = resolve_branch_or_commit(upstream).await.map_err(|detail| {
+            RebaseError::UpstreamResolve {
+                upstream: upstream.to_string(),
+                detail,
+            }
+        })?;
+        let newbase_id = onto_id.unwrap_or(upstream_id);
+        let ordinary_base =
+            crate::internal::merge_base::merge_base(&head_to_rebase_id, &upstream_id)
+                .map_err(|error| RebaseError::CommitLoad {
+                    commit: head_to_rebase_id.to_string(),
+                    detail: format!("computing merge base with {upstream_id}: {error}"),
+                })?
+                .ok_or(RebaseError::NoCommonAncestor)?;
+        let base_id = if fork_point {
+            reflog_fork_point(upstream, upstream_id, head_to_rebase_id)
+                .await?
+                .unwrap_or(ordinary_base)
+        } else {
+            ordinary_base
+        };
+        (
+            newbase_id,
+            base_id,
+            upstream_id,
+            Vec::new(),
+            upstream.to_string(),
+        )
     };
 
     // Fast-forward and already-up-to-date short-circuits apply only to a plain
@@ -2765,7 +4309,7 @@ async fn run_rebase_start(
     // always replay <upstream>..HEAD onto <newbase>, even when upstream is an
     // ancestor of HEAD (range non-empty) — otherwise the commits would never be
     // moved onto the new base.
-    if onto.is_none() && base_id == head_to_rebase_id {
+    if !root && onto.is_none() && base_id == head_to_rebase_id {
         let upstream_commit: Commit =
             load_object(&upstream_id).map_err(|e| RebaseError::CommitLoad {
                 commit: upstream_id.to_string(),
@@ -2795,7 +4339,7 @@ async fn run_rebase_start(
 
         let fast_forward_action = ReflogAction::Rebase {
             state: "fast-forward".to_string(),
-            details: format!("moving {} to {}", current_branch_name, upstream),
+            details: format!("moving {} to {}", current_branch_name, upstream_label),
         };
         let fast_forward_context = ReflogContext {
             old_oid: head_to_rebase_id.to_string(),
@@ -2837,7 +4381,7 @@ async fn run_rebase_start(
             status: "fast-forwarded".to_string(),
             branch: current_branch_name,
             commit: upstream_id.to_string(),
-            upstream: Some(upstream.to_string()),
+            upstream: Some(upstream_label.clone()),
             onto: Some(upstream_id.to_string()),
             common_ancestor: Some(base_id.to_string()),
             replay_count: Some(0),
@@ -2851,13 +4395,16 @@ async fn run_rebase_start(
         });
     }
 
-    if onto.is_none() && base_id == upstream_id {
+    // Explicit `--autosquash` must still replay (and fold) when upstream is an
+    // ancestor of HEAD. Without the flag, keep Git's already-up-to-date shortcut.
+    // `--root` never takes this shortcut: the range always includes the root.
+    if !root && onto.is_none() && base_id == upstream_id && !autosquash {
         return Ok(RebaseOutput {
             action: "start".to_string(),
             status: "already-up-to-date".to_string(),
             branch: current_branch_name,
             commit: head_to_rebase_id.to_string(),
-            upstream: Some(upstream.to_string()),
+            upstream: Some(upstream_label.clone()),
             onto: Some(upstream_id.to_string()),
             common_ancestor: Some(base_id.to_string()),
             replay_count: Some(0),
@@ -2871,12 +4418,14 @@ async fn run_rebase_start(
         });
     }
 
-    let mut commits_to_replay = collect_commits_to_replay(&base_id, &head_to_rebase_id)
-        .await
-        .map_err(|detail| RebaseError::CommitLoad {
-            commit: head_to_rebase_id.to_string(),
-            detail,
-        })?;
+    if !root {
+        commits_to_replay = collect_commits_to_replay(&base_id, &head_to_rebase_id)
+            .await
+            .map_err(|detail| RebaseError::CommitLoad {
+                commit: head_to_rebase_id.to_string(),
+                detail,
+            })?;
+    }
     let original_commits_to_replay = commits_to_replay.clone();
     // `--no-keep-empty`: drop commits that are ALREADY empty in the original
     // history (their tree equals their first parent's tree — i.e. they introduce
@@ -2915,7 +4464,7 @@ async fn run_rebase_start(
             status: "no-commits".to_string(),
             branch: current_branch_name,
             commit: head_to_rebase_id.to_string(),
-            upstream: Some(upstream.to_string()),
+            upstream: Some(upstream_label.clone()),
             onto: Some(newbase_id.to_string()),
             common_ancestor: Some(base_id.to_string()),
             replay_count: Some(0),
@@ -2957,7 +4506,7 @@ async fn run_rebase_start(
     // initial detach, the rebase state's onto/current_head, and the start reflog
     // all point at the landing commit, while the replayed range was computed
     // from `upstream`.
-    let landing_display = onto.unwrap_or(upstream);
+    let landing_display = onto.unwrap_or(upstream_label.as_str());
     let start_action = ReflogAction::Rebase {
         state: "start".to_string(),
         details: format!("checkout {}", landing_display),
@@ -3017,7 +4566,7 @@ async fn run_rebase_start(
         status: "completed".to_string(),
         branch: current_branch_name,
         commit: state.current_head.to_string(),
-        upstream: Some(upstream.to_string()),
+        upstream: Some(upstream_label),
         onto: Some(newbase_id.to_string()),
         common_ancestor: Some(base_id.to_string()),
         replay_count: Some(replay_count),
@@ -3069,14 +4618,15 @@ pub(crate) async fn run_rebase_for_pull(
     // `preflight_gitlinks_for_pull` BEFORE its own autostash push, so the gate
     // has already run by the time we get here; repeating it costs one cheap
     // history walk and keeps this entry correct on its own.
-    preflight_rebase_gitlinks(upstream, None, None, false, false).await?;
+    preflight_rebase_gitlinks(Some(upstream), None, None, false, false, false).await?;
     // `pull --rebase` keeps Libra's default (keep become-empty commits).
     let output = run_rebase_start(
-        upstream,
+        Some(upstream),
         None,
         false,
         false,
         RebaseEmptyMode::Keep,
+        false,
         false,
         output,
     )
@@ -3107,6 +4657,8 @@ async fn continue_replay(
         .await
         .map_err(RebaseError::StateSave)?;
     let rerere_autoupdate = persisted_rerere_autoupdate()?;
+    let interactive = rebase_aux_is_interactive();
+    let mut squash_needs_editor = false;
     let mut summary = RebaseReplaySummary::default();
 
     if emit_human {
@@ -3138,6 +4690,9 @@ async fn continue_replay(
                 // without advancing `current_head` (the new parent is unchanged).
                 state.todo.pop_front();
                 state.todo_actions.pop_front();
+                if interactive {
+                    consume_applied_interactive_instruction()?;
+                }
                 state.stopped_sha = None;
                 record_rebase_rewrite(commit_id, state.current_head, state.current_head, false)?;
                 if emit_human {
@@ -3167,6 +4722,31 @@ async fn continue_replay(
                 state.todo_actions.pop_front();
                 state.done.push(commit_id);
                 state.stopped_sha = None;
+                if interactive {
+                    consume_applied_interactive_instruction()?;
+                }
+
+                if interactive {
+                    let next_folds = state
+                        .todo_actions
+                        .front()
+                        .is_some_and(|next| next.folds_into_previous());
+                    let mut edit_message = matches!(
+                        action,
+                        RebaseTodoAction::Reword | RebaseTodoAction::FixupKeepEdit
+                    );
+                    if matches!(action, RebaseTodoAction::Squash) {
+                        squash_needs_editor = true;
+                    }
+                    if squash_needs_editor && !next_folds {
+                        edit_message = true;
+                        squash_needs_editor = false;
+                    }
+                    if edit_message {
+                        state.current_head =
+                            edit_interactive_commit_message(state.current_head).await?;
+                    }
+                }
 
                 // Update HEAD
                 Head::update_result_with_conn(&db, Head::Detached(state.current_head), None)
@@ -3197,7 +4777,7 @@ async fn continue_replay(
                 record_rebase_rewrite(
                     commit_id,
                     previous_tip,
-                    replayed_commit_id,
+                    state.current_head,
                     action.folds_into_previous(),
                 )?;
                 schedule_rebase_exec(state).await?;
@@ -3270,7 +4850,14 @@ async fn continue_replay(
         }
     }
 
-    // All commits replayed successfully - finalize
+    // All commits replayed successfully - finalize unless interactive
+    // instructions (exec/break/later picks) are still waiting.
+    if interactive {
+        consume_leading_interactive_drops()?;
+        if interactive_has_remaining_work() {
+            return Ok(summary);
+        }
+    }
     finalize_rebase(state, emit_human, output)
         .await
         .map_err(|e| RebaseError::Finalize(e.to_string()))?;
@@ -3486,44 +5073,50 @@ async fn finalize_rebase(
 
 async fn run_rebase_continue(output: &OutputConfig) -> Result<RebaseOutput, RebaseError> {
     ensure_rebase_in_progress().await?;
+    if let Some(aux) = RebaseAuxState::load_optional()?
+        && let Some(detail) = aux.interactive_parse_error
+    {
+        return Err(RebaseError::InteractiveTodoHalted(detail));
+    }
     let mut state = RebaseState::load().await.map_err(RebaseError::StateLoad)?;
     let previous_commit = state.current_head.to_string();
     let branch = state.head_name.clone();
     let onto_display = short_object_id(&state.onto);
     let mut applied_commits = Vec::new();
-    let mut dropped_commits = Vec::new();
+    let dropped_commits = Vec::new();
 
     if RebaseAuxState::load_optional()?
         .and_then(|aux| aux.pending_exec)
         .is_some()
     {
         run_pending_rebase_exec(&mut state).await?;
-        if state.todo.is_empty() {
-            finalize_rebase(&state, false, output)
-                .await
-                .map_err(|error| RebaseError::Finalize(error.to_string()))?;
-        } else {
-            let replay = continue_replay(&mut state, &branch, &onto_display, false, output).await?;
-            applied_commits.extend(replay.applied_commits);
-            dropped_commits.extend(replay.dropped_commits);
-        }
-        return Ok(RebaseOutput {
-            action: "continue".to_string(),
-            status: "completed".to_string(),
-            branch,
-            commit: state.current_head.to_string(),
-            upstream: None,
-            onto: Some(state.onto.to_string()),
-            common_ancestor: None,
-            replay_count: None,
-            previous_commit: Some(previous_commit),
-            restored: None,
+        return finish_replay_or_drive(
+            &mut state,
+            &branch,
+            &onto_display,
+            "continue",
+            Some(previous_commit),
             applied_commits,
             dropped_commits,
-            skipped_commit: None,
-            skipped_subject: None,
-            remaining: Some(state.todo.len()),
-        });
+            None,
+            None,
+            output,
+        )
+        .await;
+    }
+
+    if RebaseAuxState::load_optional()?
+        .and_then(|aux| aux.interactive_stop)
+        .as_deref()
+        == Some("edit")
+    {
+        reconcile_interactive_edit_continue(&mut state).await?;
+        clear_interactive_stop()?;
+    } else if RebaseAuxState::load_optional()?
+        .and_then(|aux| aux.interactive_stop)
+        .is_some()
+    {
+        clear_interactive_stop()?;
     }
 
     if let Some(stopped_sha) = state.stopped_sha {
@@ -3613,36 +5206,24 @@ async fn run_rebase_continue(output: &OutputConfig) -> Result<RebaseOutput, Reba
         if let Some(applied) = applied_commits.last_mut() {
             applied.commit = state.current_head.to_string();
         }
+        if rebase_aux_is_interactive() {
+            consume_applied_interactive_instruction()?;
+        }
     }
 
-    if state.todo.is_empty() {
-        finalize_rebase(&state, false, output)
-            .await
-            .map_err(|e| RebaseError::Finalize(e.to_string()))?;
-    } else {
-        state.save().await.map_err(RebaseError::StateSave)?;
-        let replay = continue_replay(&mut state, &branch, &onto_display, false, output).await?;
-        applied_commits.extend(replay.applied_commits);
-        dropped_commits.extend(replay.dropped_commits);
-    }
-
-    Ok(RebaseOutput {
-        action: "continue".to_string(),
-        status: "completed".to_string(),
-        branch,
-        commit: state.current_head.to_string(),
-        upstream: None,
-        onto: Some(state.onto.to_string()),
-        common_ancestor: None,
-        replay_count: None,
-        previous_commit: Some(previous_commit),
-        restored: None,
+    finish_replay_or_drive(
+        &mut state,
+        &branch,
+        &onto_display,
+        "continue",
+        Some(previous_commit),
         applied_commits,
         dropped_commits,
-        skipped_commit: None,
-        skipped_subject: None,
-        remaining: Some(state.todo.len()),
-    })
+        None,
+        None,
+        output,
+    )
+    .await
 }
 
 async fn run_rebase_abort() -> Result<RebaseOutput, RebaseError> {
@@ -3801,34 +5382,19 @@ async fn run_rebase_skip(output: &OutputConfig) -> Result<RebaseOutput, RebaseEr
             })?;
         aux.pending_exec = None;
         aux.save()?;
-        let mut applied_commits = Vec::new();
-        let mut dropped_commits = Vec::new();
-        if state.todo.is_empty() {
-            finalize_rebase(&state, false, output)
-                .await
-                .map_err(|error| RebaseError::Finalize(error.to_string()))?;
-        } else {
-            let replay = continue_replay(&mut state, &branch, &onto_display, false, output).await?;
-            applied_commits.extend(replay.applied_commits);
-            dropped_commits.extend(replay.dropped_commits);
-        }
-        return Ok(RebaseOutput {
-            action: "skip".to_string(),
-            status: "completed".to_string(),
-            branch,
-            commit: state.current_head.to_string(),
-            upstream: None,
-            onto: Some(state.onto.to_string()),
-            common_ancestor: None,
-            replay_count: None,
-            previous_commit: Some(previous_commit),
-            restored: None,
-            applied_commits,
-            dropped_commits,
-            skipped_commit: None,
-            skipped_subject: None,
-            remaining: Some(state.todo.len()),
-        });
+        return finish_replay_or_drive(
+            &mut state,
+            &branch,
+            &onto_display,
+            "skip",
+            Some(previous_commit),
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            output,
+        )
+        .await;
     }
 
     let skipped_sha = state
@@ -3846,6 +5412,9 @@ async fn run_rebase_skip(output: &OutputConfig) -> Result<RebaseOutput, RebaseEr
     state.stopped_sha = None;
     if skipped_action.unwrap_or(RebaseTodoAction::Pick) == RebaseTodoAction::Pick {
         downgrade_leading_autosquash_dependents(&mut state.todo_actions);
+    }
+    if rebase_aux_is_interactive() {
+        consume_applied_interactive_instruction()?;
     }
 
     let current_commit: Commit =
@@ -3871,36 +5440,19 @@ async fn run_rebase_skip(output: &OutputConfig) -> Result<RebaseOutput, RebaseEr
     reset_workdir_tracked_only(&current_index, &index)
         .map_err(|e| RebaseError::WorkdirReset(e.to_string()))?;
 
-    let mut applied_commits = Vec::new();
-    let mut dropped_commits = Vec::new();
-    if state.todo.is_empty() {
-        finalize_rebase(&state, false, output)
-            .await
-            .map_err(|e| RebaseError::Finalize(e.to_string()))?;
-    } else {
-        state.save().await.map_err(RebaseError::StateSave)?;
-        let replay = continue_replay(&mut state, &branch, &onto_display, false, output).await?;
-        applied_commits.extend(replay.applied_commits);
-        dropped_commits.extend(replay.dropped_commits);
-    }
-
-    Ok(RebaseOutput {
-        action: "skip".to_string(),
-        status: "completed".to_string(),
-        branch,
-        commit: state.current_head.to_string(),
-        upstream: None,
-        onto: Some(state.onto.to_string()),
-        common_ancestor: None,
-        replay_count: None,
-        previous_commit: Some(previous_commit),
-        restored: None,
-        applied_commits,
-        dropped_commits,
-        skipped_commit: Some(skipped_sha.to_string()),
+    finish_replay_or_drive(
+        &mut state,
+        &branch,
+        &onto_display,
+        "skip",
+        Some(previous_commit),
+        Vec::new(),
+        Vec::new(),
+        Some(skipped_sha.to_string()),
         skipped_subject,
-        remaining: Some(state.todo.len()),
-    })
+        output,
+    )
+    .await
 }
 
 fn downgrade_leading_autosquash_dependents(todo_actions: &mut VecDeque<RebaseTodoAction>) {
@@ -4061,6 +5613,7 @@ fn write_workdir_symlink(workdir: &Path, path: &Path, target: &[u8]) -> Result<(
 mod tests {
     #[cfg(unix)]
     use std::path::Path;
+    use std::str::FromStr;
 
     use clap::Parser;
     use git_internal::internal::object::tree::TreeItemMode;
@@ -4069,10 +5622,33 @@ mod tests {
     #[cfg(unix)]
     use super::path_to_index_key;
     use super::{
-        RebaseArgs, RebaseAuxState, RebaseError, ReplayErrorKind, index_mode_to_tree_item_mode,
+        InteractiveReplayError, RebaseArgs, RebaseAuxState, RebaseError, RebaseState,
+        RebaseTodoAction, ReplayErrorKind, decode_todo_actions_blob, encode_todo_actions_blob,
+        index_mode_to_tree_item_mode, interactive_replay_items, rebase_start_spec,
         rerere_autoupdate_override, write_workdir_blob,
     };
     use crate::utils::error::{CliError, StableErrorCode};
+
+    #[test]
+    fn rebase_start_spec_root_remaps_positional_to_branch() {
+        let args = RebaseArgs::try_parse_from(["rebase", "--root", "topic"])
+            .expect("--root <branch> must parse");
+        let spec = rebase_start_spec(&args).expect("single positional is <branch>");
+        assert!(spec.root);
+        assert_eq!(spec.upstream.as_deref(), None);
+        assert_eq!(spec.branch.as_deref(), Some("topic"));
+    }
+
+    #[test]
+    fn rebase_start_spec_root_rejects_upstream_and_branch() {
+        let args = RebaseArgs::try_parse_from(["rebase", "--root", "main", "topic"])
+            .expect("two positionals must parse");
+        let err = rebase_start_spec(&args).expect_err("two positionals are usage");
+        assert!(
+            err.to_string()
+                .contains("--root cannot be used together with <upstream>")
+        );
+    }
 
     #[test]
     fn rerere_autoupdate_flags_are_last_wins_and_old_aux_state_inherits() {
@@ -4092,6 +5668,143 @@ mod tests {
         let old: RebaseAuxState = serde_json::from_str("{}")
             .expect("sidecars written before rerere override remain readable");
         assert_eq!(old.rerere_autoupdate, None);
+    }
+
+    #[test]
+    fn interactive_action_marker_roundtrip_and_old_reader_length() {
+        use std::collections::VecDeque;
+
+        use git_internal::hash::ObjectHash;
+
+        let encoded = encode_todo_actions_blob("pick\npick".to_string(), true);
+        assert_eq!(encoded, "interactive\npick\npick");
+        let (interactive, tokens) = decode_todo_actions_blob(&encoded);
+        assert!(interactive);
+        assert_eq!(tokens, vec!["pick", "pick"]);
+
+        let empty = encode_todo_actions_blob(String::new(), true);
+        assert_eq!(empty, "interactive");
+        let (interactive, tokens) = decode_todo_actions_blob(&empty);
+        assert!(interactive);
+        assert!(tokens.is_empty());
+
+        let oid = ObjectHash::from_str("0123456789abcdef0123456789abcdef01234567").expect("oid");
+        let todo = VecDeque::from([oid]);
+        let actions = RebaseState::parse_action_list("interactive\npick", 1, false, &todo)
+            .expect("marker + pick");
+        assert_eq!(actions, VecDeque::from([RebaseTodoAction::Pick]));
+
+        let err = RebaseState::parse_action_list("interactive\npick\npick", 1, false, &todo)
+            .expect_err("unstripped marker must fail length check");
+        assert!(err.contains("invalid todo_actions length"), "{err}");
+    }
+
+    #[test]
+    fn interactive_replay_filters_pick_drop_and_rejects_other_ops() {
+        use git_internal::hash::ObjectHash;
+
+        use crate::command::rebase_todo::TodoInstruction;
+
+        let a = ObjectHash::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").expect("a");
+        let b = ObjectHash::from_str("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").expect("b");
+        let c = ObjectHash::from_str("cccccccccccccccccccccccccccccccccccccccc").expect("c");
+        let known = [a, b, c];
+
+        let picks = interactive_replay_items(
+            &[
+                TodoInstruction::Pick {
+                    commit: "aaaaaaa".into(),
+                },
+                TodoInstruction::Drop {
+                    commit: Some("bbbbbbb".into()),
+                },
+                TodoInstruction::Pick {
+                    commit: "ccccccc".into(),
+                },
+            ],
+            &known,
+        )
+        .expect("pick/drop");
+        assert_eq!(
+            picks,
+            vec![(a, RebaseTodoAction::Pick), (c, RebaseTodoAction::Pick)]
+        );
+
+        let empty = interactive_replay_items(&[], &known).expect("empty");
+        assert!(empty.is_empty());
+
+        let err = interactive_replay_items(
+            &[TodoInstruction::Squash {
+                commit: "aaaaaaa".into(),
+            }],
+            &known,
+        )
+        .expect_err("leading squash is G5");
+        assert_eq!(err, InteractiveReplayError::LeadingFold("squash"));
+
+        let mapped = interactive_replay_items(
+            &[
+                TodoInstruction::Pick {
+                    commit: "aaaaaaa".into(),
+                },
+                TodoInstruction::Fixup {
+                    commit: "bbbbbbb".into(),
+                    flag: Some(crate::command::rebase_todo::FixupFlag::KeepThis),
+                },
+                TodoInstruction::Fixup {
+                    commit: "ccccccc".into(),
+                    flag: Some(crate::command::rebase_todo::FixupFlag::Reword),
+                },
+            ],
+            &known,
+        )
+        .expect("fixup -C/-c");
+        assert_eq!(
+            mapped,
+            vec![
+                (a, RebaseTodoAction::Pick),
+                (b, RebaseTodoAction::FixupKeep),
+                (c, RebaseTodoAction::FixupKeepEdit),
+            ]
+        );
+
+        let stops = interactive_replay_items(
+            &[
+                TodoInstruction::Pick {
+                    commit: "aaaaaaa".into(),
+                },
+                TodoInstruction::Edit {
+                    commit: "bbbbbbb".into(),
+                },
+                TodoInstruction::Exec { cmd: "true".into() },
+                TodoInstruction::Break,
+            ],
+            &known,
+        )
+        .expect("edit/break/exec");
+        assert_eq!(
+            stops,
+            vec![(a, RebaseTodoAction::Pick), (b, RebaseTodoAction::Edit)]
+        );
+    }
+
+    #[test]
+    fn interactive_stop_messages_match_git_shape() {
+        assert_eq!(
+            super::format_stopped_at_edit("92d4069", "B"),
+            "Stopped at 92d4069...  B\n\
+You can amend the commit now with\n\
+\n\
+\tlibra commit --amend\n\
+\n\
+Once you are satisfied with your changes, run\n\
+\n\
+\tlibra rebase --continue"
+        );
+        assert_eq!(
+            super::format_stopped_at_break("92d4069", "B"),
+            "Stopped at 92d4069 (B)"
+        );
     }
 
     #[test]
@@ -4421,6 +6134,19 @@ mod tests {
             code_of(RebaseError::Finalize("ignored".to_string())),
             StableErrorCode::IoWriteFailed,
         );
+        assert_eq!(
+            code_of(RebaseError::InteractiveTodoHalted(
+                "invalid command".to_string()
+            )),
+            StableErrorCode::RepoStateInvalid,
+        );
+        assert_eq!(
+            code_of(RebaseError::InteractiveExecFailed {
+                command: "false".to_string(),
+                detail: String::new(),
+            }),
+            StableErrorCode::ConflictOperationBlocked,
+        );
     }
 
     #[test]
@@ -4649,8 +6375,23 @@ async fn replay_commit_with_unified_merge(
         Err(e) => return ReplayResult::internal(ReplayErrorKind::CommitLoad, e.to_string()),
     };
 
-    if commit_to_replay.parent_commit_ids.is_empty() {
-        return ReplayResult::internal(ReplayErrorKind::MissingParent, "commit has no parents");
+    // Unchanged pick: already parented on the new base, or `--root` without
+    // `--onto` replaying the original root onto itself. Reuse the original
+    // object so `--autosquash` on a linear history without fixup/squash and
+    // `--root` on an unchanged history keep the original hashes (ADR-HF-12,
+    // ADR-HF-13). Restore the index/worktree: start detaches HEAD to the
+    // landing commit first, so a reuse-only replay would otherwise leave the
+    // tree at the pre-rebase tip or the newbase.
+    if action == RebaseTodoAction::Pick
+        && (commit_to_replay.parent_commit_ids.first() == Some(new_parent_id)
+            || commit_to_replay_id == new_parent_id)
+    {
+        if let Err(error) =
+            restore_replay_index_and_workdir(&current_index, &index_file, &commit_to_replay.tree_id)
+        {
+            return error;
+        }
+        return ReplayResult::Success(*commit_to_replay_id);
     }
     let mut base_commits = Vec::with_capacity(commit_to_replay.parent_commit_ids.len());
     for parent_id in &commit_to_replay.parent_commit_ids {
@@ -4665,7 +6406,7 @@ async fn replay_commit_with_unified_merge(
     // A flattened rebase still uses the first-parent comparison for its
     // historical `--empty=drop` decision. The tree merge itself receives all
     // parents and therefore uses a recursive virtual base for merge commits.
-    let first_base_commit = &base_commits[0];
+    // `--root --onto` replays a parentless commit against an empty base.
     let our_commit: Commit = match load_object(new_parent_id) {
         Ok(commit) => commit,
         Err(error) => {
@@ -4693,10 +6434,15 @@ async fn replay_commit_with_unified_merge(
     // `--no-keep-empty` up front): the replayed commit's tree differs from its
     // original parent, confirming it introduced a change. The index/worktree
     // already equal the new parent when the result tree matches it, so no
-    // mutation is needed before skipping.
-    if empty_mode == RebaseEmptyMode::Drop
-        && new_tree_id == our_commit.tree_id
-        && commit_to_replay.tree_id != first_base_commit.tree_id
+    // mutation is needed before skipping. A parentless root is originally empty
+    // only when its tree has no entries.
+    let originally_empty = match base_commits.first() {
+        Some(first_base_commit) => commit_to_replay.tree_id == first_base_commit.tree_id,
+        None => load_object::<Tree>(&commit_to_replay.tree_id)
+            .map(|tree| tree.tree_items.is_empty())
+            .unwrap_or(false),
+    };
+    if empty_mode == RebaseEmptyMode::Drop && new_tree_id == our_commit.tree_id && !originally_empty
     {
         let subject = commit_subject_from_message(&commit_to_replay.message);
         return ReplayResult::BecameEmptyDropped { subject };
@@ -4731,23 +6477,48 @@ async fn replay_commit_with_unified_merge(
         return ReplayResult::internal(ReplayErrorKind::CommitSave, error.to_string());
     }
 
-    // Update index and working directory
-    let mut index = git_internal::internal::index::Index::new();
-    let new_tree: Tree = match load_object(&new_tree_id) {
-        Ok(tree) => tree,
-        Err(e) => return ReplayResult::internal(ReplayErrorKind::NewTreeLoad, e.to_string()),
-    };
-    if let Err(e) = rebuild_index_from_tree(&new_tree, &mut index, "") {
-        return ReplayResult::internal(ReplayErrorKind::IndexRebuild, e.to_string());
-    }
-    if let Err(e) = index.save(&index_file) {
-        return ReplayResult::internal(ReplayErrorKind::IndexSave, e.to_string());
-    }
-    if let Err(e) = reset_workdir_tracked_only(&current_index, &index) {
-        return ReplayResult::internal(ReplayErrorKind::WorkdirReset, e.to_string());
+    if let Err(error) = restore_replay_index_and_workdir(&current_index, &index_file, &new_tree_id)
+    {
+        return error;
     }
 
     ReplayResult::Success(new_commit.id)
+}
+
+fn restore_replay_index_and_workdir(
+    current_index: &git_internal::internal::index::Index,
+    index_file: &std::path::Path,
+    tree_id: &ObjectHash,
+) -> Result<(), ReplayResult> {
+    let new_tree: Tree = match load_object(tree_id) {
+        Ok(tree) => tree,
+        Err(e) => {
+            return Err(ReplayResult::internal(
+                ReplayErrorKind::NewTreeLoad,
+                e.to_string(),
+            ));
+        }
+    };
+    let mut index = git_internal::internal::index::Index::new();
+    if let Err(e) = rebuild_index_from_tree(&new_tree, &mut index, "") {
+        return Err(ReplayResult::internal(
+            ReplayErrorKind::IndexRebuild,
+            e.to_string(),
+        ));
+    }
+    if let Err(e) = index.save(index_file) {
+        return Err(ReplayResult::internal(
+            ReplayErrorKind::IndexSave,
+            e.to_string(),
+        ));
+    }
+    if let Err(e) = reset_workdir_tracked_only(current_index, &index) {
+        return Err(ReplayResult::internal(
+            ReplayErrorKind::WorkdirReset,
+            e.to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Why building a replayed commit failed. A missing identity is a configuration
@@ -4810,9 +6581,9 @@ async fn create_replayed_commit(
         RebaseTodoAction::Squash => {
             let target: Commit = load_object(&new_parent_id)
                 .map_err(|error| ReplayCommitError::ObjectLoad(error.to_string()))?;
-            let mut message = target.message.clone();
-            message.push_str("\n\n");
-            message.push_str(original_commit.message.trim());
+            let (target_clean, _) = parse_commit_msg(&target.message);
+            let (this_clean, _) = parse_commit_msg(&original_commit.message);
+            let message = format!("{}\n\n{}", target_clean.trim(), this_clean.trim());
             Ok(Commit::new(
                 target.author.clone(),
                 committer,
@@ -4831,6 +6602,25 @@ async fn create_replayed_commit(
                 tree_id,
                 target.parent_commit_ids.clone(),
                 &message,
+            ))
+        }
+        RebaseTodoAction::Reword | RebaseTodoAction::Edit => Ok(Commit::new(
+            original_commit.author.clone(),
+            committer,
+            tree_id,
+            vec![new_parent_id],
+            &original_commit.message,
+        )),
+        RebaseTodoAction::FixupKeep | RebaseTodoAction::FixupKeepEdit => {
+            let target: Commit = load_object(&new_parent_id)
+                .map_err(|error| ReplayCommitError::ObjectLoad(error.to_string()))?;
+            let (this_clean, _) = parse_commit_msg(&original_commit.message);
+            Ok(Commit::new(
+                target.author.clone(),
+                committer,
+                tree_id,
+                target.parent_commit_ids.clone(),
+                this_clean.trim(),
             ))
         }
     }
@@ -4881,6 +6671,23 @@ async fn commit_starts_empty(commit_id: &ObjectHash) -> bool {
 ///
 /// The commits are returned in chronological order (oldest first) so they
 /// can be replayed in the correct sequence.
+/// First-parent walk from `head_id` inclusive through the root commit,
+/// oldest first. Used by `rebase --root` (ADR-HF-13).
+async fn collect_commits_from_root(head_id: &ObjectHash) -> Result<Vec<ObjectHash>, String> {
+    let mut commits = Vec::new();
+    let mut current_id = *head_id;
+    loop {
+        commits.push(current_id);
+        let commit: Commit = load_object(&current_id).map_err(|e| e.to_string())?;
+        if commit.parent_commit_ids.is_empty() {
+            break;
+        }
+        current_id = commit.parent_commit_ids[0];
+    }
+    commits.reverse();
+    Ok(commits)
+}
+
 async fn collect_commits_to_replay(
     base_id: &ObjectHash,
     head_id: &ObjectHash,

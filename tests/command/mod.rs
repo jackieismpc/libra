@@ -262,6 +262,13 @@ fn run_libra_command(args: &[&str], cwd: &Path) -> Output {
 }
 
 #[allow(dead_code)]
+fn run_libra_command_with_env(args: &[&str], cwd: &Path, extra_env: &[(&str, &str)]) -> Output {
+    spawn_libra_command_with_env(args, cwd, extra_env)
+        .wait_with_output()
+        .expect("failed to execute libra binary")
+}
+
+#[allow(dead_code)]
 fn spawn_libra_command_with_env(
     args: &[&str],
     cwd: &Path,
@@ -530,6 +537,7 @@ fn cli_spawn_limit_rejects_zero_and_garbage() {
 
 mod add_cli_test;
 mod add_json_test;
+mod add_patch_test;
 mod add_test;
 mod agent_bridge_test;
 mod agent_checkpoint_export_test;
@@ -641,6 +649,7 @@ mod push_error_test;
 mod push_json_test;
 mod push_test;
 mod read_tree_test;
+mod rebase_interactive_test;
 mod rebase_test;
 mod reflog_test;
 mod remote_test;
@@ -648,6 +657,7 @@ mod remove_test;
 mod repack_test;
 mod replace_test;
 mod rerere_test;
+mod reset_patch_test;
 mod reset_test;
 mod restore_test;
 mod rev_list_test;

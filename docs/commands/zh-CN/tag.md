@@ -5,7 +5,7 @@
 ## 概要
 
 ```
-libra tag [<name>] [-m <message> | -F <file>] [-e] [-f]
+libra tag [<name>] [-a] [-m <message> | -F <file>] [-e] [-f]
 libra tag -l [-n <lines>] [--column[=<mode>]]
 libra tag -d <name>
 ```
@@ -14,7 +14,7 @@ libra tag -d <name>
 
 `libra tag` 管理轻量标签和附注标签。轻量标签只是指向提交的具名指针，而附注标签会存储带有消息、打标签者身份和时间戳的完整标签对象。
 
-不带参数（或带 `-l`）时，命令列出所有标签。给出名称时，它会在 HEAD 处创建新标签。添加 `-m <message>` 会创建附注标签，而不是轻量标签；`-F <file>` 则从文件（或 `-` 表示 stdin）读取附注消息（与 `-m` 互斥）；`-e`/`--edit` 在编辑器中撰写消息（有 `-m`/`-F` 时预填），因 Libra 无独立的 `-a`，`-e` 也是创建附注标签的路径。`-f` 标志允许覆盖同名已有标签。
+不带参数（或带 `-l`）时，命令列出所有标签。给出名称时，它会在 HEAD 处创建新标签。添加 `-a`/`--annotate`、`-m <message>` 或 `-F <file>`（从文件或 `-` 表示 stdin 读取消息）会创建附注标签，而不是轻量标签；单独使用 `-a` 会打开编辑器，`-e`/`--edit` 在编辑器中撰写消息（有 `-m`/`-F` 时预填）。与 `-d`/`-l`/`-v` 组合时，`-a` 为用法错误。`-f` 标志允许覆盖同名已有标签。
 
 标签引用与分支引用一起存储在 SQLite 数据库中，提供相同的事务保证。
 
@@ -25,9 +25,10 @@ libra tag -d <name>
 | | `<name>` | 位置参数（可选） | 要创建、显示或删除的标签名 |
 | `-l` | `--list` | | 列出所有标签 |
 | `-d` | `--delete` | | 删除具名标签 |
+| `-a` | `--annotate` | | 创建附注标签。单独使用时打开编辑器（清理后为空则中止且不写 ref）。与 `-m`/`-F`/`-e` 组合时创建附注标签；与 `-d`/`-l`/`-v` 组合为用法错误。 |
 | `-m` | `--message` | `<msg>` | 使用给定消息创建附注标签 |
 | `-F` | `--file` | `<file>` | 创建附注标签，从文件读取消息（`-` 表示 stdin）。与 `-m` 互斥。 |
-| `-e` | `--edit` | | 打开编辑器撰写或编辑附注标签消息。有 `-m`/`-F` 时编辑器以该消息预填，否则撰写新消息（Libra 无独立的 `-a`，故 `-e` 是经编辑器创建附注标签的方式）。注释行被剥离；结果为空则中止。 |
+| `-e` | `--edit` | | 打开编辑器撰写或编辑附注标签消息。有 `-m`/`-F` 时编辑器以该消息预填，否则撰写新消息。单独使用 `-a` 走同一编辑器路径。注释行被剥离；结果为空则中止。 |
 | `-f` | `--force` | | 覆盖已有标签 |
 | `-n` | `--n-lines` | `<lines>` | 列出时显示的附注行数（0 = 只显示名称） |
 | | `--column` | `[options]` | 以多列布局列出标签。逗号/空格分隔的选项：启用 `always`/`auto`/`never`（缺省 = `always`）、填充顺序 `column`（自上而下，默认）/ `row`（自左而右）/ `plain`（单列）、列宽 `dense`（每列自适应）/ `nodense`（等宽，默认）。与 `git tag --column` 字节一致。不能与 `-n` 同用。 |
@@ -48,6 +49,7 @@ libra tag -d <name>
 libra tag v1.0
 
 # 创建带消息的附注标签
+libra tag -a -m "Release v1.1" v1.1
 libra tag -m "Release v1.1" v1.1
 
 # 从文件（或 stdin，用 -）读取消息创建附注标签
@@ -74,6 +76,7 @@ libra tag --json v1.0
 
 ```bash
 libra tag v1.0                        # 在 HEAD 创建轻量标签
+libra tag -a -m "Release v1.1" v1.1   # 创建附注标签
 libra tag -m "Release v1.1" v1.1      # 创建附注标签
 libra tag -l -n 2                     # 列出标签，最多显示 2 行附注
 libra tag -d v1.0                     # 删除标签
@@ -174,16 +177,16 @@ Git 的 `--sign` 用 GPG 生成嵌入标签对象的内联 PGP 签名。Libra **
 
 ### 为什么区分轻量标签和附注标签？
 
-Libra 保留 Git 的两层标签模型，以保持磁盘格式兼容。轻量标签是简单 ref 指针（适合临时标记），而附注标签存储对发布有用的元数据。消息来源是开关：提供 `-m`、`-F` 或 `-e`（在编辑器中撰写消息）时创建附注标签，都不提供时创建轻量标签。因 Libra 无独立的 `-a`，`-e` 是经编辑器创建附注标签的路径（Git 需配合 `-a`/`-m`/`-F` 才用 `-e`）；其余两层模型与 Git 一致，让从 Git 迁移的用户保持一致心智模型。
+Libra 保留 Git 的两层标签模型，以保持磁盘格式兼容。轻量标签是简单 ref 指针（适合临时标记），而附注标签存储对发布有用的元数据。消息来源是开关：提供 `-a`、`-m`、`-F` 或 `-e`（在编辑器中撰写消息）时创建附注标签，都不提供时创建轻量标签。单独使用 `-a` 会打开编辑器，与 `git tag -a` 一致。
 
 ## 参数对比：Libra vs Git vs jj
 
 | 功能 | Git | Libra | jj |
 |---------|-----|-------|----|
 | 创建轻量标签 | `git tag <name>` | `libra tag <name>` | `jj tag create <name>` |
-| 创建附注标签 | `git tag -a -m "msg" <name>` | `libra tag -m "msg" <name>` | 不支持（仅轻量） |
+| 创建附注标签 | `git tag -a -m "msg" <name>` | `libra tag -a -m "msg" <name>`（或 `-m` / `-F` / `-e`） | 不支持（仅轻量） |
 | 从文件读取附注消息 | `git tag -F <file> <name>` | `libra tag -F <file> <name>`（`-` 表示 stdin） | N/A |
-| 编辑器编辑消息 | `git tag -e <name>`（配合 `-a`/`-m`/`-F`） | `libra tag -e <name>`（撰写附注消息；`-m`/`-F` 预填；无独立 `-a`） | N/A |
+| 编辑器编辑消息 | `git tag -e <name>`（配合 `-a`/`-m`/`-F`） | `libra tag -a <name>` 或 `libra tag -e <name>`（撰写附注消息；`-m`/`-F` 预填） | N/A |
 | 列出标签 | `git tag -l` | `libra tag -l` | `jj tag list` |
 | 带消息列出 | `git tag -l -n3` | `libra tag -l -n 3` | N/A |
 | 多列布局 | `git tag --column[=<options>]` | `libra tag --column[=<options>]`（always/auto/never + column/row/plain + dense/nodense；`--no-column` 撤销） | N/A |

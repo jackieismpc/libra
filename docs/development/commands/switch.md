@@ -51,6 +51,7 @@ flowchart TD
 - 用户文档：`docs/commands/switch.md`。
 - Synopsis：`libra switch [-c|--create <CREATE>] [-C|--force-create <FORCE_CREATE>] [--orphan <ORPHAN>] [-d|--detach] [-t|--track] [-f|--force] [--guess] [--no-guess] [--no-progress] [<BRANCH>]`。
 - 公开参数/子命令包括：`<branch>`（其中字面量 `-` 表示上一 checkout 目标）、`-c, --create <CREATE> [<start-point>]`、`-C, --force-create <FORCE_CREATE> [<start-point>]`、`--orphan <ORPHAN>`、`-d, --detach`、`-t, --track`、`-f, --force`（别名 `--discard-changes`）、`--guess`、`--no-guess`、`--no-progress`（接受式 no-op：Libra 的 switch 从不渲染进度条；字段 `no_progress` 在解构 `SwitchArgs` 时以 `_` 绑定、不被读取）。`switch -` 解析分支或 detached target 后继续复用相同 clean/untracked/case-collision/worktree guard；成功移动写 `switch` HEAD reflog，因而再次执行会切回。`-c` / `-C` 成功后 `HEAD` 保持为目标分支 symbolic ref；无效 start-point 在写 HEAD/ref 前 fail-closed。`--orphan` 设置 unborn symbolic HEAD，不创建占位 commit/branch ref，不恢复空树；首个用户提交从保留的 index 生成无 parent root commit。已有同名分支、当前分支名、其它 worktree 已 checkout 的 unborn 名称、额外 start-point 均 fail-closed。
+- `#477` HF-10：裸 `switch --detach` 在当前 HEAD 提交处分离且不恢复工作树；未诞生 HEAD 为 `You are on a branch yet to be born`（128 / `LBR-REPO-003`）。带目标的 `--detach` 仍走原 restore 路径。
 - `-f, --force`：切换到不同提交时丢弃本地（已跟踪）改动而非因 dirty 工作区报错；仍通过 `ensure_no_untracked_overwrite` 守卫会被覆盖的未跟踪文件。实现为 `ensure_switch_clean_or_force(force, target, output)`，作用于会改变工作树的 5 个 `_for_commit` 预检点（track/create 带 start-point/force-create 带 start-point/detach/普通分支切换）。**部分实现差异**：不改变树的路径（`-c` 无 start-point、`--orphan`）仍要求干净工作区；orphan 不接受 `-f` 绕过 dirty index/worktree，因为保留 index 是首个 root commit 的语义基础。
 - `--track` 现已提供 Git 的 `-t` 短别名；Libra 仅支持布尔形式（设置远端上游），不支持 Git 的 `-t (direct|inherit)` 模式参数（有意差异）。
 - `--guess` / `--no-guess`：当 `<branch>` 不是本地分支但恰好唯一匹配某个远端跟踪分支时，自动创建同名本地跟踪分支并切换（Git 的 DWIM 行为，复用 `--track` 的 `switch_to_tracked_remote_branch` 路径，输出 `created=true` 与 `tracking`）。默认开启，按 `--no-guess` > `--guess` > `checkout.guess`（默认 `true`）的优先级解析；`--no-guess` 强制要求本地分支或显式 `--track <remote>/<branch>`。多个远端同名时返回歧义错误（`ConflictOperationBlocked`，退出码 128），`checkout.defaultRemote` 可消歧。`remote/branch` 形式仍按 Git `switch` 语义报 `GotRemoteBranch` 并提示使用 `--track`，不受 guess 影响。
@@ -69,3 +70,7 @@ flowchart TD
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
+
+## Issue #477 notes
+
+裸 --detach 在当前 HEAD 处分离

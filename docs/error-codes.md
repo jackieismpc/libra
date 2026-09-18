@@ -55,6 +55,12 @@ when the object is missing.
 
 Set `LIBRA_FINE_EXIT_CODES=1` to re-enable the legacy fine-grained exit codes (2-8) described in the migration section below. When this variable is unset or `0`, Libra uses the Git-standard codes shown above.
 
+### Per-command exit-code overrides
+
+`CliError::with_exit_code` wins over both the Git-standard 128/129 mapping and `LIBRA_FINE_EXIT_CODES=1`. The stable `error_code` is unchanged.
+
+- `branch -d` / `--delete` refusals (not fully merged, missing branch, currently checked-out branch) exit **1**. Codes stay `LBR-REPO-003` or `LBR-CLI-003`.
+
 Bridge `LBR-AGENT-024..038` errors are **frame errors**: `libra agent bridge --stdio` answers them as JSON-RPC 2.0 error frames on stdout and keeps serving the next NDJSON line — the bridge process does not exit with `128`. Their exit-code column is marked `frame` accordingly. `LBR-AGENT-039..040` are normal controlled `review --fix` or `investigate fix` CLI outcomes and exit `128`.
 
 ## Migration From Fine-Grained Exit Codes

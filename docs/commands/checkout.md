@@ -49,7 +49,7 @@ already-current branch does not invoke it. Set
 | `-B` | | `<name>` | Force-create a branch from `[<start-point>]` or the current HEAD and switch to it; resets an existing branch to that commit |
 | | `[<start-point>]` | positional | Optional commit, tag, or branch used with `-b` / `-B` as the new branch tip |
 | | `--orphan` | `<name>` | Create an unborn orphan branch, preserve the index/worktree, and switch HEAD to it. A separate start-point is not supported. |
-| `-d` | `--detach` | | Detach HEAD at the named commit even when it is a branch (instead of switching to the branch) |
+| `-d` | `--detach` | | Detach HEAD at the named commit even when it is a branch. With no target, detach at the current HEAD instead of showing the current branch (unborn HEAD is refused: `You are on a branch yet to be born`, `LBR-REPO-003`, exit 128) |
 | `-t` | `--track` | | Set up upstream tracking when checking out a remote-tracking branch. Accepted as a no-op: Libra always configures tracking for a remote-tracking checkout (DWIM), so this requests behavior Libra already performs; no effect for a non-remote target. Use `libra switch --track` for explicit, standalone tracking. |
 | | `--ignore-other-worktrees` | | Accepted for CLI compatibility, but **does NOT** bypass Libra's other-worktree safety guard (intentionally-different from Git): Libra never allows the same shared branch checked out in two worktrees. It is a silent no-op in a single-worktree repo; against a real collision the checkout is still refused. |
 | | `--no-progress` | | Do not show a progress meter. Accepted as a no-op: Libra's checkout never renders a progress meter. |
@@ -286,6 +286,8 @@ When `libra checkout feature` finds `origin/feature` but no local `feature` bran
 | Track remote branch | `git checkout -t`/`--track <remote>/<branch>` | `libra checkout -t`/`--track` (accepted no-op; DWIM always tracks) | N/A |
 | Structured output | No | `--json` / `--machine` for branch compatibility actions | `--template` |
 
+Remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001` (`-p`/`--patch` and `--[no-]auto-advance`, D15). Use `libra checkout <pathspec>` or `libra restore <pathspec>`.
+
 ## Error Handling
 
 `checkout` has a typed `CheckoutError` for checkout-owned failures and delegates path restore failures to `restore` while preserving stable codes.
@@ -306,3 +308,8 @@ When `libra checkout feature` finds `origin/feature` but no local `feature` bran
 | Current branch (no-op) | N/A | Prints "Already on {branch}" and succeeds | 0 |
 | Branch storage query failure | `LBR-IO-001` | "failed to resolve checkout target: {detail}" | 128 |
 | Corrupt branch reference | `LBR-REPO-002` | "failed to resolve checkout target: {detail}" | 128 |
+
+## Issue #477 notes
+
+remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001`
+`--detach` with no target detaches at the current commit

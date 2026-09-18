@@ -145,3 +145,43 @@ fn corrupt_index_reports_fatal_without_panic() {
     assert!(!stderr.contains("thread 'main' panicked"));
     assert!(!stderr.contains("stack backtrace"));
 }
+
+/// M-DECLINED X1 / X7: `add -i` is a stable unsupported refusal, not a usage hint.
+#[test]
+fn interactive_flag_is_unsupported_and_atomic() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    fs::write(repo.join("good.txt"), "good").unwrap();
+
+    let output = run_libra(&["add", "-i", "good.txt"], &repo);
+    assert_eq!(output.status.code(), Some(128));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("LBR-UNSUPPORTED-001"), "{stderr}");
+    assert!(
+        stderr.contains("interactive add is not supported"),
+        "{stderr}"
+    );
+
+    let status = run_libra(&["status", "--short"], &repo);
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        !stdout.contains("A  good.txt"),
+        "add -i must not stage: {stdout}"
+    );
+}
+
+/// M-DECLINED X6: an unknown add flag stays a 129 usage error.
+#[test]
+fn unknown_flag_stays_cli_invalid() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    fs::write(repo.join("good.txt"), "good").unwrap();
+
+    let output = run_libra(&["add", "--bogus", "good.txt"], &repo);
+    assert_eq!(output.status.code(), Some(129));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("LBR-CLI-002"), "{stderr}");
+    assert!(!stderr.contains("LBR-UNSUPPORTED-001"), "{stderr}");
+}

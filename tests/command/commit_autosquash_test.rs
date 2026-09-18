@@ -379,3 +379,65 @@ fn commit_verbose_config_default_on() {
         "commit.verbose=true should append the scissors block, saw: {seen}"
     );
 }
+
+/// M-RI Q3 (HF-24): `commit --squash=<A>` then `rebase -i --autosquash`.
+#[cfg(unix)]
+#[test]
+fn test_commit_squash_then_rebase_i_autosquash() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    write_and_add(&repo, "init.txt", "init\n");
+    commit(&repo, "init");
+    write_and_add(&repo, "a.txt", "A body\n");
+    commit(&repo, "A");
+    let a = head_commit(&repo);
+
+    write_and_add(&repo, "a.txt", "A body\nsquash extra\n");
+    let squash = run_libra(&["commit", "--squash", &a], &repo);
+    assert_eq!(
+        squash.status.code(),
+        Some(0),
+        "commit --squash: {}",
+        String::from_utf8_lossy(&squash.stderr)
+    );
+    assert!(
+        last_commit_message(&repo).contains("squash! A"),
+        "expected squash! subject: {}",
+        last_commit_message(&repo)
+    );
+
+    let captured = repo.join(".q3.todo");
+    let editor = write_editor_script(
+        &repo,
+        "q3-capture.sh",
+        &format!("#!/bin/sh\ncp \"$1\" '{}'\n", captured.display()),
+    );
+    let rebase = run_libra_env(
+        &["rebase", "-i", "--autosquash", "HEAD~2"],
+        &repo,
+        &[("GIT_SEQUENCE_EDITOR", &editor)],
+    );
+    assert_eq!(
+        rebase.status.code(),
+        Some(0),
+        "Q3 rebase -i --autosquash: {}",
+        String::from_utf8_lossy(&rebase.stderr)
+    );
+    let todo = fs::read_to_string(&captured).expect("Q3 todo");
+    assert!(
+        todo.contains("squash ") && todo.contains(&a[..7.min(a.len())]),
+        "Q3 todo must mark the squash commit: {todo}"
+    );
+    let message = last_commit_message(&repo);
+    assert!(
+        message.contains("A") && (message.contains("squash") || message.contains("A body")),
+        "Q3 final message must keep A and the squash body: {message}"
+    );
+    let log_out = run_libra(&["log", "--oneline"], &repo);
+    let log = String::from_utf8_lossy(&log_out.stdout);
+    assert!(
+        !log.contains("squash!"),
+        "Q3 must fold the squash commit: {log}"
+    );
+}

@@ -6205,7 +6205,11 @@ async fn resolve_upstream_info(
 
     let remote = &branch_config.remote;
     let merge_branch = &branch_config.merge;
-    let remote_ref_display = format!("{remote}/{merge_branch}");
+    let remote_ref_display = if remote == "." {
+        merge_branch.clone()
+    } else {
+        format!("{remote}/{merge_branch}")
+    };
 
     // Tracking refs are stored under their fully-qualified
     // `refs/remotes/<remote>/<branch>` name (clone/fetch/push writers), so the
@@ -6213,15 +6217,21 @@ async fn resolve_upstream_info(
     // every fresh clone report "upstream is gone" (#464). The short-name probe
     // is kept as a fallback for repositories written before the
     // fully-qualified convention.
-    let tracking_full_ref = format!("refs/remotes/{remote}/{merge_branch}");
-    let tracking_branch = Branch::find_branch_result(&tracking_full_ref, Some(remote))
-        .await
-        .map_err(|error| status_branch_store_error("resolve upstream branch", error))?;
-    let tracking_branch = match tracking_branch {
-        Some(branch) => Some(branch),
-        None => Branch::find_branch_result(merge_branch, Some(remote))
+    let tracking_branch = if remote == "." {
+        Branch::find_branch_result(merge_branch, None)
             .await
-            .map_err(|error| status_branch_store_error("resolve upstream branch", error))?,
+            .map_err(|error| status_branch_store_error("resolve upstream branch", error))?
+    } else {
+        let tracking_full_ref = format!("refs/remotes/{remote}/{merge_branch}");
+        let tracking_branch = Branch::find_branch_result(&tracking_full_ref, Some(remote))
+            .await
+            .map_err(|error| status_branch_store_error("resolve upstream branch", error))?;
+        match tracking_branch {
+            Some(branch) => Some(branch),
+            None => Branch::find_branch_result(merge_branch, Some(remote))
+                .await
+                .map_err(|error| status_branch_store_error("resolve upstream branch", error))?,
+        }
     };
 
     let tracking_commit = match tracking_branch {

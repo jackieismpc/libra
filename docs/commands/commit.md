@@ -47,6 +47,22 @@ resolution (for example `libra update-index --cacheinfo 160000,<commit>,<path>`)
 Libra does not materialize submodules, so `-a` cannot infer deletion from an
 absent submodule directory. Dry-run and porcelain previews preserve the live
 index, `HEAD`, and worktree, including when `-a` previews a resolution.
+A successful non-`--dry-run` commit that updates HEAD also
+clears a stopped single-commit cherry-pick or revert (or a sequence sitting on
+its last item). A multi-commit sequence is kept and the stopped item is
+recorded as concluded. `--dry-run` and `--porcelain` leave that state unchanged.
+
+When a merge is in progress, `commit` finishes it: the new commit has HEAD plus
+the recorded merge target(s) as parents, the message defaults to the saved merge
+message (editor mode strips `# Conflicts:` comments; `--no-edit` keeps them;
+`-m`/`-F` override), then merge state is cleared and a held autostash is
+applied. `--amend` during a merge is refused (exit 128). `--dry-run` writes
+nothing, keeps merge state, and prints a preview instead of a fake
+`[branch hash]` line. After `merge --squash`, the following commit is
+single-parent, prefills `SQUASH_MSG`, and deletes that file. Partial
+`commit <path>` / `commit -o <path>` remains a usage error (exit 129; Git
+exits 128).
+
 For a deleted conflict, use `commit -a` only when all tracked changes belong in
 the commit. A parent replaced by a file or symlink makes its tracked children
 deletions; `-a` never reads through that symlink. Replacing a conflicted file with
@@ -80,6 +96,12 @@ message is the initial buffer). Conflicts with `--no-edit`.
 libra commit -e -m "Draft message"
 ```
 
+### `--allow-empty-message`
+
+Allow a commit whose message is empty after cleanup. This also bypasses the
+unedited-template abort. It does **not** imply `--allow-empty` (an empty index
+still needs that flag). A `commit-msg` hook can still reject the empty file.
+
 ### `-t, --template <FILE>`
 
 Use the contents of `FILE` as the initial commit message. With the editor open (the default
@@ -88,7 +110,9 @@ used directly. When the `-t` flag is unset, the `commit.template` config (a file
 leading `~/` expanded to `$HOME`) is consulted. The template is **ignored** when a message
 source (`-m`/`-F`/`-C`/`-c`/`--fixup`/`--squash`) is given — that source wins and the template
 file is not even read. As in Git, if the editor leaves the template unchanged the commit is
-aborted ("you did not edit the message"); `--no-edit` bypasses that check.
+aborted ("you did not edit the message"); a template that cleans to an empty message
+(comment-only under `strip`/`default`) reports `aborting commit due to empty commit message`
+instead. `--no-edit` bypasses the unedited-template check.
 
 ```bash
 libra commit -t .libra/commit-template.txt
@@ -690,6 +714,8 @@ candidate OIDs while holding that fence through the prune transaction. With
 | Index object missing or wrong type | `LBR-REPO-002` | 128 | "run 'libra fsck' to inspect missing or mistyped objects" |
 | Failed to save index | `LBR-IO-002` | 128 | -- |
 | Nothing to commit (clean) | `LBR-REPO-003` | 128 | "use 'libra add' to stage changes" |
+| Nothing added (untracked only) | `LBR-REPO-003` | 128 | "use 'libra add' to track files" |
+| No changes added (unstaged tracked) | `LBR-REPO-003` | 128 | "use 'libra add' and/or 'libra commit -a'" |
 | Nothing to commit (no tracked) | `LBR-REPO-003` | 128 | "create/copy files and use 'libra add' to track" |
 | Author identity missing | `LBR-AUTH-001` | 128 | "run 'libra config user.name ...' and 'libra config user.email ...'" |
 | No commit to amend | `LBR-REPO-003` | 128 | "create a commit before using --amend" |
@@ -720,3 +746,11 @@ candidate OIDs while holding that fence through the prune transaction. With
 - `--fixup` and `--squash` are supported (autosquash markers); `--cleanup=<mode>` controls comment/scissors stripping
 - Vault signing replaces the external keyring; `commit.gpgSign` is honored while `user.signingkey` remains vault-managed
 - Change identity is stored in the sidecar projection (`change_identity`/`change_revision`); Libra does not write a `change-id` commit header. Existing headers are import-compatible metadata only.
+- Remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001` (`-p`/`--patch`/`--interactive`, D15). Stage paths with `libra add <pathspec>` then commit.
+
+## Issue #477 notes
+
+concludes an in-progress merge with a two-parent commit
+no changes added to commit (use "libra add" and/or "libra commit -a")
+remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001`
+records a commit whose message is empty

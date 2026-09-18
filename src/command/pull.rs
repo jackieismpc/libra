@@ -203,6 +203,12 @@ pub(crate) enum PullError {
     #[error("remote '{0}' not found")]
     RemoteNotFound(String),
 
+    #[error(
+        "cannot pull: branch '{branch}' tracks a local upstream; \
+         network commands do not operate on local upstreams (issues/480 HP-16)"
+    )]
+    LocalUpstream { branch: String },
+
     #[error("pull failed during fetch phase: {0}")]
     Fetch(#[source] fetch::FetchError),
 
@@ -265,6 +271,15 @@ impl From<PullError> for CliError {
                     .with_stable_code(StableErrorCode::CliInvalidTarget)
                     .with_hint("use 'libra remote -v' to see configured remotes")
             }
+            PullError::LocalUpstream { branch } => CliError::command_usage(format!(
+                "cannot pull: branch '{branch}' tracks a local upstream; \
+                 network commands do not operate on local upstreams (issues/480 HP-16)"
+            ))
+            .with_stable_code(StableErrorCode::CliInvalidTarget)
+            .with_detail("remote", ".")
+            .with_detail("upstream_kind", "local")
+            .with_hint("use 'libra branch --unset-upstream' to clear the local upstream")
+            .with_hint("local-upstream network operations are tracked as issues/480 HP-16"),
             PullError::Fetch(error) => map_fetch_error_to_cli(&error).with_detail("phase", "fetch"),
             PullError::Merge(error) => map_merge_error_to_cli(&error).with_detail("phase", "merge"),
             PullError::Rebase(error) => CliError::from(error).with_detail("phase", "rebase"),
@@ -710,6 +725,11 @@ async fn resolve_pull_target(
             let Some(branch_config) = ConfigKv::branch_config(&branch).await.ok().flatten() else {
                 return Err(no_tracking_error(&branch, rebase).await);
             };
+            if branch_config.remote == "." {
+                return Err(PullError::LocalUpstream {
+                    branch: branch.clone(),
+                });
+            }
             let remote_config = ConfigKv::remote_config(&branch_config.remote)
                 .await
                 .ok()
@@ -1310,6 +1330,14 @@ mod tests {
         assert_eq!(
             PullError::RemoteNotFound("origin".to_string()).to_string(),
             "remote 'origin' not found",
+        );
+        assert_eq!(
+            PullError::LocalUpstream {
+                branch: "alpha".to_string(),
+            }
+            .to_string(),
+            "cannot pull: branch 'alpha' tracks a local upstream; \
+             network commands do not operate on local upstreams (issues/480 HP-16)",
         );
     }
 }

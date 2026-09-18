@@ -505,6 +505,9 @@ mod tests {
             renormalize: false,
             ignore_missing: false,
             resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         })
         .await;
 
@@ -584,6 +587,9 @@ mod tests {
             renormalize: false,
             ignore_missing: false,
             resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         })
         .await;
 
@@ -625,6 +631,9 @@ mod tests {
             renormalize: false,
             ignore_missing: false,
             resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         })
         .await;
 
@@ -713,6 +722,9 @@ mod tests {
             renormalize: false,
             ignore_missing: false,
             resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         })
         .await;
 

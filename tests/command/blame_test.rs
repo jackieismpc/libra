@@ -608,6 +608,9 @@ async fn prepare_history() -> (ObjectHash, ObjectHash) {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -639,6 +642,9 @@ async fn prepare_history() -> (ObjectHash, ObjectHash) {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -670,6 +676,9 @@ async fn commit_foo(message: &str) -> ObjectHash {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -761,6 +770,9 @@ async fn test_blame_empty_file_returns_empty_result() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {

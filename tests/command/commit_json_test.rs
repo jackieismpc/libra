@@ -331,3 +331,41 @@ fn json_commit_stdout_is_clean_json_only() {
         panic!("stdout should be valid JSON without any human text mixed in.\nstdout: {stdout}\nerror: {e}")
     });
 }
+
+/// M-EMPTY E10 (#477 HF-06): `--json log` renders an empty-message commit.
+#[test]
+fn json_commit_empty_message_subject() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    configure_identity(&repo);
+    fs::write(repo.join("f.txt"), "hello").unwrap();
+    assert!(run_libra(&["add", "f.txt"], &repo).status.success());
+    let commit = run_libra(
+        &[
+            "--json",
+            "commit",
+            "--allow-empty-message",
+            "-m",
+            "",
+            "--no-verify",
+        ],
+        &repo,
+    );
+    assert!(
+        commit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+
+    let log = run_libra(&["--json", "log", "-1"], &repo);
+    assert!(
+        log.status.success(),
+        "{}",
+        String::from_utf8_lossy(&log.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&log.stdout);
+    let value: Value =
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("json log: {e}\n{stdout}"));
+    assert_eq!(value["ok"], true);
+}

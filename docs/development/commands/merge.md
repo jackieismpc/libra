@@ -4,6 +4,9 @@
 
 `libra merge` 的目标是把一个或多个提交/分支合入当前 HEAD，覆盖 fast-forward、单头 three-way、多头 octopus、`ort`/`recursive`/`resolve`/`ours` strategy、冲突侧偏好、输入归一化与无关历史合并。实现需要处理冲突生命周期、autostash、rename detection、签名/策略兼容参数和 JSON 输出；`--ff`/`--ff-only`/`--no-ff`、可重复 `-s` 策略回退、`-X ours/theirs/ignore-space-*/renormalize/no-renormalize`、`--allow-unrelated-histories`、`--log[=<n>]`、vault merge-commit signing、`--rerere-autoupdate`/`--no-rerere-autoupdate` 与 `merge.ff`/`merge.log`/`merge.verifySignatures`/`merge.renormalize` 配置默认已支持，外部/`subtree`/显式 `octopus` strategy 与其它 strategy option 仍是未完成差异。
 
+- commit 结束进行中的 merge（#477 HF-27，ADR-HF-21）：`MergeState` 向 `commit` 暴露 `merge_commit_parents` / `merge_commit_message` / `conclude_merge_after_commit`；冲突消息附加 `# Conflicts:` 注释段。干净 `--squash` 写 `.libra/SQUASH_MSG`（`record_squash_message`），由随后的普通 `commit` 预填并删除。reset 提升 autostash 仍走 HF-26 的 `conclude_stopped_merge`，commit 则先清状态再 `resolve_pending_autostash_with` 应用。
+- 冲突标记标签（#477 HF-04，ADR-HF-05）：`GitConflictLabels` 是 merge / cherry-pick / revert 的单一 helper。merge 的对方标签是用户在命令行给出的目标原文（`side` / `refs/heads/side` / hash 前缀原样保留），`--restart` 从已保存的 `MergeState.target_ref` 重读；diff3 祖先为单一 merge-base 的 abbrev7（多个 merge-base 仍用 `base`）。rerere 以规范化 hunk 内容为键，不受标签影响。rename 临时名的分支标签与同一 `upstream` 同源。
+
 ## 对比 Git 与兼容性
 
 - 兼容级别：`partial`。fast-forward、单头 three-way、多头 octopus、`-s ort|recursive|resolve|ours`、单目标多策略回退、已列出的 `-X` favor/whitespace/renormalize 选项、`--allow-unrelated-histories`、`--log[=<n>]`/`--no-log`、冲突 lifecycle、autostash、历史 config、vault merge-commit signing、`--rerere-autoupdate`/`--no-rerere-autoupdate` 与显示 flags 已支持；外部/`subtree`/显式 `octopus` strategy 和其它 strategy option 延后。
@@ -269,3 +272,9 @@ MG-05 把「无法直接吸收的改名」一律退化成「未检测到改名�
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
+
+## Issue #477 notes
+
+reset concludes merge state through the merge module
+commit reads the in-progress merge state for parents and message
+single conflict-label helper

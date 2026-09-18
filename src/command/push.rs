@@ -250,6 +250,12 @@ pub enum PushError {
         suggestion: Option<String>,
     },
 
+    #[error(
+        "cannot push: branch '{branch}' tracks a local upstream; \
+         network commands do not operate on local upstreams (issues/480 HP-16)"
+    )]
+    LocalUpstream { branch: String },
+
     #[error("invalid refspec '{0}'")]
     InvalidRefspec(String),
 
@@ -403,6 +409,12 @@ impl From<PushError> for CliError {
                 }
                 err
             }
+            PushError::LocalUpstream { .. } => CliError::command_usage(error.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+                .with_detail("remote", ".")
+                .with_detail("upstream_kind", "local")
+                .with_hint("use 'libra branch --unset-upstream' to clear the local upstream")
+                .with_hint("local-upstream network operations are tracked as issues/480 HP-16"),
             PushError::InvalidRefspec(..) => CliError::command_usage(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("use '<name>' or '<src>:<dst>'"),
@@ -891,6 +903,11 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
         None => {
             let remote = ConfigKv::get_remote(&current_branch).await.ok().flatten();
             match remote {
+                Some(remote) if remote == "." => {
+                    return Err(PushError::LocalUpstream {
+                        branch: current_branch,
+                    });
+                }
                 Some(remote) => remote,
                 None => return Err(PushError::NoRemoteConfigured),
             }
@@ -4584,6 +4601,14 @@ mod test {
             }
             .to_string(),
             "remote 'upstream' not found",
+        );
+        assert_eq!(
+            PushError::LocalUpstream {
+                branch: "alpha".to_string(),
+            }
+            .to_string(),
+            "cannot push: branch 'alpha' tracks a local upstream; \
+             network commands do not operate on local upstreams (issues/480 HP-16)",
         );
         assert_eq!(
             PushError::InvalidRefspec("@invalid".to_string()).to_string(),

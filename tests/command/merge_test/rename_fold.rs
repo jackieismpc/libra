@@ -177,10 +177,9 @@ fn assert_fold_consumed(shape: Shape) {
     // Given: two independently resolved arms with the exact two bases above.
     let repo = crisscross(shape);
     let p = repo.path();
-    let target = run_libra_command(&["rev-parse", "y"], p);
-    assert_cli_success(&target, "read the target commit label");
-    let target_id = String::from_utf8(target.stdout).expect("target id");
-    let target_label = target_id.get(..7).expect("seven hex digits");
+    // ADR-HF-05 / HF-04: merge conflict labels use the user spelling of the
+    // target (`merge y`), not the abbreviated object id.
+    let target_label = "y";
     let width = match shape {
         Shape::OneToTwo | Shape::RenameDelete => 7,
         Shape::TwoToOne | Shape::RenameAdd => 10,

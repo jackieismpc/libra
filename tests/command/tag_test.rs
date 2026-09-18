@@ -623,6 +623,9 @@ async fn setup_repo_with_commit_with(
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -820,6 +823,9 @@ async fn test_force_tag() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -843,6 +849,7 @@ async fn test_force_tag() {
         name: Some("v1.0".into()),
         file: None,
         edit: false,
+        annotate: false,
         list: false,
         delete: false,
         message: Some("Updated".into()),
@@ -974,6 +981,7 @@ async fn test_delete_tag() {
         name: Some("to-delete".into()),
         file: None,
         edit: false,
+        annotate: false,
         list: false,
         delete: true,
         message: None,
@@ -1023,6 +1031,9 @@ async fn test_annotation_lines_tag() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1046,6 +1057,7 @@ async fn test_annotation_lines_tag() {
         name: Some("v1.0.1".into()),
         file: None,
         edit: false,
+        annotate: false,
         list: false,
         delete: false,
         message: Some("Single line annotation message".into()),
@@ -1082,6 +1094,9 @@ async fn test_annotation_lines_tag() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1105,6 +1120,7 @@ async fn test_annotation_lines_tag() {
         name: Some("v1.0.3".into()),
         file: None,
         edit: false,
+        annotate: false,
         list: false,
         delete: false,
         message: Some("multi\nline\nannotation\ntag".into()),
@@ -1708,6 +1724,149 @@ fn tag_edit_rejected_outside_create_mode() {
         !with_delete.status.success(),
         "`tag -e -d` is rejected as a non-create mode"
     );
+}
+
+/// M-TAG G1–G7 (HF-11): `-a/--annotate` creates annotated tags, opens the
+/// editor when used alone, and is a usage error with list/delete.
+#[cfg(unix)]
+#[test]
+fn test_tag_annotate_flag_matrix() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    let object_type = |name: &str| -> String {
+        let out = run_libra_command(&["cat-file", "-t", name], p);
+        assert_cli_success(&out, &format!("cat-file -t {name}"));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // G1: `tag -a -m x v1` → annotated (`cat-file -t` is `tag`).
+    let g1 = run_libra_command(&["tag", "-a", "-m", "x", "v1"], p);
+    assert_cli_success(&g1, "tag -a -m x v1");
+    assert_eq!(object_type("v1"), "tag", "G1 must be an annotated tag");
+
+    // G2: `tag -a -F <file> v2` → annotated.
+    std::fs::write(p.join("tagmsg.txt"), "from file\n").unwrap();
+    let g2 = run_libra_command(&["tag", "-a", "-F", "tagmsg.txt", "v2"], p);
+    assert_cli_success(&g2, "tag -a -F tagmsg.txt v2");
+    assert_eq!(object_type("v2"), "tag", "G2 must be an annotated tag");
+    let shown = run_libra_command(&["cat-file", "-p", "v2"], p);
+    assert!(
+        String::from_utf8_lossy(&shown.stdout).contains("from file"),
+        "G2 message: {}",
+        String::from_utf8_lossy(&shown.stdout)
+    );
+
+    // G3: `tag -a -e -m pre v3` with `GIT_EDITOR=true` keeps the seed message.
+    let g3 = run_libra_command_with_stdin_and_env(
+        &["tag", "-a", "-e", "-m", "pre", "v3"],
+        p,
+        "",
+        &[("GIT_EDITOR", "true")],
+    );
+    assert_cli_success(&g3, "tag -a -e -m pre v3");
+    assert_eq!(object_type("v3"), "tag", "G3 must be an annotated tag");
+    let listed = run_libra_command(&["tag", "-n1", "v3"], p);
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("pre"),
+        "G3 message pre: {}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+
+    // G4: `tag -a v4` with an empty editor aborts and writes no ref.
+    let before = run_libra_command(&["tag", "-l"], p);
+    let g4 = run_libra_command_with_stdin_and_env(
+        &["tag", "-a", "v4"],
+        p,
+        "",
+        &[("GIT_EDITOR", "true")],
+    );
+    assert_ne!(
+        g4.status.code(),
+        Some(0),
+        "G4 must abort: {}",
+        String::from_utf8_lossy(&g4.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&g4.stderr).contains("no tag message given"),
+        "G4 abort message: {}",
+        String::from_utf8_lossy(&g4.stderr)
+    );
+    let after = run_libra_command(&["tag", "-l"], p);
+    assert_eq!(
+        String::from_utf8_lossy(&before.stdout),
+        String::from_utf8_lossy(&after.stdout),
+        "G4 must not create a ref"
+    );
+    let missing = run_libra_command(&["cat-file", "-t", "v4"], p);
+    assert!(!missing.status.success(), "G4 must not write v4");
+
+    // G5: `-a` with delete/list is a usage error (129).
+    let g5d = run_libra_command(&["tag", "-a", "-d", "x"], p);
+    assert_eq!(
+        g5d.status.code(),
+        Some(129),
+        "G5 -a -d: {}",
+        String::from_utf8_lossy(&g5d.stderr)
+    );
+    let g5l = run_libra_command(&["tag", "-a", "-l"], p);
+    assert_eq!(
+        g5l.status.code(),
+        Some(129),
+        "G5 -a -l: {}",
+        String::from_utf8_lossy(&g5l.stderr)
+    );
+
+    // G6: `tag -a -s -m x v5` is a signed annotated tag.
+    let g6 = run_libra_command(&["tag", "-a", "-s", "-m", "x", "v5"], p);
+    assert_cli_success(&g6, "tag -a -s -m x v5");
+    assert_eq!(object_type("v5"), "tag", "G6 must be an annotated tag");
+    let signed = run_libra_command(&["cat-file", "-p", "v5"], p);
+    assert_cli_success(&signed, "cat-file -p v5");
+    let body = String::from_utf8_lossy(&signed.stdout);
+    assert!(
+        body.contains("-----BEGIN PGP SIGNATURE-----"),
+        "G6 signed tag: {body}"
+    );
+
+    // G7: existing list/create flags still work after `-a` is public.
+    assert_cli_success(
+        &run_libra_command(&["tag", "--points-at", "HEAD"], p),
+        "G7 --points-at",
+    );
+    assert_cli_success(
+        &run_libra_command(&["tag", "--contains", "HEAD"], p),
+        "G7 --contains",
+    );
+    assert_cli_success(
+        &run_libra_command(&["tag", "--no-contains", "HEAD"], p),
+        "G7 --no-contains",
+    );
+    assert_cli_success(
+        &run_libra_command(&["tag", "--merged", "HEAD"], p),
+        "G7 --merged",
+    );
+    let n1 = run_libra_command(&["tag", "-l", "-n", "1"], p);
+    assert_cli_success(&n1, "G7 -l -n1");
+    assert!(
+        String::from_utf8_lossy(&n1.stdout).contains("v1"),
+        "G7 -l -n1 lists v1: {}",
+        String::from_utf8_lossy(&n1.stdout)
+    );
+    std::fs::write(p.join("g7msg.txt"), "force-file\n").unwrap();
+    let g7f = run_libra_command(&["tag", "-F", "g7msg.txt", "v-file"], p);
+    assert_cli_success(&g7f, "G7 -F");
+    assert_eq!(object_type("v-file"), "tag");
+    let g7force = run_libra_command(&["tag", "-f", "-m", "overwritten", "v1"], p);
+    assert_cli_success(&g7force, "G7 -f");
+    let g7e = run_libra_command_with_stdin_and_env(
+        &["tag", "-e", "-m", "edited", "v-edit-g7"],
+        p,
+        "",
+        &[("GIT_EDITOR", "true")],
+    );
+    assert_cli_success(&g7e, "G7 -e");
+    assert_eq!(object_type("v-edit-g7"), "tag");
 }
 
 /// Helper: run `tag -l --sort=refname --column=<spec>` at a fixed COLUMNS width

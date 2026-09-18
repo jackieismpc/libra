@@ -148,7 +148,7 @@ httpd.serve_forever()
     Run-Scenario "revoked" "manifest-revoked.json" "fail" "no" "REVOKED"
     Run-Scenario "stale-replay" "manifest-stale-replay.json" "fail" "no" "older than this installer's baseline"
     Run-Scenario "tampered-payload" "manifest-tampered-payload.json" "fail" "no" "SIGNATURE VERIFICATION FAILED"
-    Run-Scenario "zero-size" "manifest-zero-size.json" "fail" "no" "outside (0, 128 MiB]"
+    Run-Scenario "zero-size" "manifest-zero-size.json" "fail" "no" "outside (0, 256 MiB]"
     Run-Scenario "future-min-key" "manifest-future-min-key.json" "fail" "no" "min_key_generation"
     Run-Scenario "key-window" "manifest-key-window.json" "fail" "no" "validity window"
     Run-Scenario "noncanonical" "manifest-noncanonical.json" "fail" "no" "canonical serialization"

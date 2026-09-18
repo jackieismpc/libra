@@ -51,6 +51,9 @@ async fn test_add_single_file() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -89,6 +92,9 @@ async fn test_add_reports_marker_registration_failure_without_panicking() {
             renormalize: false,
             ignore_missing: false,
             resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         },
         &OutputConfig::default(),
     )
@@ -121,6 +127,9 @@ async fn test_add_reports_marker_registration_failure_without_panicking() {
             renormalize: false,
             ignore_missing: false,
             resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         },
         &OutputConfig::default(),
     )
@@ -179,6 +188,9 @@ async fn test_add_dispatches_vcs_automation_history() {
             renormalize: false,
             ignore_missing: false,
             resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         },
         &libra::utils::output::OutputConfig::default(),
     )
@@ -227,6 +239,9 @@ async fn test_add_dry_run_does_not_dispatch_vcs_automation_history() {
             renormalize: false,
             ignore_missing: false,
             resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         },
         &libra::utils::output::OutputConfig::default(),
     )
@@ -276,6 +291,9 @@ async fn test_add_multiple_files() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -335,6 +353,9 @@ async fn test_add_all_flag() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -398,6 +419,9 @@ async fn test_add_update_flag() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -432,6 +456,9 @@ async fn test_add_update_flag() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -504,6 +531,9 @@ async fn test_add_with_ignore_patterns() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -591,6 +621,9 @@ async fn test_add_force_tracks_ignored_file() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -618,6 +651,9 @@ async fn test_add_force_tracks_ignored_file() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -655,6 +691,9 @@ async fn test_add_force_tracks_ignored_file() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -706,6 +745,9 @@ async fn test_add_force_dot_includes_ignored_directory() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -741,6 +783,9 @@ async fn test_add_force_dot_includes_ignored_directory() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -786,6 +831,9 @@ async fn test_add_dry_run() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -826,6 +874,9 @@ async fn test_add_without_path_should_error() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -865,6 +916,9 @@ async fn test_add_nonexistent_file_should_error() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -908,6 +962,9 @@ async fn test_add_duplicate_file_should_not_duplicate_index() {
             renormalize: false,
             ignore_missing: false,
             resolved: false,
+            patch: false,
+            auto_advance: false,
+            no_auto_advance: false,
         })
         .await;
 
@@ -956,6 +1013,9 @@ async fn test_add_empty_file() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -999,6 +1059,9 @@ async fn test_add_sub_directory_file() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1043,6 +1106,9 @@ async fn test_add_pathspec_from_file_newline_stages_listed_paths() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1087,6 +1153,9 @@ async fn test_add_pathspec_from_file_nul_stages_listed_paths() {
         renormalize: false,
         ignore_missing: false,
         resolved: false,
+        patch: false,
+        auto_advance: false,
+        no_auto_advance: false,
     })
     .await;
 
@@ -1506,7 +1575,12 @@ fn test_t2207_add_resolved_matrix() {
             "resolved -A diagnostic: {err}"
         );
         let with_p = run_libra_command(&["add", "--resolved", "-p"], repo.path());
-        assert_eq!(with_p.status.code(), Some(129), "-p is still unknown");
+        assert_eq!(with_p.status.code(), Some(129), "resolved -p exits 129");
+        let err = String::from_utf8_lossy(&with_p.stderr);
+        assert!(
+            err.contains("cannot be used together"),
+            "resolved -p diagnostic: {err}"
+        );
     }
 
     // R7: no unmerged entries → success, no index write.

@@ -33,7 +33,7 @@ values fail before fetch or integration with `LBR-CLI-002`; local/global config 
 failures use `LBR-IO-001`. An unreadable or unsupported system config scope is skipped,
 so a lower-precedence default or the built-in merge behavior can still be used.
 
-When invoked with no arguments, the command reads the current branch tracking configuration (`branch.<name>.remote` and `branch.<name>.merge`). When `<repository>` is given alone, the current branch name is used as the remote branch. When both `<repository>` and `<refspec>` are given, the specified remote branch is fetched and merged.
+When invoked with no arguments, the command reads the current branch tracking configuration (`branch.<name>.remote` and `branch.<name>.merge`). A configured local upstream (`branch.<name>.remote=.`, written by `libra branch -u <local-branch>`) is refused before any network or `FETCH_HEAD` write (`LBR-CLI-003`, exit 129); Git 2.54 `fetch`/`pull` can operate on a local upstream — that support is deferred to [issues/480 HP-16](https://github.com/libra-tools/libra/issues/480). An explicit repository argument `.` keeps the existing `remote '.' not found` path. When `<repository>` is given alone, the current branch name is used as the remote branch. When both `<repository>` and `<refspec>` are given, the specified remote branch is fetched and merged.
 
 Before its merge phase starts, pull inherits `libra merge`'s index check. If there is no merge state but unresolved entries remain (for example after a conflicted squash), the merge phase fails with `LBR-CONFLICT-002` (exit 128, `phase: "merge"`) even when the fetched target is already up to date. That phase preserves HEAD, the index and working tree, and directs you to resolve the conflicts, stage them with `libra add`, then make a plain `libra commit`. Existing merge state retains the usual `merge --continue` / `--abort` guidance. Fetch may already have downloaded objects and updated remote-tracking refs before this merge-phase refusal.
 
@@ -295,6 +295,7 @@ Every `PullError` variant maps to an explicit `StableErrorCode`. Fetch, merge, a
 | HEAD is detached | `LBR-REPO-003` | 128 | "checkout a branch before pulling" |
 | No tracking info for branch | `LBR-REPO-003` | 128 | Git-style advisory block with `libra pull <remote> <branch>` and `libra branch --set-upstream-to=...` |
 | Remote not found | `LBR-CLI-003` | 129 | "use 'libra remote -v' to see configured remotes" |
+| Configured local upstream (`branch.<name>.remote=.`) | `LBR-CLI-003` | 129 | "use 'libra branch --unset-upstream' to clear the local upstream"; network support is issues/480 HP-16 |
 | Invalid `pull.rebase`, `branch.<name>.rebase`, or `pull.ff` config value | `LBR-CLI-002` | 129 | "libra config <key> <value>" |
 | Unsupported `pull.rebase=merges|interactive` mode | `LBR-CLI-002` | 129 | Use boolean rebase or an explicit supported pull flag |
 | Invalid `merge.renames` / `merge.renameLimit` / `merge.directoryRenames` / `merge.renormalize` (inherited from `libra merge`) | `LBR-REPO-003` | 128 | Set the named merge key to a supported value or remove it |
@@ -510,3 +511,7 @@ reason that does not echo the remote bytes. It is no longer reported as a
 successful empty response. Check the remote Git service or proxy response before
 retrying. Valid empty repositories, supported SHA-1/SHA-256 advertisements,
 existing command hints and structured error fields retain their behavior.
+
+## Issue #477 notes
+
+refuses a local upstream (`branch.<name>.remote=.`)

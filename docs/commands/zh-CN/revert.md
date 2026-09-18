@@ -33,7 +33,7 @@ revert 提交使用当前 author 与 committer 身份/日期，并在创建提�
 
 新的 revert 在索引存在未合并条目时拒绝开始：在解析任何目标、写入索引、工作树、引用或 `revert-state.json` 之前，以 exit 128 与 `LBR-CONFLICT-001` 退出，并列出最多 10 条未合并路径（Git 以 `your index file is unmerged` 拒绝）。逐条解决后 `libra add`，或用 `libra reset --hard` 放弃冲突，然后重新执行 revert；该拒绝不写 revert state，`--continue`、`--skip`、`--abort` 对它不适用。
 
-已停止的 revert 不会比它所在的工作树活得更久：之后的 reset 在清除索引冲突阶段后会结束已停止的单提交 revert，下一次 revert 可以正常开始。多提交序列保留剩余提交并记录被停提交已结束：此时 `--continue` 以 `LBR-REPO-003` 拒绝，不会把重置后的索引记成该 revert；用 `libra revert --skip` 应用其余提交，或 `libra revert --abort` 将 HEAD、索引和已跟踪文件恢复到 revert 前的状态，丢弃之后的已跟踪改动（包括 reset 选择的目标）。
+已停止的 revert 不会比它所在的工作树活得更久：之后的 reset 会结束已停止的单提交 revert（在清除索引冲突阶段后），下一次 revert 可以正常开始。解决冲突后再执行一次之后的 commit 会结束已停止的单提交 revert。多提交序列保留剩余提交并记录被停提交已结束：`--continue` 不会重新提交已在序列外结束的停止项，而是继续 revert 剩余提交。`libra revert --abort` 仍会将 HEAD、索引和已跟踪文件恢复到 revert 前的状态，丢弃之后的已跟踪改动（包括 reset 选择的目标）。
 
 ## 选项
 
@@ -176,7 +176,7 @@ Git 的 `--mainline <parent-number>` 会选择合并提交的某个父提交，�
 
 ### 冲突处理（`--continue`、`--skip`、`--abort`）
 
-冲突的 revert 会向工作树写入三方冲突标记，把 revert 状态记录到 `revert-state.json`，并返回 `LBR-CONFLICT-001`。随后解决冲突并运行 `libra revert --continue` 收尾、`libra revert --skip` 丢弃当前提交继续，或 `libra revert --abort` 恢复 revert 前状态。
+冲突的 revert 会向工作树写入三方冲突标记（`<<<<<<< HEAD` / `>>>>>>> parent of <abbrev7> (<subject>)`；`merge.conflictStyle=diff3` 时祖先标签为 `<abbrev7> (<subject>)`），把 revert 状态记录到 `revert-state.json`，并返回 `LBR-CONFLICT-001`。随后解决冲突并运行 `libra revert --continue` 收尾、`libra revert --skip` 丢弃当前提交继续，或 `libra revert --abort` 恢复 revert 前状态。
 
 1. **显式、对代理友好的错误。** 报告具体路径与错误码，便于代理以编程方式解决冲突并续作。
 2. **可预测的状态。** revert 状态集中在单个 `revert-state.json` 文件，而非散落的隐式标记。
@@ -185,7 +185,7 @@ Git 的 `--mainline <parent-number>` 会选择合并提交的某个父提交，�
 ### 冲突模型（三方合并）
 
 Libra 的 revert 以路径级三方合并应用逆向更改。结果无歧义时干净更新文件；与后续更改重叠时，向工作树写入标准冲突标记，把未合并状态与 revert 进度记录到 `revert-state.json`，并返回 `LBR-CONFLICT-001`。随后解决标记并运行 `libra revert --continue`、用 `libra revert --skip` 跳过当前提交，或 `libra revert --abort` 撤销。
-文本冲突与 merge/cherry-pick 共用 `merge.conflictStyle`：默认 `merge` 风格重新 diff 双方 postimage；`diff3` 加入完整 `||||||| original` ancestor 块；`zdiff3` 保留该块并把共同前后缀移到 marker 外。未知风格只会在内容合并仍有冲突、确需渲染时于索引或工作树写入前失败；干净合并不会被无关的呈现配置阻断。所有可识别输入行尾均为 CRLF 时 marker 行也使用 CRLF，否则使用 LF。binary driver 仍保留完整当前文件且不写 marker。
+文本冲突与 merge/cherry-pick 共用 `merge.conflictStyle`：默认 `merge` 风格重新 diff 双方 postimage；`diff3` 加入完整 `||||||| <abbrev7> (<subject>)` ancestor 块；`zdiff3` 保留该块并把共同前后缀移到 marker 外。未知风格只会在内容合并仍有冲突、确需渲染时于索引或工作树写入前失败；干净合并不会被无关的呈现配置阻断。所有可识别输入行尾均为 CRLF 时 marker 行也使用 CRLF，否则使用 LF。binary driver 仍保留完整当前文件且不写 marker。
 
 ## 参数对比：Libra vs Git vs jj
 
@@ -228,3 +228,8 @@ Libra 的 revert 以路径级三方合并应用逆向更改。结果无歧义时
 ### 暂存文本冲突与 reset 收尾
 
 revert 当前把文本冲突保存为 stage-0 blob。整树 reset 收尾前也检查该次 revert 冲突路径的暂存内容：仍有 `<<<<<<<` 标记或 blob 无法读取时，保留 revert 状态并发出恢复警告。因此即使 `ls-files --unmerged` 为空，`--soft` 也不会丢掉恢复状态。解决并重新暂存内容（或从索引移除路径），或通过 `--mixed`/`--hard` 将索引替换为干净内容后，可以正常收尾。仅工作树中残留的标记不阻止 mixed reset 收尾。本次不改变 revert 的冲突表示及 `--continue` 行为。
+
+## Issue #477 notes
+
+--continue 不会重新提交已在序列外结束的停止项
+冲突标记以「parent of」加缩写提交标注被 revert 的一侧

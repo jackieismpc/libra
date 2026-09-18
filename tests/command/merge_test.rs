@@ -27,6 +27,22 @@ mod message_options;
 mod quit;
 mod signoff;
 
+fn rev_full(repo: &Path, spec: &str) -> String {
+    let out = run_libra_command(&["rev-parse", spec], repo);
+    assert_cli_success(&out, spec);
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn merge_base_abbrev7(repo: &Path, a: &str, b: &str) -> String {
+    let out = run_libra_command(&["merge-base", a, b], repo);
+    assert_cli_success(&out, "merge-base");
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .chars()
+        .take(7)
+        .collect()
+}
+
 fn commit_file(repo: &Path, file: &str, content: &str, message: &str) {
     let path = repo.join(file);
     if let Some(parent) = path.parent() {
@@ -2872,13 +2888,14 @@ fn create_diverged_repo_for_conflict() -> tempfile::TempDir {
     temp_repo
 }
 
-/// `merge.conflictStyle = diff3` adds the `||||||| base` block with the
-/// common-ancestor content between ours and the `=======` separator
-/// (lore.md §1.3); the default two-marker style stays unchanged when unset.
+/// `merge.conflictStyle = diff3` adds the `||||||| <merge-base abbrev7>` block
+/// with the common-ancestor content between ours and the `=======` separator
+/// (HF-04 / ADR-HF-05 L8a).
 #[test]
 fn test_merge_conflict_diff3_markers() {
     let temp_repo = create_diverged_repo_for_conflict();
     let p = temp_repo.path();
+    let merge_base = merge_base_abbrev7(p, "main", "feature");
     assert_cli_success(
         &run_libra_command(&["config", "merge.conflictStyle", "diff3"], p),
         "set conflictStyle",
@@ -2888,8 +2905,10 @@ fn test_merge_conflict_diff3_markers() {
     assert_eq!(out.status.code(), Some(128), "merge conflict exits 128");
     let body = std::fs::read_to_string(p.join("shared.txt")).expect("read conflict");
     assert!(
-        body.contains("<<<<<<< HEAD\nMAIN\n||||||| base\nORIG\n=======\nFEATURE\n"),
-        "diff3 emits the base block between ours and the separator: {body:?}"
+        body.contains(&format!(
+            "<<<<<<< HEAD\nMAIN\n||||||| {merge_base}\nORIG\n=======\nFEATURE\n"
+        )),
+        "diff3 emits the merge-base abbrev between ours and the separator: {body:?}"
     );
 }
 
@@ -2979,18 +2998,12 @@ fn merge_conflict_refine_adopts_same_change_outside_markers() {
         "checkout main",
     );
     commit_file(p, "shared.txt", "top\nMAIN\nSAME\nbottom\n", "main edit");
-    let target = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "feature"], p).stdout)
-        .trim()
-        .chars()
-        .take(7)
-        .collect::<String>();
-
     let out = run_libra_command(&["merge", "feature"], p);
     assert_eq!(out.status.code(), Some(128), "real conflict remains");
     let body = std::fs::read_to_string(p.join("shared.txt")).expect("read conflict");
     assert_eq!(
         body,
-        format!("top\n<<<<<<< HEAD\nMAIN\n=======\nFEATURE\n>>>>>>> {target}\nSAME\nbottom\n")
+        "top\n<<<<<<< HEAD\nMAIN\n=======\nFEATURE\n>>>>>>> feature\nSAME\nbottom\n"
     );
 }
 
@@ -3027,18 +3040,14 @@ fn merge_conflict_refine_zdiff3_trims_common_edges() {
         "set zdiff3",
     );
 
-    let target = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "feature"], p).stdout)
-        .trim()
-        .chars()
-        .take(7)
-        .collect::<String>();
+    let merge_base = merge_base_abbrev7(p, "main", "feature");
     let out = run_libra_command(&["merge", "feature"], p);
     assert_eq!(out.status.code(), Some(128), "zdiff3 conflict exits 128");
     let body = std::fs::read_to_string(p.join("shared.txt")).expect("read conflict");
     assert_eq!(
         body,
         format!(
-            "1\n2\n3\n4\nA\n<<<<<<< HEAD\nB\nC\nD\n||||||| base\n5\n6\n=======\nX\nC\nY\n>>>>>>> {target}\nE\n7\n8\n9\n"
+            "1\n2\n3\n4\nA\n<<<<<<< HEAD\nB\nC\nD\n||||||| {merge_base}\n5\n6\n=======\nX\nC\nY\n>>>>>>> feature\nE\n7\n8\n9\n"
         ),
         "zdiff3 follows Git's edge-only refinement"
     );
@@ -4082,6 +4091,106 @@ fn test_merge_autostash_conflict_holds_then_abort_restores() {
         "precious\n"
     );
     assert!(!p.join(".libra/merge-autostash.json").exists());
+}
+
+/// M-SEQ S6 (#477 HF-26): `reset --hard` after a conflicted `--autostash`
+/// merge promotes the held commit into the visible stash list.
+#[test]
+fn test_reset_hard_after_merge_conflict_promotes_autostash() {
+    let temp_repo = create_diverged_repo_for_conflict();
+    let p = temp_repo.path();
+    std::fs::write(p.join("unrelated.txt"), "precious\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "unrelated.txt"], p), "add");
+    let out = run_libra_command(&["merge", "feature", "--autostash"], p);
+    assert_eq!(out.status.code(), Some(128), "conflict exits 128");
+    assert_eq!(stash_list_len(p), 0, "held autostash not yet in stash list");
+    assert!(p.join(".libra/merge-autostash.json").exists());
+    let reset = run_libra_command(&["reset", "--hard"], p);
+    assert_cli_success(&reset, "reset --hard");
+    let stderr = String::from_utf8_lossy(&reset.stderr);
+    assert!(
+        stderr.contains("stash@{0}") || stderr.contains("stash@{{0}}"),
+        "stderr names the promoted stash: {stderr}"
+    );
+    assert!(
+        !p.join(".libra/merge-state.json").exists(),
+        "merge-state.json cleared"
+    );
+    assert!(
+        !p.join(".libra/merge-autostash.json").exists(),
+        "merge-autostash.json cleared"
+    );
+    assert_eq!(stash_list_len(p), 1, "held autostash is now stash@{{0}}");
+    assert_cli_success(&run_libra_command(&["stash", "pop"], p), "stash pop");
+    assert_eq!(
+        std::fs::read_to_string(p.join("unrelated.txt")).unwrap(),
+        "precious\n"
+    );
+}
+
+/// M-MCOMMIT MC10 (#477 HF-27): commit after a conflicted `--autostash` merge
+/// applies the held autostash.
+#[test]
+fn test_commit_after_autostash_merge_applies_autostash() {
+    let temp_repo = create_diverged_repo_for_conflict();
+    let p = temp_repo.path();
+    std::fs::write(p.join("unrelated.txt"), "precious\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "unrelated.txt"], p), "add");
+    assert_eq!(
+        run_libra_command(&["merge", "feature", "--autostash"], p)
+            .status
+            .code(),
+        Some(128)
+    );
+    std::fs::write(p.join("shared.txt"), "top\nl1\nRESOLVED\nl3\nbottom\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "resolve");
+    let committed = run_libra_command(&["commit", "-m", "finish", "--no-verify"], p);
+    assert_cli_success(&committed, "MC10 commit");
+    assert_eq!(commit_parents(p).len(), 2, "MC10 two parents");
+    assert!(!p.join(".libra/merge-state.json").exists());
+    assert!(!p.join(".libra/merge-autostash.json").exists());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&committed.stdout),
+        String::from_utf8_lossy(&committed.stderr)
+    );
+    assert!(
+        combined.contains("Applied autostash") || combined.contains("autostash"),
+        "MC10 mentions autostash: {combined}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.join("unrelated.txt")).unwrap(),
+        "precious\n"
+    );
+}
+
+/// M-MCOMMIT MC12 (#477 HF-27): squash merge then commit uses SQUASH_MSG.
+#[test]
+fn test_commit_after_squash_uses_squash_message() {
+    let temp_repo = create_diverged_repo_clean();
+    let p = temp_repo.path();
+    assert_cli_success(
+        &run_libra_command(&["merge", "--squash", "feature"], p),
+        "squash",
+    );
+    assert!(
+        p.join(".libra/SQUASH_MSG").exists(),
+        "squash writes SQUASH_MSG"
+    );
+    assert!(!p.join(".libra/merge-state.json").exists());
+    let committed = run_libra_command(&["commit", "--no-edit", "--no-verify"], p);
+    assert_cli_success(&committed, "MC12 commit");
+    assert_eq!(commit_parents(p).len(), 1, "MC12 single parent");
+    let cat = run_libra_command(&["cat-file", "-p", "HEAD"], p);
+    let body = String::from_utf8_lossy(&cat.stdout);
+    assert!(
+        body.contains("Squashed commit of the following:"),
+        "MC12 squash message: {body}"
+    );
+    assert!(
+        !p.join(".libra/SQUASH_MSG").exists(),
+        "MC12 deletes SQUASH_MSG"
+    );
 }
 
 #[test]
@@ -13706,6 +13815,7 @@ fn merge_rename_conflict_collision_nests_the_rename_merge_markers() {
             "theirs",
         );
         assert_cli_success(&run_libra_command(&["checkout", "main"], p), "main");
+        let merge_base = merge_base_abbrev7(p, "main", "feature");
         assert_cli_success(
             &run_libra_command(&["config", "merge.conflictStyle", "diff3"], p),
             "diff3",
@@ -13713,16 +13823,12 @@ fn merge_rename_conflict_collision_nests_the_rename_merge_markers() {
 
         merge_expecting_conflict(p, &["merge", "feature"], env);
         let body = std::fs::read_to_string(p.join("new")).expect("the conflicted destination");
-        let target = run_libra_command(&["rev-parse", "feature"], p);
-        assert_cli_success(&target, "read the outer conflict's target label");
-        let target_id = String::from_utf8(target.stdout).expect("target object id is ASCII");
-        let target_abbrev: String = target_id.trim().chars().take(7).collect();
         // The whole rename result, including every context line, belongs to
         // the outer ours arm. Exact bytes pin both complete diff3 regions:
         // matching open/base/separator/close widths, labels, and one outer
         // block. Git uses seven outside; MG-02's documented rule requires
         // Libra's outer markers to be longer than the nested eight. The outer
-        // writer uses the target commit's abbreviation, as for plain conflicts.
+        // writer uses the user's target spelling (HF-04).
         let renamed = concat!(
             "l1\n",
             "<<<<<<<< HEAD:new\n",
@@ -13737,7 +13843,7 @@ fn merge_rename_conflict_collision_nests_the_rename_merge_markers() {
         assert_eq!(
             body,
             format!(
-                "<<<<<<<<< HEAD\n{renamed}||||||||| base\n=========\ntheirs own file\n>>>>>>>>> {target_abbrev}\n"
+                "<<<<<<<<< HEAD\n{renamed}||||||||| {merge_base}\n=========\ntheirs own file\n>>>>>>>>> feature\n"
             ),
             "walk {env:?}: one complete outer add/add contains the complete rename conflict"
         );
@@ -14137,5 +14243,141 @@ fn merge_rename_conflict_summaries_match_across_both_walks() {
             summaries[0], summaries[1],
             "{label}: the pruned walk and the flattening engine must agree"
         );
+    }
+}
+
+/// M-LABEL L1–L4b, L7, L8a, L9a, L9b (#477 HF-04).
+#[test]
+fn test_merge_conflict_label_uses_target_spelling_matrix() {
+    // L1 + L9a: branch spelling, then continue after resolve.
+    {
+        let repo = create_diverged_repo_for_conflict();
+        let p = repo.path();
+        let out = run_libra_command(&["merge", "feature"], p);
+        assert_eq!(out.status.code(), Some(128), "L1 conflict");
+        let body = std::fs::read_to_string(p.join("shared.txt")).expect("L1 read");
+        assert!(
+            body.contains("<<<<<<< HEAD\n") && body.contains(">>>>>>> feature\n"),
+            "L1 user spelling: {body}"
+        );
+        std::fs::write(p.join("shared.txt"), "resolved\n").expect("L9a resolve");
+        assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "L9a add");
+        assert_cli_success(
+            &run_libra_command(&["merge", "--continue", "-m", "merged"], p),
+            "L9a continue",
+        );
+        assert!(
+            !p.join(".libra/merge-state.json").exists(),
+            "L9a cleared merge state"
+        );
+    }
+
+    // L2: refs/heads/feature
+    {
+        let repo = create_diverged_repo_for_conflict();
+        let p = repo.path();
+        let out = run_libra_command(&["merge", "refs/heads/feature"], p);
+        assert_eq!(out.status.code(), Some(128), "L2 conflict");
+        let body = std::fs::read_to_string(p.join("shared.txt")).expect("L2 read");
+        assert!(
+            body.contains(">>>>>>> refs/heads/feature\n"),
+            "L2 refs spelling: {body}"
+        );
+    }
+
+    // L3 / L4a / L4b: full hash and user-supplied prefixes.
+    {
+        let repo = create_diverged_repo_for_conflict();
+        let p = repo.path();
+        let full = rev_full(p, "feature");
+        let short7: String = full.chars().take(7).collect();
+        let short10: String = full.chars().take(10).collect();
+
+        let out = run_libra_command(&["merge", &full], p);
+        assert_eq!(out.status.code(), Some(128), "L3 conflict");
+        let body = std::fs::read_to_string(p.join("shared.txt")).expect("L3 read");
+        assert!(
+            body.contains(&format!(">>>>>>> {full}\n")),
+            "L3 full hash: {body}"
+        );
+        assert_cli_success(&run_libra_command(&["merge", "--abort"], p), "L3 abort");
+
+        let out = run_libra_command(&["merge", &short7], p);
+        assert_eq!(out.status.code(), Some(128), "L4a conflict");
+        let body = std::fs::read_to_string(p.join("shared.txt")).expect("L4a read");
+        assert!(
+            body.contains(&format!(">>>>>>> {short7}\n")),
+            "L4a 7-char spelling: {body}"
+        );
+        assert_cli_success(&run_libra_command(&["merge", "--abort"], p), "L4a abort");
+
+        let out = run_libra_command(&["merge", &short10], p);
+        assert_eq!(out.status.code(), Some(128), "L4b conflict");
+        let body = std::fs::read_to_string(p.join("shared.txt")).expect("L4b read");
+        assert!(
+            body.contains(&format!(">>>>>>> {short10}\n")),
+            "L4b 10-char spelling: {body}"
+        );
+    }
+
+    // L7: add/add uses the same user spelling.
+    {
+        let repo = create_committed_repo_via_cli();
+        let p = repo.path();
+        assert_cli_success(&run_libra_command(&["branch", "side"], p), "L7 branch");
+        assert_cli_success(&run_libra_command(&["checkout", "side"], p), "L7 side");
+        commit_file(p, "both.txt", "theirs\n", "side add");
+        assert_cli_success(&run_libra_command(&["checkout", "main"], p), "L7 main");
+        commit_file(p, "both.txt", "ours\n", "main add");
+        let out = run_libra_command(&["merge", "side"], p);
+        assert_eq!(out.status.code(), Some(128), "L7 conflict");
+        let body = std::fs::read_to_string(p.join("both.txt")).expect("L7 read");
+        assert!(
+            body.contains("<<<<<<< HEAD\n") && body.contains(">>>>>>> side\n"),
+            "L7 add/add spelling: {body}"
+        );
+    }
+
+    // L8a: diff3 ancestor is the merge-base abbrev7.
+    {
+        let repo = create_diverged_repo_for_conflict();
+        let p = repo.path();
+        let merge_base = merge_base_abbrev7(p, "main", "feature");
+        assert_cli_success(
+            &run_libra_command(&["config", "merge.conflictStyle", "diff3"], p),
+            "L8a style",
+        );
+        let out = run_libra_command(&["merge", "feature"], p);
+        assert_eq!(out.status.code(), Some(128), "L8a conflict");
+        let body = std::fs::read_to_string(p.join("shared.txt")).expect("L8a read");
+        assert!(
+            body.contains(&format!("||||||| {merge_base}\n")) && body.contains(">>>>>>> feature\n"),
+            "L8a merge-base abbrev: {body}"
+        );
+    }
+
+    // L9b: rerere records and replays regardless of the label form.
+    {
+        let repo = create_diverged_repo_for_conflict();
+        let p = repo.path();
+        assert_cli_success(
+            &run_libra_command(&["config", "rerere.enabled", "true"], p),
+            "L9b enable rerere",
+        );
+        assert_eq!(
+            run_libra_command(&["merge", "feature"], p).status.code(),
+            Some(128),
+            "L9b first conflict"
+        );
+        std::fs::write(p.join("shared.txt"), "resolved-rerere\n").expect("L9b resolve");
+        assert_cli_success(&run_libra_command(&["rerere"], p), "L9b record");
+        assert_cli_success(&run_libra_command(&["merge", "--abort"], p), "L9b abort");
+        assert_eq!(
+            run_libra_command(&["merge", "feature"], p).status.code(),
+            Some(128),
+            "L9b replay still reports conflict"
+        );
+        let body = std::fs::read_to_string(p.join("shared.txt")).expect("L9b replay");
+        assert_eq!(body, "resolved-rerere\n", "L9b replayed resolution");
     }
 }

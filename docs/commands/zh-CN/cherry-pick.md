@@ -38,7 +38,7 @@ libra cherry-pick (--continue | --skip | --abort | --quit)
 `text`。因此 union driver 可把重叠 pick 解析为 current 内容后接 picked
 内容；binary driver 冲突则保留完整的存活侧（current 存在时优先），不插入文本标记。
 
-已停止的 pick 不会比它所在的工作树活得更久：之后的 reset 在清除索引冲突阶段后会结束已停止的单提交 pick，下一次 cherry-pick 可以正常开始。多提交序列会保留剩余提交并记录被停提交已结束；此时 `--continue` 拒绝，而不是把重置后的索引记成该提交，用 `libra cherry-pick --skip` 应用其余提交。
+已停止的 pick 不会比它所在的工作树活得更久：之后的 reset 会结束已停止的单提交 pick（在清除索引冲突阶段后），下一次 cherry-pick 可以正常开始。解决冲突后再执行一次之后的 commit 会结束已停止的单提交 pick。多提交序列会保留剩余提交并记录被停提交已结束；`--continue` 不会重新提交已在序列外结束的停止项，而是继续应用剩余提交。
 
 ## 选项
 
@@ -256,7 +256,7 @@ Git 维护 `.git/CHERRY_PICK_HEAD` 与 sequencer 状态文件。Libra 把进行�
 
 ### 行级冲突 hunk
 
-发散路径以行级冲突标记呈现，与 Git 一致：三方合并（base = 父提交树，ours = 当前索引，theirs = 被 pick 的树）仅把发散的 hunk 包在 `<<<<<<< HEAD` / `=======` / `>>>>>>> <short-source>` 之间，两侧共享的行留在标记之外。删除/修改冲突（某一侧缺失）或二进制内容回退为整文件呈现（此时行级合并无意义）。`>>>>>>>` 标签为被 pick 提交的缩写（Libra 省略了 Git 追加的提交主题）。
+发散路径以行级冲突标记呈现，与 Git 一致：三方合并（base = 父提交树，ours = 当前索引，theirs = 被 pick 的树）仅把发散的 hunk 包在 `<<<<<<< HEAD` / `=======` / `>>>>>>> <abbrev7> (<subject>)` 之间，两侧共享的行留在标记之外。删除/修改冲突（某一侧缺失）或二进制内容回退为整文件呈现（此时行级合并无意义）。`merge.conflictStyle=diff3` 时祖先标签为 `parent of <abbrev7> (<subject>)`。
 
 Git 兼容配置 `merge.conflictStyle` 同样被尊重（与 `libra merge` 一致）：`merge` 重新 diff 双方 postimage 以移出共同边缘和较长共同片段；`diff3` 加入完整 ancestor 块；`zdiff3` 保留该 ancestor 块并移出共同前后缀。遇到未知值且确实需要内容合并时，会在索引或工作树写入前直接报错。所有可识别输入行尾均为 CRLF 时 marker 行也使用 CRLF，否则使用 LF。详见 [merge 文档](merge.md)。
 
@@ -313,3 +313,8 @@ Git 兼容配置 `merge.conflictStyle` 同样被尊重（与 `libra merge` 一�
 
 Cherry-pick revision 使用 sidecar Change ID 投影和类型化 predecessor 谱系。已有 commit header
 仍可用于导入读取，但新提交不依赖也不会注入 `change-id` header。
+
+## Issue #477 notes
+
+--continue 不会重新提交已在序列外结束的停止项
+冲突标记以缩写提交与主题标注被 pick 的一侧

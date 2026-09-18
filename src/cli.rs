@@ -2601,7 +2601,199 @@ fn is_top_level_unknown_command(argv: &[std::ffi::OsString], err: &clap::Error) 
     None
 }
 
+/// A declined interactive flag (HF-14 / ADR-HF-14). Unknown clap arguments in
+/// this table become `LBR-UNSUPPORTED-001` instead of a misleading usage error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeclinedInteractiveFlag {
+    pub command: &'static str,
+    pub nested: Option<&'static str>,
+    pub flags: &'static [&'static str],
+    pub message: &'static str,
+    pub hints: &'static [&'static str],
+    pub docs_anchor: &'static str,
+}
+
+/// Single source of truth for remaining D15/D16 interactive refusals.
+pub const DECLINED_INTERACTIVE_FLAGS: &[DeclinedInteractiveFlag] = &[
+    DeclinedInteractiveFlag {
+        command: "add",
+        nested: None,
+        flags: &["-i", "--interactive"],
+        message: "interactive add is not supported",
+        hints: &[
+            "see D15 in docs/development/commands/_compatibility.md",
+            "use 'libra add -p' or 'libra add <pathspec>'",
+        ],
+        docs_anchor: "D15",
+    },
+    DeclinedInteractiveFlag {
+        command: "commit",
+        nested: None,
+        flags: &["-p", "--patch", "--interactive"],
+        message: "interactive commit is not supported",
+        hints: &[
+            "see D15 in docs/development/commands/_compatibility.md",
+            "stage paths with 'libra add <pathspec>' then commit",
+        ],
+        docs_anchor: "D15",
+    },
+    DeclinedInteractiveFlag {
+        command: "restore",
+        nested: None,
+        flags: &["-p", "--patch"],
+        message: "patch mode is not supported for restore",
+        hints: &[
+            "see D15 in docs/development/commands/_compatibility.md",
+            "use 'libra restore <pathspec>' or 'libra restore --staged <pathspec>'",
+        ],
+        docs_anchor: "D15",
+    },
+    DeclinedInteractiveFlag {
+        command: "checkout",
+        nested: None,
+        flags: &["-p", "--patch"],
+        message: "patch mode is not supported for checkout",
+        hints: &[
+            "see D15 in docs/development/commands/_compatibility.md",
+            "use 'libra checkout <pathspec>' or 'libra restore <pathspec>'",
+        ],
+        docs_anchor: "D15",
+    },
+    DeclinedInteractiveFlag {
+        command: "checkout",
+        nested: None,
+        flags: &["--no-auto-advance"],
+        message: "the option '--no-auto-advance' requires '--patch'",
+        hints: &[
+            "patch mode is not supported for checkout (D15)",
+            "use 'libra checkout <pathspec>' or 'libra restore <pathspec>'",
+        ],
+        docs_anchor: "D15",
+    },
+    DeclinedInteractiveFlag {
+        command: "checkout",
+        nested: None,
+        flags: &["--auto-advance"],
+        message: "the option '--auto-advance' requires '--patch'",
+        hints: &[
+            "patch mode is not supported for checkout (D15)",
+            "use 'libra checkout <pathspec>' or 'libra restore <pathspec>'",
+        ],
+        docs_anchor: "D15",
+    },
+    DeclinedInteractiveFlag {
+        command: "stash",
+        nested: None,
+        flags: &["-p", "--patch"],
+        message: "patch mode is not supported for stash",
+        hints: &[
+            "see D15 in docs/development/commands/_compatibility.md",
+            "use 'libra stash push -m <message>' or 'libra stash push -- <pathspec>'",
+        ],
+        docs_anchor: "D15",
+    },
+    DeclinedInteractiveFlag {
+        command: "stash",
+        nested: Some("push"),
+        flags: &["-p", "--patch"],
+        message: "patch mode is not supported for stash push",
+        hints: &[
+            "see D15 in docs/development/commands/_compatibility.md",
+            "use 'libra stash push -m <message>' or 'libra stash push -- <pathspec>'",
+        ],
+        docs_anchor: "D15",
+    },
+    DeclinedInteractiveFlag {
+        command: "stash",
+        nested: Some("push"),
+        flags: &["--no-auto-advance"],
+        message: "the option '--no-auto-advance' requires '--patch'",
+        hints: &[
+            "patch mode is not supported for stash push (D15)",
+            "use 'libra stash push -m <message>' or 'libra stash push -- <pathspec>'",
+        ],
+        docs_anchor: "D15",
+    },
+    DeclinedInteractiveFlag {
+        command: "stash",
+        nested: Some("push"),
+        flags: &["--auto-advance"],
+        message: "the option '--auto-advance' requires '--patch'",
+        hints: &[
+            "patch mode is not supported for stash push (D15)",
+            "use 'libra stash push -m <message>' or 'libra stash push -- <pathspec>'",
+        ],
+        docs_anchor: "D15",
+    },
+    DeclinedInteractiveFlag {
+        command: "rebase",
+        nested: None,
+        flags: &["-r", "--rebase-merges"],
+        message: "rebase --rebase-merges is not supported",
+        hints: &[
+            "see D16 in docs/development/commands/_compatibility.md",
+            "linear history can use 'libra rebase -i'",
+        ],
+        docs_anchor: "D16",
+    },
+];
+
+fn clap_invalid_arg(err: &clap::Error) -> Option<String> {
+    match err.get(ContextKind::InvalidArg) {
+        Some(ContextValue::String(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn known_nested_subcommand(command: &str, token: &str) -> bool {
+    matches!(
+        (command, token),
+        (
+            "stash",
+            "push" | "pop" | "list" | "apply" | "drop" | "show" | "branch" | "clear" | "save"
+        )
+    )
+}
+
+fn invocation_command_chain(argv: &[std::ffi::OsString]) -> Option<(&str, Option<&str>)> {
+    let (index, _) = find_subcommand_index(argv)?;
+    let command = argv.get(index)?.to_str()?;
+    let nested = argv[index + 1..]
+        .iter()
+        .filter_map(|arg| arg.to_str())
+        .find(|token| *token != "--" && !token.starts_with('-'))
+        .filter(|token| known_nested_subcommand(command, token));
+    Some((command, nested))
+}
+
+pub fn lookup_declined_interactive(
+    argv: &[std::ffi::OsString],
+    err: &clap::Error,
+) -> Option<&'static DeclinedInteractiveFlag> {
+    let (command, nested) = invocation_command_chain(argv)?;
+    let invalid = clap_invalid_arg(err);
+    DECLINED_INTERACTIVE_FLAGS.iter().find(|entry| {
+        if entry.command != command || entry.nested != nested {
+            return false;
+        }
+        if let Some(flag) = invalid.as_deref() {
+            return entry.flags.contains(&flag);
+        }
+        argv.iter()
+            .filter_map(|arg| arg.to_str())
+            .any(|token| entry.flags.contains(&token))
+    })
+}
+
 fn classify_parse_error(argv: &[std::ffi::OsString], err: &clap::Error) -> CliError {
+    if let Some(entry) = lookup_declined_interactive(argv, err) {
+        let mut cli_error = CliError::failure(entry.message)
+            .with_stable_code(utils::error::StableErrorCode::Unsupported);
+        for hint in entry.hints {
+            cli_error = cli_error.with_hint(*hint);
+        }
+        return cli_error;
+    }
     if let Some(cmd) = is_top_level_unknown_command(argv, err) {
         let hints = top_level_unknown_command_hints(err);
         let mut cli_error = CliError::unknown_command(format!(
@@ -4005,5 +4197,63 @@ mod tests {
         // Libra accepts the flag after the subcommand (intentional vs Git).
         let after = Cli::try_parse_from(["libra", "add", "--literal-pathspecs", "."]).unwrap();
         assert!(after.literal_pathspecs);
+    }
+
+    fn os_argv(args: &[&str]) -> Vec<std::ffi::OsString> {
+        args.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    fn parse_err(args: &[&str]) -> clap::Error {
+        Cli::try_parse_from(args).expect_err("expected a clap parse failure")
+    }
+
+    #[test]
+    fn declined_interactive_table_maps_add_interactive() {
+        let argv = os_argv(&["libra", "add", "--interactive"]);
+        let err = parse_err(&["libra", "add", "--interactive"]);
+        let hit = lookup_declined_interactive(&argv, &err).expect("add --interactive");
+        assert_eq!(hit.command, "add");
+        assert_eq!(hit.docs_anchor, "D15");
+    }
+
+    #[test]
+    fn declined_interactive_table_maps_add_dash_i_with_pathspec() {
+        let argv = os_argv(&["libra", "add", "-i", "good.txt"]);
+        let err = parse_err(&["libra", "add", "-i", "good.txt"]);
+        let hit = lookup_declined_interactive(&argv, &err).expect("add -i path");
+        assert_eq!(hit.command, "add");
+        assert!(hit.nested.is_none());
+    }
+
+    #[test]
+    fn declined_interactive_table_misses_unknown_add_flag() {
+        let argv = os_argv(&["libra", "add", "--bogus"]);
+        let err = parse_err(&["libra", "add", "--bogus"]);
+        assert!(
+            lookup_declined_interactive(&argv, &err).is_none(),
+            "table-miss must stay a plain clap usage error"
+        );
+    }
+
+    #[test]
+    fn declined_interactive_table_maps_checkout_no_auto_advance() {
+        let argv = os_argv(&["libra", "checkout", "--no-auto-advance"]);
+        let err = parse_err(&["libra", "checkout", "--no-auto-advance"]);
+        let hit = lookup_declined_interactive(&argv, &err).expect("checkout --no-auto-advance");
+        assert!(hit.message.contains("requires '--patch'"));
+    }
+
+    #[test]
+    fn declined_interactive_table_covers_every_docs_anchor() {
+        assert!(
+            DECLINED_INTERACTIVE_FLAGS
+                .iter()
+                .all(|entry| entry.docs_anchor == "D15" || entry.docs_anchor == "D16")
+        );
+        assert!(
+            DECLINED_INTERACTIVE_FLAGS
+                .iter()
+                .any(|entry| entry.docs_anchor == "D16")
+        );
     }
 }
