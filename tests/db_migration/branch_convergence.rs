@@ -13,14 +13,15 @@ use super::{
 #[path = "branch_convergence/fixtures.rs"]
 mod fixtures;
 use fixtures::{
-    CHANGE_AI_LINK, CHANGE_IDENTITY_PREFIX_INDEX_REPAIR, CONFIG_REPAIR, CONVERGENCE, OPERATION_V2,
-    branch_database, receipts, rows, snapshot,
+    BOUNDARY_CLAIM_COLUMNS, CHANGE_AI_LINK, CHANGE_IDENTITY_PREFIX_INDEX_REPAIR, CONFIG_REPAIR,
+    CONVERGENCE, OPERATION_V2, branch_database, operation_rows_without_boundary_columns, receipts,
+    rows, snapshot,
 };
 
 #[test]
 fn combined_registry_keeps_both_original_migrations_and_adds_a_forward_barrier() {
     let migrations = builtin_migrations();
-    assert_eq!(migrations.len(), 64);
+    assert_eq!(migrations.len(), 65);
     let tail: Vec<_> = migrations
         .iter()
         .filter(|migration| migration.version >= OPERATION_V2)
@@ -39,6 +40,7 @@ fn combined_registry_keeps_both_original_migrations_and_adds_a_forward_barrier()
             ),
             (2026091801, "operation_v1_retirement"),
             (2026091802, "operation_v2_dedup_index"),
+            (BOUNDARY_CLAIM_COLUMNS, "operation_boundary_claim_columns"),
         ]
     );
     assert!(migrations.last().unwrap().down.is_none());
@@ -69,7 +71,12 @@ async fn change_identity_prefix_index_repair_replays_after_old_receipt() {
     let runner = super::all_builtin_runner().unwrap();
     assert_eq!(
         runner.run_pending(&conn).await.unwrap(),
-        vec![CHANGE_IDENTITY_PREFIX_INDEX_REPAIR, 2026091801, 2026091802,]
+        vec![
+            CHANGE_IDENTITY_PREFIX_INDEX_REPAIR,
+            2026091801,
+            2026091802,
+            BOUNDARY_CLAIM_COLUMNS,
+        ]
     );
 
     // Then the repair is durable and subsequent opens are no-ops.
@@ -123,7 +130,7 @@ async fn config_branch_ordinary_open_catches_up_operations_without_rewriting_rec
     assert_eq!(rows(&conn, "config").await, config);
     assert_eq!(rows(&conn, "config_kv").await, modern);
     let after = receipts(&conn).await;
-    assert_eq!(after.len(), 64);
+    assert_eq!(after.len(), 65);
     for (version, name) in [
         (OPERATION_V2, "operation_v2"),
         (CONVERGENCE, "operation_v2_branch_convergence"),
@@ -134,6 +141,7 @@ async fn config_branch_ordinary_open_catches_up_operations_without_rewriting_rec
         ),
         (2026091801, "operation_v1_retirement"),
         (2026091802, "operation_v2_dedup_index"),
+        (BOUNDARY_CLAIM_COLUMNS, "operation_boundary_claim_columns"),
     ] {
         assert_eq!(after.iter().find(|row| row.0 == version).unwrap().1, name);
     }
@@ -143,7 +151,7 @@ async fn config_branch_ordinary_open_catches_up_operations_without_rewriting_rec
             "changed original receipt {receipt:?}"
         );
     }
-    assert_eq!(after.last().unwrap().0, 2026091802);
+    assert_eq!(after.last().unwrap().0, BOUNDARY_CLAIM_COLUMNS);
     let unchanged = snapshot(&conn).await;
     conn.close().await.unwrap();
     let reopened = db::establish_connection(path.to_str().unwrap())
@@ -173,7 +181,7 @@ async fn operation_v2_branch_keeps_modern_rows_without_recopying() {
          BEGIN SELECT RAISE(ABORT,'legacy rows must not be recopied'); END;"
     ).await.unwrap();
     let before = receipts(&conn).await;
-    let modern = rows(&conn, "operation").await;
+    let modern = operation_rows_without_boundary_columns(&conn).await;
     let heads = rows(&conn, "operation_head").await;
     let journals = rows(&conn, "operation_journal").await;
 
@@ -190,9 +198,10 @@ async fn operation_v2_branch_keeps_modern_rows_without_recopying() {
             CHANGE_IDENTITY_PREFIX_INDEX_REPAIR,
             2026091801,
             2026091802,
+            BOUNDARY_CLAIM_COLUMNS,
         ]
     );
-    assert_eq!(rows(&conn, "operation").await, modern);
+    assert_eq!(operation_rows_without_boundary_columns(&conn).await, modern);
     assert_eq!(rows(&conn, "operation_head").await, heads);
     assert_eq!(rows(&conn, "operation_journal").await, journals);
     for table in [
@@ -292,13 +301,13 @@ async fn concurrent_config_branch_upgraders_claim_the_copy_and_barrier_once() {
     assert_eq!(
         applied,
         vec![
-            OPERATION_V2,
             CONVERGENCE,
             CHANGE_AI_LINK,
             CHANGE_IDENTITY_PREFIX_INDEX_REPAIR,
             2026091801,
             2026091802,
+            BOUNDARY_CLAIM_COLUMNS,
         ]
     );
-    assert_eq!(receipts(&left).await.len(), 64);
+    assert_eq!(receipts(&left).await.len(), 65);
 }

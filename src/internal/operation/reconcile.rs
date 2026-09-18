@@ -297,7 +297,21 @@ impl ReconcileEngine {
             reverts_op_id: None,
             predecessor_map_oid: None,
         };
-        self.store.write_operation(&operation).await?;
+        let operation_worktree_id = Some(self.scope.scope.storage_key());
+        let operation_scope_kind = if self.scope.scope.is_linked() {
+            "linked"
+        } else {
+            "main"
+        };
+        self.store
+            .write_operation_with_scope_and_restorable(
+                &operation,
+                operation_worktree_id,
+                operation_scope_kind,
+                "declared",
+                true,
+            )
+            .await?;
         let generation = match self
             .store
             .cas_update_op_heads(

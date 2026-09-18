@@ -101,6 +101,8 @@ Automation clients 使用 `POST /api/code/controller/attach` 连接，请求体 
 
 `GET /api/code/diagnostics` 返回为本地工具准备的脱敏 observe-only 状态摘要。Control attach、detach、submit、respond 和 cancel 操作会通过 runtime audit sink 发出 `local-tui-control/v1` audit events；此标识为兼容既有 audit consumers 而冻结，并不代表仍存在 terminal UI。Stdio automation clients 请优先使用 canonical `libra code --control stdio` JSON-RPC NDJSON client：默认从 `.libra/code/control.json` discovery（可用 `--control-url` / `--control-token-file` / `--control-info-file` 覆盖）。Discovery fail-closed 使用稳定码（`CONTROL_INFO_MISSING`、`CONTROL_INFO_PERMS`、`CONTROL_TOKEN_MISSING`、`CONTROL_TOKEN_PERMS`、`CONTROL_SCOPE_CONFLICT`、`CONTROL_SERVER_MISSING`）；attach lease/ownership 冲突以 JSON-RPC `-32000` + Libra 码（如 `CONTROLLER_CONFLICT`）返回。原 `libra code-control` 转发 shim 已在 **W5 breaking 发布（W5-01）中删除**；`libra code --control stdio` 是唯一的 stdio automation client（见[迁移说明](code-control.md)）。弃用的 `libra code --stdio` 仍是 **MCP-only** tools/resources 传输（stderr 弃用警告；非 turn control），不得与 `--control stdio` 混同；独立的 `libra mcp --stdio` 计划在 W5 之后。
 
+`GET /api/code/operation-graph` 是 loopback-only、只读的有界脱敏 Operation v2 图投影。它接受可选的 `scope`、`limit` 和 `cursor` 查询参数，不暴露 prompt、transcript、secret 或写控制。
+
 Stdio client 在 stdin/stdout 上使用换行分隔的 JSON-RPC 2.0，并把方法映射到 loopback `/api/code/*` HTTP/SSE 控制接口：
 
 | JSON-RPC 方法 | HTTP 等价接口 |

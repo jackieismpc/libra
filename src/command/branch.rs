@@ -39,6 +39,7 @@ use crate::{
         head::Head,
         operation::{current_operation_id, store},
         workspace::RepoIdentity,
+        worktree_scope::WorktreeScope,
     },
     utils::{
         error::{CliError, CliResult, StableErrorCode, emit_warning},
@@ -688,6 +689,8 @@ async fn record_branch_reset_operation_digest(branch: &str, new_commit: &str) ->
 
     let payload = format!("reset\0{branch}\0{new_commit}");
     let args_digest = format!("sha256:{}", hex::encode(Sha256::digest(payload.as_bytes())));
+    let scope = WorktreeScope::for_request();
+    let worktree_id = scope.storage_key();
     let database = get_db_conn_instance().await;
     let repo_id = RepoIdentity::resolve(&database)
         .await
@@ -695,6 +698,7 @@ async fn record_branch_reset_operation_digest(branch: &str, new_commit: &str) ->
     if let Some(previous_operation) = store::find_recent_success_by_args_digest(
         &database,
         repo_id.as_str(),
+        worktree_id,
         "branch",
         &args_digest,
     )

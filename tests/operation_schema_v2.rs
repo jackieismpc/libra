@@ -285,4 +285,16 @@ async fn operation_v2_migration_is_forward_only_and_versioned() {
             .await
             .contains(&"ordinal".to_string())
     );
+    let operation_columns = table_columns(&conn, "operation").await;
+    for column in [
+        "restorable",
+        "control_slot",
+        "claim_owner",
+        "scope_provenance",
+    ] {
+        assert!(
+            operation_columns.iter().any(|actual| actual == column),
+            "operation v2 must retain boundary-claim column {column}"
+        );
+    }
 }

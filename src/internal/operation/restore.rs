@@ -69,6 +69,10 @@ pub enum RestoreWhat {
 pub enum RestoreError {
     #[error("restore target view is missing workspace '{0}'")]
     WorkspaceMissing(String),
+    #[error("restore target operation does not capture a fully restorable worktree state")]
+    NonRestorableOperation,
+    #[error("operation ran in the {recorded} worktree, but this is worktree {current}")]
+    WrongScope { recorded: String, current: String },
     #[error("restore target snapshot is not fully restorable")]
     IncompleteSnapshot,
     #[error("restore target is not valid for this worktree: {0}")]
@@ -123,6 +127,14 @@ struct DryRunSnapshot {
     _scratch: tempfile::TempDir,
 }
 
+struct ValidatedRestoreTarget {
+    target_op_id: String,
+    target_view_oid: ObjectHash,
+    view: RepoViewV2,
+    snapshot: WorkspaceSnapshotV2,
+    workspace_id: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RestoreInstallEntry {
     path: String,
@@ -163,6 +175,21 @@ impl RestoreEngine {
 
     pub fn scope_key(&self) -> String {
         self.scope.scope.storage_key().to_string()
+    }
+
+    /// Validate a restore target without inspecting or changing the current
+    /// working tree. Callers use this before their own dirty-worktree policy
+    /// so an invalid target reports its actual reason deterministically.
+    pub(crate) async fn validate_target(
+        &self,
+        target_op_id: impl Into<String>,
+        target_view_oid: ObjectHash,
+        kind: OperationKind,
+        confirm_repo_wide: bool,
+    ) -> Result<(), RestoreError> {
+        self.load_validated_target(target_op_id, target_view_oid, kind, confirm_repo_wide)
+            .await
+            .map(|_| ())
     }
 
     /// Restore one view.  A target with multiple workspaces is rejected unless
@@ -292,59 +319,16 @@ impl RestoreEngine {
         reverts_op_id: Option<String>,
         expected_head: Option<String>,
     ) -> Result<RestoreReceipt, RestoreError> {
-        let target_op_id = target_op_id.into();
-        let target_operation = self
-            .store
-            .load_operation(&target_op_id)
-            .await
-            .map_err(|error| RestoreError::Storage(error.to_string()))?
-            .ok_or_else(|| {
-                RestoreError::Storage(format!("operation '{target_op_id}' not found"))
-            })?;
-        if target_operation.status != OperationStatusV2::Success {
-            return Err(RestoreError::Storage(format!(
-                "operation '{target_op_id}' is not a completed success"
-            )));
-        }
-        if kind != OperationKind::Revert
-            && target_operation.post_view_oid != target_view_oid
-            && target_operation.pre_view_oid != target_view_oid
-        {
-            return Err(RestoreError::WrongWorkspace(format!(
-                "operation '{target_op_id}' does not publish target view {target_view_oid}"
-            )));
-        }
-        let view = self
-            .store
-            .load_view(&target_view_oid)
-            .map_err(|error| RestoreError::Storage(error.to_string()))?;
-        view.validate_recursive_closure(|oid| self.store.load_object(oid).ok())
-            .map_err(|error| RestoreError::Storage(error.to_string()))?;
-        if view.repo_id != self.repo_id {
-            return Err(RestoreError::WrongWorkspace(format!(
-                "target belongs to repository '{}', expected '{}'",
-                view.repo_id, self.repo_id
-            )));
-        }
-        let workspace_id = workspace_id(&self.scope);
-        if view.workspaces.len() != 1 && !confirm_repo_wide {
-            return Err(RestoreError::HeadConfirmationRequired);
-        }
-        let snapshot_oid = view
-            .workspaces
-            .get(&workspace_id)
-            .copied()
-            .ok_or_else(|| RestoreError::WorkspaceMissing(workspace_id.clone()))?;
-        let snapshot = self
-            .store
-            .load_snapshot(&snapshot_oid)
-            .map_err(|error| RestoreError::Storage(error.to_string()))?;
-        if snapshot.workspace_id != workspace_id {
-            return Err(RestoreError::WrongWorkspace(snapshot.workspace_id));
-        }
-        if snapshot.completeness != Completeness::Full {
-            return Err(RestoreError::IncompleteSnapshot);
-        }
+        let target = self
+            .load_validated_target(target_op_id, target_view_oid, kind, confirm_repo_wide)
+            .await?;
+        let ValidatedRestoreTarget {
+            target_op_id,
+            target_view_oid,
+            view,
+            snapshot,
+            workspace_id,
+        } = target;
         let selected = selected_facets(what);
         let changed_paths = if dry_run {
             let current = self.capture_current_snapshot(0).await?;
@@ -464,8 +448,20 @@ impl RestoreEngine {
             reverts_op_id,
             predecessor_map_oid: None,
         };
+        let operation_worktree_id = Some(self.scope.scope.storage_key());
+        let operation_scope_kind = if self.scope.scope.is_linked() {
+            "linked"
+        } else {
+            "main"
+        };
         self.store
-            .write_operation(&operation)
+            .write_operation_with_scope_and_restorable(
+                &operation,
+                operation_worktree_id,
+                operation_scope_kind,
+                "declared",
+                true,
+            )
             .await
             .map_err(|error| RestoreError::Storage(error.to_string()))?;
         if let Err(error) = self
@@ -718,6 +714,105 @@ impl RestoreEngine {
         }
         receipt.new_op_id = Some(op_id);
         Ok(receipt)
+    }
+
+    async fn load_validated_target(
+        &self,
+        target_op_id: impl Into<String>,
+        target_view_oid: ObjectHash,
+        kind: OperationKind,
+        confirm_repo_wide: bool,
+    ) -> Result<ValidatedRestoreTarget, RestoreError> {
+        let target_op_id = target_op_id.into();
+        if self
+            .store
+            .operation_is_restorable(&target_op_id)
+            .await
+            .map_err(|error| RestoreError::Storage(error.to_string()))?
+            .is_some_and(|restorable| !restorable)
+        {
+            return Err(RestoreError::NonRestorableOperation);
+        }
+        let current_workspace_id = workspace_id(&self.scope);
+        if let Some((worktree_id, scope_kind, scope_provenance)) = self
+            .store
+            .operation_scope(&target_op_id)
+            .await
+            .map_err(|error| RestoreError::Storage(error.to_string()))?
+        {
+            let recorded_workspace_id = match (scope_provenance.as_str(), scope_kind.as_str()) {
+                ("declared", "main") => "main".to_string(),
+                ("declared", "linked") => worktree_id
+                    .filter(|worktree_id| !worktree_id.is_empty())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                _ => "unknown".to_string(),
+            };
+            if recorded_workspace_id != current_workspace_id {
+                return Err(RestoreError::WrongScope {
+                    recorded: recorded_workspace_id,
+                    current: current_workspace_id,
+                });
+            }
+        }
+        let target_operation = self
+            .store
+            .load_operation(&target_op_id)
+            .await
+            .map_err(|error| RestoreError::Storage(error.to_string()))?
+            .ok_or_else(|| {
+                RestoreError::Storage(format!("operation '{target_op_id}' not found"))
+            })?;
+        if target_operation.status != OperationStatusV2::Success {
+            return Err(RestoreError::Storage(format!(
+                "operation '{target_op_id}' is not a completed success"
+            )));
+        }
+        if kind != OperationKind::Revert
+            && target_operation.post_view_oid != target_view_oid
+            && target_operation.pre_view_oid != target_view_oid
+        {
+            return Err(RestoreError::WrongWorkspace(format!(
+                "operation '{target_op_id}' does not publish target view {target_view_oid}"
+            )));
+        }
+        let view = self
+            .store
+            .load_view(&target_view_oid)
+            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        view.validate_recursive_closure(|oid| self.store.load_object(oid).ok())
+            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        if view.repo_id != self.repo_id {
+            return Err(RestoreError::WrongWorkspace(format!(
+                "target belongs to repository '{}', expected '{}'",
+                view.repo_id, self.repo_id
+            )));
+        }
+        let workspace_id = current_workspace_id;
+        if view.workspaces.len() != 1 && !confirm_repo_wide {
+            return Err(RestoreError::HeadConfirmationRequired);
+        }
+        let snapshot_oid = view
+            .workspaces
+            .get(&workspace_id)
+            .copied()
+            .ok_or_else(|| RestoreError::WorkspaceMissing(workspace_id.clone()))?;
+        let snapshot = self
+            .store
+            .load_snapshot(&snapshot_oid)
+            .map_err(|error| RestoreError::Storage(error.to_string()))?;
+        if snapshot.workspace_id != workspace_id {
+            return Err(RestoreError::WrongWorkspace(snapshot.workspace_id));
+        }
+        if snapshot.completeness != Completeness::Full {
+            return Err(RestoreError::IncompleteSnapshot);
+        }
+        Ok(ValidatedRestoreTarget {
+            target_op_id,
+            target_view_oid,
+            view,
+            snapshot,
+            workspace_id,
+        })
     }
 
     async fn capture_current_state(

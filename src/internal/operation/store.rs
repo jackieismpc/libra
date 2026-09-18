@@ -430,6 +430,39 @@ impl OperationStoreV2 {
     }
 
     pub async fn write_operation(&self, operation: &OperationV2) -> Result<(), StoreError> {
+        self.write_operation_with_scope_and_restorable(
+            operation,
+            None,
+            "repository",
+            "declared",
+            true,
+        )
+        .await
+    }
+
+    pub async fn write_operation_with_restorable(
+        &self,
+        operation: &OperationV2,
+        restorable: bool,
+    ) -> Result<(), StoreError> {
+        self.write_operation_with_scope_and_restorable(
+            operation,
+            None,
+            "repository",
+            "declared",
+            restorable,
+        )
+        .await
+    }
+
+    pub async fn write_operation_with_scope_and_restorable(
+        &self,
+        operation: &OperationV2,
+        worktree_id: Option<&str>,
+        scope_kind: &str,
+        scope_provenance: &str,
+        restorable: bool,
+    ) -> Result<(), StoreError> {
         if self.repo_id.is_empty() {
             return Err(StoreError::Validation(
                 "operation store repository id cannot be empty".to_string(),
@@ -440,40 +473,55 @@ impl OperationStoreV2 {
                 "operation id cannot be empty".to_string(),
             ));
         }
+        if !matches!(scope_kind, "main" | "linked" | "repository" | "unknown") {
+            return Err(StoreError::Validation(format!(
+                "invalid operation scope kind '{scope_kind}'"
+            )));
+        }
+        if !matches!(scope_provenance, "declared" | "unknown") {
+            return Err(StoreError::Validation(format!(
+                "invalid operation scope provenance '{scope_provenance}'"
+            )));
+        }
         validate_parent_ids(&operation.op_id, &operation.parent_op_ids)?;
 
         let txn = begin_write_transaction(&self.db).await?;
         let start_ts = Utc::now().timestamp_millis();
         let insert_result = txn
-             .execute_raw(Statement::from_sql_and_values(
-                 DbBackend::Sqlite,
-                 "INSERT INTO operation (op_id, repo_id, format_version, kind, status, \
-                  command_name, description, args_digest, actor, worktree_id, scope_kind, \
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO operation (op_id, repo_id, format_version, kind, status, \
+                 command_name, description, args_digest, actor, worktree_id, scope_kind, \
+                  scope_provenance, \
                   pre_view_oid, post_view_oid, restores_op_id, reverts_op_id, \
-                  predecessor_map_oid, causal_context_id, start_ts, end_ts) \
-                  VALUES (?, ?, 2, ?, ?, ?, ?, ?, ?, NULL, 'repository', ?, ?, ?, ?, ?, ?, ?, NULL)",
-                 [
-                     operation.op_id.clone().into(),
-                     self.repo_id.clone().into(),
-                     operation.kind.to_string().into(),
-                     operation.status.to_string().into(),
-                     operation.metadata.command_name.clone().into(),
-                     operation.metadata.description.clone().into(),
-                     operation.metadata.args_digest.clone().into(),
-                     operation.metadata.actor.clone().into(),
-                     operation.pre_view_oid.to_string().into(),
-                     operation.post_view_oid.to_string().into(),
-                     operation.restores_op_id.clone().into(),
-                     operation.reverts_op_id.clone().into(),
-                     operation
-                         .predecessor_map_oid
-                         .map(|oid| oid.to_string())
-                         .into(),
-                     operation.metadata.causal_context_id.clone().into(),
-                     start_ts.into(),
-                 ],
-             ))
-             .await;
+                  predecessor_map_oid, causal_context_id, restorable, start_ts, end_ts) \
+                  VALUES (?, ?, 2, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                [
+                    operation.op_id.clone().into(),
+                    self.repo_id.clone().into(),
+                    operation.kind.to_string().into(),
+                    operation.status.to_string().into(),
+                    operation.metadata.command_name.clone().into(),
+                    operation.metadata.description.clone().into(),
+                    operation.metadata.args_digest.clone().into(),
+                    operation.metadata.actor.clone().into(),
+                    worktree_id.map(ToOwned::to_owned).into(),
+                    scope_kind.to_string().into(),
+                    scope_provenance.to_string().into(),
+                    operation.pre_view_oid.to_string().into(),
+                    operation.post_view_oid.to_string().into(),
+                    operation.restores_op_id.clone().into(),
+                    operation.reverts_op_id.clone().into(),
+                    operation
+                        .predecessor_map_oid
+                        .map(|oid| oid.to_string())
+                        .into(),
+                    operation.metadata.causal_context_id.clone().into(),
+                    (restorable as i64).into(),
+                    start_ts.into(),
+                ],
+            ))
+            .await;
         if let Err(error) = insert_result {
             let _ = txn.rollback().await;
             return Err(StoreError::Database(error));
@@ -498,6 +546,50 @@ impl OperationStoreV2 {
         }
         txn.commit().await?;
         Ok(())
+    }
+
+    pub async fn operation_is_restorable(&self, op_id: &str) -> Result<Option<bool>, StoreError> {
+        let row = self
+            .db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT restorable FROM operation WHERE repo_id = ? AND op_id = ?",
+                [self.repo_id.clone().into(), op_id.to_string().into()],
+            ))
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        match row.try_get::<i64>("", "restorable")? {
+            0 => Ok(Some(false)),
+            1 => Ok(Some(true)),
+            value => Err(StoreError::Validation(format!(
+                "operation '{op_id}' has invalid restorable value {value}"
+            ))),
+        }
+    }
+
+    pub async fn operation_scope(
+        &self,
+        op_id: &str,
+    ) -> Result<Option<(Option<String>, String, String)>, StoreError> {
+        let row = self
+            .db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT worktree_id, scope_kind, scope_provenance \
+                 FROM operation WHERE repo_id = ? AND op_id = ?",
+                [self.repo_id.clone().into(), op_id.to_string().into()],
+            ))
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some((
+            row.try_get::<Option<String>>("", "worktree_id")?,
+            row.try_get::<String>("", "scope_kind")?,
+            row.try_get::<String>("", "scope_provenance")?,
+        )))
     }
 
     /// Load one operation and its ordered parent edges for target validation.
@@ -1137,6 +1229,7 @@ impl OperationStoreV2 {
 pub(crate) async fn find_recent_success_by_args_digest(
     db: &DatabaseConnection,
     repo_id: &str,
+    worktree_id: &str,
     command_name: &str,
     args_digest: &str,
 ) -> Result<Option<String>, StoreError> {
@@ -1145,12 +1238,14 @@ pub(crate) async fn find_recent_success_by_args_digest(
         .query_one_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "SELECT op_id FROM operation \
-             WHERE repo_id = ? AND scope_kind = 'repository' \
+             WHERE repo_id = ? AND (worktree_id = ? OR (? = '' AND worktree_id IS NULL)) \
                AND command_name = ? AND args_digest = ? \
                AND status = 'success' AND end_ts >= ? \
-             ORDER BY end_ts DESC, op_id DESC LIMIT 1",
+               ORDER BY end_ts DESC, op_id DESC LIMIT 1",
             [
                 repo_id.to_string().into(),
+                worktree_id.to_string().into(),
+                worktree_id.to_string().into(),
                 command_name.to_string().into(),
                 args_digest.to_string().into(),
                 cutoff.into(),

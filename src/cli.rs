@@ -1961,6 +1961,9 @@ async fn operation_class_for_command(
     ) {
         return MutationClass::ReadOnly;
     }
+    if matches!(command, Commands::Merge(args) if args.dry_run) {
+        return MutationClass::ReadOnly;
+    }
     if matches!(command_scope(command), CommandScope::ReadOnly) {
         return MutationClass::ReadOnly;
     }
@@ -2043,6 +2046,14 @@ fn command_has_existing_operation_boundary(command: &Commands) -> bool {
             | Commands::Agent(_)
             | Commands::Review(_)
             | Commands::Investigate(_)
+    ) || matches!(
+        command,
+        Commands::Worktree(command::worktree::WorktreeArgs {
+            command: command::worktree::WorktreeSubcommand::Remove {
+                delete_dir: true,
+                ..
+            },
+        })
     )
 }
 
@@ -3219,6 +3230,10 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
         command_handles_background_index_failures,
         background_index_scope,
     );
+
+    if use_central_operation_boundary && let Commands::Merge(merge_args) = &args.command {
+        command::merge::preflight_before_operation_boundary(merge_args, &output).await?;
+    }
 
     let remote_prune_name = match &args.command {
         Commands::Remote(command::remote::RemoteCmds::Prune {

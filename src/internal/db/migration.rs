@@ -311,13 +311,19 @@ impl MigrationRunner {
         Fut: std::future::Future<Output = ()>,
     {
         ensure_schema_versions_table(conn).await?;
-        let _current = self.current_version(conn).await?;
+        let current = self.current_version(conn).await?;
         gate().await;
         let mut applied_versions = applied_schema_versions(conn).await?;
         let mut applied = Vec::new();
 
         for migration in &self.migrations {
-            if applied_versions.contains(&migration.version) {
+            // A later receipt is a forward barrier for independently shipped
+            // migration branches. Once the database has recorded a higher
+            // version, an absent lower receipt is historical divergence, not
+            // a pending migration to replay.
+            if applied_versions.contains(&migration.version)
+                || current.is_some_and(|version| migration.version < version)
+            {
                 continue;
             }
             // A guard SQL cannot express (§C.4.3): the layer/sparse scope
@@ -367,14 +373,16 @@ impl MigrationRunner {
         target: i64,
     ) -> Result<Vec<i64>, MigrationError> {
         ensure_schema_versions_table(conn).await?;
-        let _current = self.current_version(conn).await?;
+        let current = self.current_version(conn).await?;
         let mut applied_versions = applied_schema_versions(conn).await?;
         let mut applied = Vec::new();
         for migration in &self.migrations {
             if migration.version > target {
                 break;
             }
-            if applied_versions.contains(&migration.version) {
+            if applied_versions.contains(&migration.version)
+                || current.is_some_and(|version| migration.version < version)
+            {
                 continue;
             }
             if apply_one_migration(conn, migration).await? {
@@ -1850,6 +1858,14 @@ pub(crate) fn repository_migrations() -> Vec<Migration> {
             up: include_str!("../../../sql/migrations/2026091802_operation_v2_dedup_index.sql"),
             down: None,
         },
+        Migration {
+            version: 2026091901,
+            name: "operation_boundary_claim_columns",
+            up: include_str!(
+                "../../../sql/migrations/2026091901_operation_boundary_claim_columns.sql"
+            ),
+            down: None,
+        },
     ]
 }
 
@@ -2310,9 +2326,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 64);
+        assert_eq!(runner.len(), 65);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026091802));
+        assert_eq!(runner.max_registered_version(), Some(2026091901));
     }
 
     #[test]

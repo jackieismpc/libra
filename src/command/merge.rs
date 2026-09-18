@@ -228,7 +228,7 @@ fn select_whitespace_mode(current: &mut Option<MergeWhitespace>, candidate: Merg
     }
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(after_help = MERGE_EXAMPLES)]
 pub struct MergeArgs {
     /// One or more branches to merge into the current branch; each may be a
@@ -1317,6 +1317,42 @@ pub async fn execute_safe(args: MergeArgs, output: &OutputConfig) -> CliResult<(
         return Err(CliError::silent_exit(1));
     }
     Ok(())
+}
+
+/// Run the merge's read-only validation before the central operation boundary
+/// captures a durable pre-snapshot. A rejected merge must not create snapshot
+/// objects merely because the generic boundary ran before the command's own
+/// validation. The real command is still executed afterwards, so successful
+/// merges retain the normal operation record and snapshots.
+pub(crate) async fn preflight_before_operation_boundary(
+    args: &MergeArgs,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    if args.dry_run
+        || args.branch.is_empty()
+        || args.continue_merge
+        || args.abort
+        || args.restart
+        || args.quit
+    {
+        return Ok(());
+    }
+
+    let mut preview = args.clone();
+    preview.dry_run = true;
+    preview.autostash = false;
+    preview.no_autostash = false;
+    preview.edit = false;
+    preview.squash = false;
+    preview.no_commit = false;
+    preview.gpg_sign = false;
+    preview.no_gpg_sign = false;
+    preview.signoff = false;
+
+    match execute_safe(preview, &output.child_output_config()).await {
+        Err(error) if error.is_silent() && error.exit_code() == 1 => Ok(()),
+        result => result,
+    }
 }
 
 /// `--stat`: print a Git-style diffstat of what the merge changed (pre-merge

@@ -12,9 +12,9 @@ use crate::{
         config::ConfigKv,
         db::get_db_conn_instance,
         operation::{
-            DoctorEngine, DoctorReport, OperationStoreV2, ReconcileEngine, ReconcileError,
-            ReconcileOutcome, RestoreEngine, RestoreError, RestoreReceipt, RestoreWhat, UndoEngine,
-            UndoError,
+            DoctorEngine, DoctorReport, OperationKind, OperationStoreV2, ReconcileEngine,
+            ReconcileError, ReconcileOutcome, RestoreEngine, RestoreError, RestoreReceipt,
+            RestoreWhat, UndoEngine, UndoError,
         },
         worktree_scope::RequestScope,
     },
@@ -546,8 +546,12 @@ fn undo_cli_error(error: UndoError) -> CliError {
         }
         UndoError::Restore(RestoreError::HeadConfirmationRequired)
         | UndoError::Restore(RestoreError::WrongWorkspace(_))
+        | UndoError::Restore(RestoreError::WrongScope { .. })
         | UndoError::Restore(RestoreError::Cas(_)) => CliError::fatal(error.to_string())
             .with_stable_code(StableErrorCode::ConflictOperationBlocked),
+        UndoError::Restore(RestoreError::NonRestorableOperation) => {
+            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::CliInvalidTarget)
+        }
         UndoError::Restore(RestoreError::Storage(message))
             if message.contains("not found") || message.contains("not a completed") =>
         {
@@ -937,12 +941,24 @@ async fn handle_v2_restore(
         .await
         .map_err(|error| CliError::fatal(format!("failed to load v2 operation: {error}")))?
         .ok_or_else(|| CliError::fatal(format!("v2 operation '{op_id}' not found")))?;
+    let engine = RestoreEngine::new(operation_scope, repo_id, db.clone(), object_storage);
+    engine
+        .validate_target(
+            op_id.to_string(),
+            operation.post_view_oid,
+            OperationKind::Restore,
+            confirm_repo_wide,
+        )
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!("v2 restore failed: {error}"))
+                .with_stable_code(restore_error_code(&error))
+        })?;
     if !force && !status::is_clean().await {
         return Err(CliError::fatal("working tree has uncommitted changes")
             .with_stable_code(StableErrorCode::ConflictUnresolved)
             .with_hint("use --force to restore anyway, or commit/stash changes first"));
     }
-    let engine = RestoreEngine::new(operation_scope, repo_id, db.clone(), object_storage);
     let receipt = engine
         .restore(
             op_id.to_string(),
@@ -1137,6 +1153,8 @@ fn restore_error_code(error: &RestoreError) -> StableErrorCode {
     match error {
         RestoreError::WorkspaceMissing(_)
         | RestoreError::WrongWorkspace(_)
+        | RestoreError::WrongScope { .. }
+        | RestoreError::NonRestorableOperation
         | RestoreError::IncompleteSnapshot
         | RestoreError::HeadConfirmationRequired => StableErrorCode::CliInvalidTarget,
         RestoreError::Cas(_) => StableErrorCode::ConflictUnresolved,

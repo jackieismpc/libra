@@ -3876,12 +3876,7 @@ async fn gc_object_source_inventory_covers_every_oid_column() {
     }
     // Semantic OID columns the name heuristic cannot flag — pinned by hand;
     // each must be inventoried too.
-    for (table, column) in [
-        ("legacy_operation_view", "head_target"),
-        ("legacy_operation_view_workspace", "pointer_value"),
-        ("object_index", "o_id"),
-        ("metadata_kv", "value"),
-    ] {
+    for (table, column) in [("object_index", "o_id"), ("metadata_kv", "value")] {
         let inventoried = GC_OBJECT_SOURCE_INVENTORY
             .iter()
             .any(|source| source.location == table && source.column == column);
