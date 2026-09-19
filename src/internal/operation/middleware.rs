@@ -174,6 +174,12 @@ fn operation_needs_repository_lease(meta: &OperationMetaV2, class: MutationClass
     command_may_mutate_shared_refs(command_name)
 }
 
+fn is_worktree_lifecycle_command(meta: &OperationMetaV2) -> bool {
+    meta.command_name
+        .as_deref()
+        .is_some_and(|command| command.split_ascii_whitespace().next() == Some("worktree"))
+}
+
 #[derive(Debug, Error)]
 pub enum OperationError {
     #[error(transparent)]
@@ -400,15 +406,22 @@ where
         ));
     }
     let shared_repository_value = shared_repository.as_ref().map(|entry| entry.value.as_str());
+    let worktree_lifecycle = is_worktree_lifecycle_command(&meta);
     // Repository-wide ref transitions take the common lease before the
     // worktree lease, matching restore's lock order. Worktree-only edits keep
     // their existing concurrency across linked worktrees.
-    let _repository_lease =
-        if operation_needs_repository_lease(&meta, class) && !repository_ref_lease_is_held() {
-            Some(ScopeLease::acquire_repository(scope, &repo_id, shared_repository_value).await?)
+    let _repository_lease = if operation_needs_repository_lease(&meta, class)
+        && !repository_ref_lease_is_held()
+    {
+        let lease = if worktree_lifecycle {
+            ScopeLease::acquire_repository_wait(scope, &repo_id, shared_repository_value).await?
         } else {
-            None
+            ScopeLease::acquire_repository(scope, &repo_id, shared_repository_value).await?
         };
+        Some(lease)
+    } else {
+        None
+    };
     let lease_permissions = LeaseFilePermissions::from_shared_repository(
         shared_repository.as_ref().map(|entry| entry.value.as_str()),
     )?;
@@ -418,6 +431,8 @@ where
     }
     let _lease = if operation_scope_lease_is_held() {
         None
+    } else if worktree_lifecycle {
+        Some(ScopeLease::acquire_with_permissions_wait(scope, &repo_id, lease_permissions).await?)
     } else {
         Some(ScopeLease::acquire_with_permissions(scope, &repo_id, lease_permissions).await?)
     };

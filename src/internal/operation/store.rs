@@ -947,8 +947,9 @@ impl OperationStoreV2 {
             .db
             .query_all_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "SELECT DISTINCT op_id FROM operation_head WHERE repo_id = ? ORDER BY op_id LIMIT 200",
-                [repo_id.to_string().into()],
+                "SELECT DISTINCT op_id FROM operation_head \
+                 WHERE repo_id = ? AND op_id <> ? ORDER BY op_id LIMIT 200",
+                [repo_id.to_string().into(), HEAD_GENERATION_SENTINEL.into()],
             ))
             .await?;
         rows.into_iter()
@@ -978,8 +979,9 @@ impl OperationStoreV2 {
             .db
             .query_all_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "SELECT DISTINCT op_id FROM operation_head WHERE repo_id = ? ORDER BY op_id LIMIT 200",
-                [repo_id.to_string().into()],
+                "SELECT DISTINCT op_id FROM operation_head \
+                 WHERE repo_id = ? AND op_id <> ? ORDER BY op_id LIMIT 200",
+                [repo_id.to_string().into(), HEAD_GENERATION_SENTINEL.into()],
             ))
             .await?;
         let mut frontier = head_rows

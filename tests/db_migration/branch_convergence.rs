@@ -61,7 +61,7 @@ async fn change_identity_prefix_index_repair_replays_after_old_receipt() {
         .unwrap();
     assert_eq!(
         shipped_runner.run_pending(&conn).await.unwrap(),
-        vec![OPERATION_V2, CONVERGENCE, CHANGE_AI_LINK]
+        vec![CONVERGENCE, CHANGE_AI_LINK]
     );
     conn.execute_unprepared("DROP INDEX idx_change_identity_v2_repo_change")
         .await

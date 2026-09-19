@@ -50,26 +50,6 @@ pub const MUTABLE_STATE_OWNERSHIP: &[MutableStateSurface] = &[
         rationale: "historical v1 migration namespace retired by the forward-only retirement migration",
     },
     MutableStateSurface {
-        table: "legacy_operation_parent",
-        owner: StateOwner::Repository,
-        rationale: "historical v1 migration namespace retired by the forward-only retirement migration",
-    },
-    MutableStateSurface {
-        table: "legacy_operation_view",
-        owner: StateOwner::Repository,
-        rationale: "historical v1 migration namespace retired by the forward-only retirement migration",
-    },
-    MutableStateSurface {
-        table: "legacy_operation_view_ref",
-        owner: StateOwner::Repository,
-        rationale: "historical v1 migration namespace retired by the forward-only retirement migration",
-    },
-    MutableStateSurface {
-        table: "legacy_operation_view_workspace",
-        owner: StateOwner::Repository,
-        rationale: "historical v1 migration namespace retired by the forward-only retirement migration",
-    },
-    MutableStateSurface {
         table: "sequence_state",
         owner: StateOwner::Worktree,
         rationale: "one in-progress cherry-pick/am/revert sequence per worktree",

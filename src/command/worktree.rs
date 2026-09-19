@@ -2192,8 +2192,8 @@ enum AddCheckout {
 }
 
 /// Fence worktree lifecycle actions that publish or remove shared HEAD/branch
-/// rows. Acquire this before the registry and branch-attach locks so the lock
-/// order matches ordinary repository mutations and restore.
+/// rows. The registry lock is acquired by each lifecycle operation before this
+/// lease so concurrent adds queue on the registry before any other work starts.
 async fn acquire_worktree_ref_lease()
 -> WorktreeResult<Option<crate::internal::operation::middleware::ScopeLease>> {
     // The v2 CLI boundary already holds the repository lease for a central
@@ -2263,11 +2263,11 @@ async fn add_worktree(
     detach: bool,
     new_branch: Option<String>,
 ) -> WorktreeResult<WorktreeAddOutput> {
-    let _repository_ref_lease = acquire_worktree_ref_lease().await?;
     // Registry mutation lock: the whole precheck → sweep → seed → registry
     // write sequence runs under it (a concurrent add's sweep must not
     // delete this add's freshly seeded rows).
     let _registry_lock = acquire_registry_lock_async().await?;
+    let _repository_ref_lease = acquire_worktree_ref_lease().await?;
     let storage = util::storage_path();
     let target = resolve_path(&path, "worktree path")?;
 
@@ -5318,8 +5318,8 @@ fn render_move_worktree(result: &WorktreeMoveOutput, output: &OutputConfig) -> C
 /// to guard); leaked rows would otherwise be re-inherited by a worktree
 /// re-created at the same path (deterministic instance id).
 async fn prune_worktrees() -> WorktreeResult<WorktreePruneOutput> {
-    let _repository_ref_lease = acquire_worktree_ref_lease().await?;
     let _registry_lock = acquire_registry_lock_async().await?;
+    let _repository_ref_lease = acquire_worktree_ref_lease().await?;
     let mut state = load_state()?;
 
     // §C.7: prune only handles entries whose path is PROVEN missing
@@ -5505,8 +5505,8 @@ fn render_prune_worktrees(result: &WorktreePruneOutput, output: &OutputConfig) -
 /// Order matters: registry last — a half-completed delete cannot silently
 /// unregister a worktree whose directory is still present.
 async fn remove_worktree(path: String, delete_dir: bool) -> WorktreeResult<WorktreeRemoveOutput> {
-    let _repository_ref_lease = acquire_worktree_ref_lease().await?;
     let _registry_lock = acquire_registry_lock_async().await?;
+    let _repository_ref_lease = acquire_worktree_ref_lease().await?;
     let mut state = load_state()?;
     let target = resolve_path(&path, "worktree path")?;
 
